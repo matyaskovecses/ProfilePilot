@@ -1,0 +1,60 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "profilepilot"
+version = "0.1.0"
+description = "Multi-profile native Chrome for AI agents (Claude, ChatGPT, Codex): isolated cookies, history and proxies per profile, exposed over MCP."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "matyaskovecses" }]
+keywords = ["mcp", "browser", "chrome", "profiles", "proxy", "socks5", "scraping", "scrapling", "claude", "chatgpt"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Topic :: Internet :: WWW/HTTP :: Browsers",
+]
+dependencies = [
+  "mcp>=2.3,<3",
+  "playwright>=1.63,<1.64",
+  "pydantic>=2.7",
+  "python-socks[asyncio]>=2.5",
+  "psutil>=5.9",
+  "filelock>=3.13",
+  "httpx>=0.27",
+  "websockets>=12",
+  "keyring>=24",
+  "markdownify>=0.13",
+  "scrapling>=0.4.15",
+  "pywin32>=306; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+scrapling = ["scrapling[fetchers]>=0.4.15"]
+test = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+profilepilot = "profilepilot.cli:main"
+
+[project.urls]
+Documentation = "https://github.com/matyaskovecses/ProfilePilot#readme"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/profilepilot"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/profilepilot", "README.md", "LICENSE", "docs"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+markers = [
+  "chrome: launches the real installed Chrome (slow; run with -m chrome)",
+  "network: needs internet access (skipped unless -m network)",
+]
+addopts = "-m 'not network'"
