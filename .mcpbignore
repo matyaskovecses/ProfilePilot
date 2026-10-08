@@ -1,0 +1,32 @@
+# Files left out of the Claude Desktop extension bundle (dist/profilepilot.mcpb).
+# scripts/build_mcpb.py only bundles manifest.json, pyproject.toml, README.md, LICENSE and src/;
+# these gitignore-style patterns trim that further. The build script also applies the
+# `mcpb pack` defaults (.git/, *.log, .DS_Store, ...) and skips Python caches.
+
+# Python build and cache debris
+__pycache__/
+*.py[cod]
+*.egg-info/
+/build/
+/dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments and local state (never bundle a venv: Claude Desktop's uv builds its own)
+.venv/
+venv/
+.env
+.env.*
+*.mcpb
+
+# Editor and OS files
+.idea/
+.vscode/
+*.swp
+*~
+
+# Development-only content (anchored to the project root)
+/tests/
+/docs/
+/scripts/

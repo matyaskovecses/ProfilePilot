@@ -1,0 +1,17 @@
+{
+  "name": "profilepilot",
+  "owner": {
+    "name": "matyaskovecses",
+    "url": "https://github.com/matyaskovecses"
+  },
+  "description": "ProfilePilot: isolated native-Chrome profiles with per-profile proxies for AI agents.",
+  "plugins": [
+    {
+      "name": "profilepilot",
+      "source": "./",
+      "description": "Drive many isolated profiles of your real Chrome (own cookies, logins and proxy each) over MCP, plus a skill for polite, ref-based scraping. Needs uv (https://docs.astral.sh/uv/).",
+      "category": "browser-automation",
+      "tags": ["browser", "chrome", "profiles", "proxy", "scraping", "mcp"]
+    }
+  ]
+}

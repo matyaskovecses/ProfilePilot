@@ -1,0 +1,71 @@
+{
+  "manifest_version": "0.4",
+  "name": "profilepilot",
+  "display_name": "ProfilePilot",
+  "version": "0.1.0",
+  "description": "Many isolated profiles of your real, native Chrome, each with its own cookies, logins and proxy, for browsing and scraping.",
+  "long_description": "ProfilePilot lets Claude drive any number of isolated browser profiles of the Google Chrome (or Edge, Brave, Chromium) already installed on your computer. Every profile has its own cookies, logins, history, storage and cache, and can use its own proxy: HTTP, HTTPS, SOCKS4 or SOCKS5, with or without username and password (a local relay handles proxy authentication, DNS is resolved at the proxy and WebRTC is limited to the proxy). There is no fingerprint spoofing and no automation flags: pages see a genuine Chrome. Claude works with accessibility snapshots and element refs, reads pages as markdown with hidden prompt-injection text removed, extracts data with CSS/XPath, manages cookies and makes HTTP requests through a profile's proxy and cookies. Profiles keep running in the background and are shared with Claude Code, Codex, ChatGPT and Python scripts. Requires Google Chrome, Edge, Brave or Chromium. Claude Desktop installs the Python dependencies with its bundled uv on first start, which can take a minute.",
+  "author": {
+    "name": "matyaskovecses",
+    "url": "https://github.com/matyaskovecses"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/matyaskovecses/ProfilePilot"
+  },
+  "homepage": "https://github.com/matyaskovecses/ProfilePilot",
+  "documentation": "https://github.com/matyaskovecses/ProfilePilot/blob/main/docs/CLIENTS.md",
+  "support": "https://github.com/matyaskovecses/ProfilePilot/issues",
+  "server": {
+    "type": "uv",
+    "entry_point": "src/profilepilot/__main__.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": ["run", "--directory", "${__dirname}", "python", "-m", "profilepilot", "serve"]
+    }
+  },
+  "tools": [
+    {"name": "profile_list", "description": "List browser profiles with their proxy and running state."},
+    {"name": "profile_create", "description": "Create an isolated profile, optionally with a proxy, tags, language or timezone."},
+    {"name": "profile_update", "description": "Change a profile's name, tags, notes or launch options."},
+    {"name": "profile_delete", "description": "Move a profile and all its data to the trash."},
+    {"name": "profile_clone", "description": "Copy a profile's settings, optionally with its data."},
+    {"name": "profile_start", "description": "Launch a profile's Chrome window."},
+    {"name": "profile_stop", "description": "Close a profile's Chrome."},
+    {"name": "profile_status", "description": "Show which profiles are running and their proxy relay statistics."},
+    {"name": "profile_set_proxy", "description": "Assign or remove a profile's proxy; switches live when the profile is running."},
+    {"name": "proxy_list", "description": "List saved proxies (passwords are never shown)."},
+    {"name": "proxy_add", "description": "Save one proxy or a whole newline-separated list."},
+    {"name": "proxy_remove", "description": "Delete a saved proxy."},
+    {"name": "proxy_test", "description": "Check a proxy's exit IP, country and latency."},
+    {"name": "browser_navigate", "description": "Open a URL, or go back, forward or reload."},
+    {"name": "browser_snapshot", "description": "Accessibility snapshot of the page with element refs to act on."},
+    {"name": "browser_click", "description": "Click an element by ref or selector."},
+    {"name": "browser_type", "description": "Type text into an element, optionally submitting."},
+    {"name": "browser_press_key", "description": "Press a key or key combination."},
+    {"name": "browser_select_option", "description": "Choose options in a select element."},
+    {"name": "browser_hover", "description": "Hover over an element."},
+    {"name": "browser_scroll", "description": "Scroll the page or an element into view."},
+    {"name": "browser_wait_for", "description": "Wait for text, a selector or a number of seconds."},
+    {"name": "browser_screenshot", "description": "Screenshot of the page or one element."},
+    {"name": "browser_read", "description": "Read the page as markdown, text or HTML, with hidden text removed."},
+    {"name": "browser_extract", "description": "Extract values with CSS or XPath selectors."},
+    {"name": "browser_evaluate", "description": "Evaluate a JavaScript expression in the page."},
+    {"name": "browser_tabs", "description": "List, open, select or close tabs."},
+    {"name": "cookies_get", "description": "List a profile's cookies (names only by default)."},
+    {"name": "cookies_set", "description": "Add or update cookies in a profile."},
+    {"name": "cookies_clear", "description": "Delete a profile's cookies, optionally for one domain."},
+    {"name": "cookies_export", "description": "Export cookies to a JSON or Netscape cookies.txt file."},
+    {"name": "cookies_import", "description": "Import cookies from a JSON or cookies.txt file."},
+    {"name": "http_fetch", "description": "HTTP request through a profile's proxy with its cookies."}
+  ],
+  "tools_generated": true,
+  "keywords": ["browser", "chrome", "profiles", "proxy", "socks5", "scraping", "automation", "cookies"],
+  "license": "MIT",
+  "compatibility": {
+    "platforms": ["win32", "darwin", "linux"],
+    "runtimes": {
+      "python": ">=3.10"
+    }
+  }
+}

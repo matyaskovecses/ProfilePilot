@@ -1,0 +1,20 @@
+{
+  "name": "profilepilot",
+  "displayName": "ProfilePilot",
+  "version": "0.1.0",
+  "description": "Many isolated profiles of your real, native Chrome for browsing and scraping: each profile has its own cookies, logins, history and proxy (HTTP/HTTPS/SOCKS4/SOCKS5, with auth). Includes the MCP server and a scraping-workflow skill. Requires uv and Google Chrome (or Edge/Brave/Chromium).",
+  "author": {
+    "name": "matyaskovecses",
+    "url": "https://github.com/matyaskovecses"
+  },
+  "homepage": "https://github.com/matyaskovecses/ProfilePilot#readme",
+  "repository": "https://github.com/matyaskovecses/ProfilePilot",
+  "license": "MIT",
+  "keywords": ["browser", "chrome", "profiles", "proxy", "socks5", "scraping", "mcp", "cookies"],
+  "mcpServers": {
+    "profilepilot": {
+      "command": "uvx",
+      "args": ["--from", "${CLAUDE_PLUGIN_ROOT}", "profilepilot", "serve"]
+    }
+  }
+}
