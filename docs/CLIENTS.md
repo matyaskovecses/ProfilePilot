@@ -154,11 +154,15 @@ To use only the skill with Option A, copy `skills/profilepilot/` to `~/.claude/s
 If you prefer one long-running server for several clients:
 
 ```powershell
-profilepilot serve --http --port 8931 --auth token --token <TOKEN>
+$env:PROFILEPILOT_TOKEN = "<TOKEN>"
+profilepilot serve --http --port 8931 --auth token
 claude mcp add --transport http --scope user profilepilot http://127.0.0.1:8931/mcp --header "Authorization: Bearer <TOKEN>"
 ```
 
-Use a long random token. Stdio (Option A) is simpler and needs no token.
+Use a long random token. Read it from `PROFILEPILOT_TOKEN` or pipe it in with `--token -` rather
+than typing `--token <TOKEN>`, because other local programs can read a process's command line.
+If you don't give a token at all, the server generates one and prints it once. Stdio (Option A)
+is simpler and needs no token.
 
 ## Codex CLI, Codex IDE extension and the ChatGPT desktop app
 
@@ -274,14 +278,14 @@ Restart Cursor or reload the server under **Cursor Settings > MCP**.
 ## Any other MCP client
 
 - **stdio:** command `<absolute path to python>`, arguments `-m profilepilot serve`.
-- **Streamable HTTP:** `profilepilot serve --http --port 8931 --auth token --token <TOKEN>`, URL
-  `http://127.0.0.1:8931/mcp`, header `Authorization: Bearer <TOKEN>`.
+- **Streamable HTTP:** `profilepilot serve --http --port 8931 --auth token`, with the token in
+  `PROFILEPILOT_TOKEN`. URL `http://127.0.0.1:8931/mcp`, header `Authorization: Bearer <TOKEN>`.
 
 ## Removing ProfilePilot from a client
 
 | Client | How |
 |---|---|
-| Claude Desktop, Cursor, Codex | `python -c "from profilepilot.install import unregister; print(unregister('codex'))"` (or `'claude-desktop'`, `'cursor'`). It backs the file up and removes only the `profilepilot` entry |
+| Claude Desktop, Cursor, Codex | `profilepilot uninstall codex` (or `claude-desktop`, `cursor`). It backs the file up and removes only the `profilepilot` entry |
 | Claude Code | `claude mcp remove --scope user profilepilot`, or `/plugin uninstall profilepilot@profilepilot` for the plugin |
 | Claude Desktop extension | **Settings > Extensions**, then remove ProfilePilot |
 | ChatGPT | Delete the plugin on chatgpt.com/plugins and stop `tunnel-client` or the public tunnel |

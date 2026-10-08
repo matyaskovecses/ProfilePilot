@@ -76,13 +76,16 @@ def test_language(tmp_path):
     args = args_for(tmp_path, lang="de-DE")
     assert "--lang=de-DE" in args and "--accept-lang=de-DE,de" in args
     assert "--accept-lang=fr" in args_for(tmp_path, lang="fr")
-    with pytest.raises(ProfilePilotError):
+    # A malformed tag never reaches the command line: LaunchOptions rejects it up front.
+    with pytest.raises(ValueError):
         args_for(tmp_path, lang="de DE; --no-sandbox")
 
 
 def test_window_modes(tmp_path):
     normal = args_for(tmp_path, window="normal")
-    assert not any(a.startswith(("--window-position", "--headless", "--disable-backgrounding")) for a in normal)
+    assert not any(a.startswith(("--window-position", "--headless")) for a in normal)
+    # Occlusion throttling is disabled in every mode: covered windows must keep rendering.
+    assert "--disable-backgrounding-occluded-windows" in normal
     off = args_for(tmp_path, window="offscreen")
     assert "--window-position=-32000,-32000" in off and "--disable-backgrounding-occluded-windows" in off
     assert "--headless=new" in args_for(tmp_path, window="headless")

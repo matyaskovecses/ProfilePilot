@@ -80,6 +80,7 @@ def launch_chrome(user_data_dir: Path, *extra_args: str, url: str = "about:blank
         "--no-default-browser-check",
         "--disable-search-engine-choice-screen",
         "--window-position=-32000,-32000",
+        "--disable-backgrounding-occluded-windows",
         *extra_args,
         url,
     ]

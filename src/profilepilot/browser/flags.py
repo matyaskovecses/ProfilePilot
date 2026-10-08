@@ -6,10 +6,13 @@ genuine browser. Verified on Chrome 154 (Windows 11):
 * A fixed, non-zero ``--remote-debugging-port`` keeps ``navigator.webdriver`` false; port 0,
   ``--remote-debugging-pipe`` and ``--enable-automation`` do not. (``--headless=new`` with a fixed
   port also reports ``webdriver == false`` on 154, but the UA says ``HeadlessChrome``.)
-* An off-screen window (``--window-position=-32000,-32000``) is treated as occluded: the page
-  reports ``visibilityState == "hidden"``, ``requestAnimationFrame`` never fires and timers are
-  throttled to ~1/s. ``--disable-backgrounding-occluded-windows`` keeps it ``"visible"`` with
-  normal rAF/timer behaviour, so offscreen mode adds that flag.
+* An off-screen window (``--window-position=-32000,-32000``) - and equally a *normal* window that
+  is fully covered by other windows - is treated as occluded: the page reports
+  ``visibilityState == "hidden"``, ``requestAnimationFrame`` never fires, timers are throttled to
+  ~1/s and Playwright actions hang waiting for the element to be "stable".
+  ``--disable-backgrounding-occluded-windows`` keeps it ``"visible"`` with normal rAF/timer
+  behaviour, so it is passed in every window mode (it is not a "bad flag": no infobar, and the
+  page cannot read it - it only stops occlusion-based throttling).
 * ``--webrtc-ip-handling-policy=disable_non_proxied_udp`` makes a local
   ``RTCPeerConnection`` + ``createDataChannel`` + ``createOffer`` gather no candidates at all,
   whereas without it a UDP host (mDNS) candidate appears. ``--force-webrtc-ip-handling-policy``
@@ -128,6 +131,9 @@ def build_chrome_args(
         # frame in aria-ref selector") and never fire load events again, so history navigations
         # wait forever. Playwright disables the cache in browsers it launches for the same reason.
         "--disable-back-forward-cache",
+        # An AI-driven window is usually behind other windows; without this Chrome treats it as
+        # occluded, stops rendering frames and every Playwright action hangs.
+        "--disable-backgrounding-occluded-windows",
     ]
     if browser.kind == "edge":
         args.append("--edge-skip-compat-layer-relaunch")  # keeps the PID we spawned alive
@@ -148,7 +154,7 @@ def build_chrome_args(
         args += [f"--lang={lang}", f"--accept-lang={accept_languages(lang)}"]
 
     if launch.window == "offscreen":
-        args += [f"--window-position={OFFSCREEN_POSITION}", "--disable-backgrounding-occluded-windows"]
+        args.append(f"--window-position={OFFSCREEN_POSITION}")
     elif launch.window == "headless":
         args.append("--headless=new")  # NOT native: HeadlessChrome user agent
 

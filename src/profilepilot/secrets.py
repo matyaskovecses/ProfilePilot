@@ -33,8 +33,9 @@ class SecretStore:
             self._keyring = _load_keyring()
             if self._keyring is None and choice == "keyring":
                 log.warning("keyring backend unavailable; falling back to the encrypted file store")
-        # Namespace keyring entries per data root so test/alt roots never collide.
-        self._ns = f"{SERVICE}:{_short_hash(str(root))}"
+        # Namespace keyring entries per data root so test/alt roots never collide. Resolve first so
+        # every spelling of the same directory (relative, 8.3 short name, ...) maps to one namespace.
+        self._ns = f"{SERVICE}:{_short_hash(str(Path(root).resolve()))}"
 
     @property
     def backend(self) -> str:

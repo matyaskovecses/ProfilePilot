@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import psutil
+from pydantic import ValidationError
 
 from .errors import AmbiguousError, ConflictError, NotFoundError, ProfilePilotError, ProfileRunningError
 from .jsonio import lock_for, read_json, write_json
@@ -43,6 +44,20 @@ CACHE_DIRS = {
 }
 RUNTIME_FILES = {"lockfile", "DevToolsActivePort", "SingletonLock", "SingletonSocket", "SingletonCookie"}
 MAX_NAME = 64
+
+
+def _launch_options(data: LaunchOptions | dict[str, Any] | None) -> LaunchOptions:
+    """Build LaunchOptions, turning pydantic validation errors into a readable ProfilePilotError."""
+    if isinstance(data, LaunchOptions):
+        return data
+    try:
+        return LaunchOptions.model_validate(data or {})
+    except ValidationError as exc:
+        problems = "; ".join(
+            f"{'.'.join(str(p) for p in err['loc']) or 'launch'}: {err['msg'].removeprefix('Value error, ')}"
+            for err in exc.errors()
+        )
+        raise ProfilePilotError(f"Invalid launch options - {problems}") from None
 
 
 def _validate_name(name: str) -> str:
@@ -168,7 +183,7 @@ class Store:
             pid = new_id()
             while self.profile_dir(pid).exists():
                 pid = new_id()
-            launch_opts = launch if isinstance(launch, LaunchOptions) else LaunchOptions.model_validate(launch or {})
+            launch_opts = _launch_options(launch)
             if launch is None:
                 launch_opts.window = self.load_config().default_window
             profile = Profile(
@@ -216,7 +231,7 @@ class Store:
                 if isinstance(patch, LaunchOptions):
                     patch = patch.model_dump()
                 merged = profile.launch.model_dump() | dict(patch)
-                profile.launch = LaunchOptions.model_validate(merged)
+                profile.launch = _launch_options(merged)
             for key in ("notes", "color", "browser"):
                 if key in changes and changes[key] is not None:
                     setattr(profile, key, changes.pop(key))

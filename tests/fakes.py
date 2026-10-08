@@ -21,6 +21,7 @@ class FakeSocks5Server:
     targets: list[tuple[str, int]] = field(default_factory=list)
     auth_failures: int = 0
     _server: asyncio.base_events.Server | None = None
+    _tasks: set = field(default_factory=set)
 
     @property
     def port(self) -> int:
@@ -34,9 +35,18 @@ class FakeSocks5Server:
     async def stop(self) -> None:
         if self._server:
             self._server.close()
-            await self._server.wait_closed()
+        for task in list(self._tasks):
+            task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        if self._server:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self._server.wait_closed(), 5)
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            self._tasks.add(task)
         try:
             ver, n = await reader.readexactly(2)
             methods = await reader.readexactly(n)
@@ -76,6 +86,7 @@ class FakeSocks5Server:
         finally:
             with contextlib.suppress(Exception):
                 writer.close()
+            self._tasks.discard(asyncio.current_task())
 
 
 @dataclass
@@ -86,6 +97,7 @@ class FakeHttpConnectProxy:
     password: str = "hpass"
     targets: list[str] = field(default_factory=list)
     _server: asyncio.base_events.Server | None = None
+    _tasks: set = field(default_factory=set)
 
     @property
     def port(self) -> int:
@@ -99,9 +111,18 @@ class FakeHttpConnectProxy:
     async def stop(self) -> None:
         if self._server:
             self._server.close()
-            await self._server.wait_closed()
+        for task in list(self._tasks):
+            task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        if self._server:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self._server.wait_closed(), 5)
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            self._tasks.add(task)
         try:
             head = await reader.readuntil(b"\r\n\r\n")
             lines = head.decode("latin-1").split("\r\n")
@@ -127,6 +148,7 @@ class FakeHttpConnectProxy:
         finally:
             with contextlib.suppress(Exception):
                 writer.close()
+            self._tasks.discard(asyncio.current_task())
 
 
 async def _pipe(r1, w1, r2, w2) -> None:
@@ -160,7 +182,12 @@ class OriginServer:
 
             def do_GET(self):
                 outer.requests.append({"path": self.path, "headers": dict(self.headers)})
-                if self.path.startswith("/set-cookie"):
+                if self.path.startswith("/set-session-cookie"):
+                    name, _, value = self.path.partition("?")[2].partition("=")
+                    body = b"session cookie set"
+                    self.send_response(200)
+                    self.send_header("Set-Cookie", f"{name}={value}; Path=/")
+                elif self.path.startswith("/set-cookie"):
                     name, _, value = self.path.partition("?")[2].partition("=")
                     body = b"cookie set"
                     self.send_response(200)

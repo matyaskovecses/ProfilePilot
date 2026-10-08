@@ -130,3 +130,15 @@ def test_tolerant_json_reads(store, tmp_path):
     assert read_json(f) == {"b": 2}
     f.write_text("{broken")
     assert read_json(f, "dflt") == "dflt" and (tmp_path / "bom.json.bad").exists()
+
+
+def test_launch_option_validation_is_readable(store):
+    from profilepilot.errors import ProfilePilotError
+
+    p = store.create_profile("tz", launch={"timezone": "Europe/Berlin", "lang": "de-DE"})
+    assert (p.launch.timezone, p.launch.lang) == ("Europe/Berlin", "de-DE")
+    with pytest.raises(ProfilePilotError, match="unknown IANA timezone 'Mars/Base'"):
+        store.update_profile("tz", launch={"timezone": "Mars/Base"})
+    with pytest.raises(ProfilePilotError, match="invalid language tag"):
+        store.create_profile("bad-lang", launch={"lang": "not a lang!"})
+    assert store.update_profile("tz", launch={"timezone": ""}).launch.timezone is None

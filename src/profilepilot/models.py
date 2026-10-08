@@ -6,10 +6,14 @@ are never part of the ``summary()`` / ``public()`` views that are returned to AI
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+_LANG_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
+_TZ_RE = re.compile(r"^(?:UTC|[A-Za-z_]+(?:/[A-Za-z0-9_+\-]+)+)$")
 
 ProxyScheme = Literal["http", "https", "socks4", "socks5"]
 WindowMode = Literal["normal", "offscreen", "headless"]
@@ -121,6 +125,34 @@ class LaunchOptions(_Model):
 
     start_url: str | None = None
     extra_args: list[str] = Field(default_factory=list)
+
+    @field_validator("lang")
+    @classmethod
+    def _check_lang(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        value = value.strip()
+        if not _LANG_RE.match(value):
+            raise ValueError(f"invalid language tag {value!r}; expected e.g. 'de-DE' or 'fr'")
+        return value
+
+    @field_validator("timezone")
+    @classmethod
+    def _check_timezone(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        value = value.strip()
+        try:
+            import zoneinfo
+
+            known = zoneinfo.available_timezones()
+        except Exception:  # no tz database available: fall back to a shape check
+            known = set()
+        if known and value not in known:
+            raise ValueError(f"unknown IANA timezone {value!r}; expected e.g. 'Europe/Berlin' or 'America/New_York'")
+        if not known and not _TZ_RE.match(value):
+            raise ValueError(f"invalid timezone {value!r}; expected an IANA name such as 'Europe/Berlin'")
+        return value
 
 
 class Profile(_Model):
