@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Radios</title>
+<style>
+  /* custom-styled radios: the native input is visually hidden, people click the label */
+  .sr { position: absolute; opacity: 0; width: 1px; height: 1px; }
+  .pill { display: inline-block; padding: 4px 10px; border: 1px solid #888; border-radius: 12px; }
+</style>
+</head>
+<body>
+<form id="radios">
+  <fieldset>
+    <legend>Gender</legend>
+    <label><input type="radio" name="g" value="m"> Male</label>
+    <label><input type="radio" name="g" value="f"> Female</label>
+    <label><input type="radio" name="g" value="o"> Other</label>
+  </fieldset>
+  <fieldset>
+    <legend>Anrede</legend>
+    <input type="radio" class="sr" id="herr" name="anrede" value="herr"><label class="pill" for="herr">Herr</label>
+    <input type="radio" class="sr" id="frau" name="anrede" value="frau"><label class="pill" for="frau">Frau</label>
+  </fieldset>
+  <fieldset>
+    <legend>Shipping speed</legend>
+    <label><input type="radio" name="ship" value="std"> Standard</label>
+    <label><input type="radio" name="ship" value="exp"> Express</label>
+  </fieldset>
+</form>
+</body>
+</html>

@@ -162,6 +162,8 @@ class Profile(_Model):
     tags: list[str] = Field(default_factory=list)
     color: str | None = None
     proxy_id: str | None = None
+    identity_id: str | None = None
+    """The identity (see :mod:`profilepilot.identity`) that form autofill uses by default."""
     browser: str = "auto"
     """auto | chrome | edge | chromium | brave | absolute path to a Chromium-family executable."""
     launch: LaunchOptions = Field(default_factory=LaunchOptions)
@@ -173,6 +175,8 @@ class Profile(_Model):
 
     def summary(self) -> dict[str, Any]:
         data: dict[str, Any] = {"id": self.id, "name": self.name, "proxy_id": self.proxy_id, "tags": self.tags}
+        if self.identity_id:
+            data["identity_id"] = self.identity_id
         if self.notes:
             data["notes"] = self.notes
         if self.browser != "auto":
@@ -218,6 +222,9 @@ class RuntimeInfo(_Model):
     window: WindowMode = "normal"
     started_at: datetime = Field(default_factory=utcnow)
     error: str | None = None
+    client_job: bool | None = None
+    """True when the host could not leave the kill-on-close job of the client that started it (some
+    MCP clients): the browser then closes when that client disconnects."""
 
     @property
     def proxy_url(self) -> str | None:
@@ -253,4 +260,11 @@ class AppConfig(_Model):
     """Override for the default browser executable (otherwise auto-detected)."""
     default_window: WindowMode = "normal"
     max_running: int = 20
+    escape_client_job: bool = False
+    """Windows, opt-in. Some MCP clients (e.g. the official Python SDK's stdio client) run their
+    server inside a kill-on-close job that forbids breakaway, so browsers die when the client
+    disconnects. When True, the host restarts itself through WMI (``Win32_Process.Create``) outside
+    that job. Off by default: it overrides the client's cleanup policy, and security software may
+    flag WMI process creation. Claude Desktop / Claude Code already allow breakaway and need no
+    escape. Env override: ``PROFILEPILOT_ESCAPE_CLIENT_JOB=1``."""
     shardx: ShardXConfig = Field(default_factory=ShardXConfig)

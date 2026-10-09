@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="de">
+<head><meta charset="utf-8"><title>Registrierung (nur Labels)</title>
+<style>td { padding: 2px 6px; } [contenteditable] { border: 1px solid #888; min-height: 1.4em; width: 240px; }</style>
+</head>
+<body>
+<h1>Registrierung</h1>
+<form id="reg">
+  <table>
+    <tr><td><label for="v">Vorname</label></td><td><input id="v" name="vorname"></td></tr>
+    <tr><td><label for="n">Name</label></td><td><input id="n" name="name"></td></tr>
+    <tr><td>E-Mail-Adresse</td><td><input name="kontakt_mail"></td></tr>
+    <tr><td>Straße und Hausnummer</td><td><input name="f5"></td></tr>
+    <tr><td>Adresszusatz</td><td><input name="f6"></td></tr>
+    <tr><td>PLZ</td><td><input name="f7" maxlength="5"></td></tr>
+    <tr><td>Ort</td><td><input name="f8"></td></tr>
+    <tr><td>Bundesland</td><td><input name="f9"></td></tr>
+    <tr><td>Land</td><td><select name="f10">
+      <option>Bitte wählen</option><option>Deutschland</option><option>Österreich</option>
+      <option>Schweiz</option><option>Vereinigte Staaten</option></select></td></tr>
+    <tr><td>Telefon</td><td><input name="f11"></td></tr>
+    <tr><td>Geburtsdatum</td><td><input name="f12" placeholder="TT.MM.JJJJ"></td></tr>
+    <tr><td>Geburtsort</td><td><input name="f13"></td></tr>
+    <tr><td>Spitzname</td><td><input name="f14"></td></tr>
+  </table>
+  <p><input name="login" placeholder="Username"></p>
+  <p><input name="mail2" placeholder="Confirm your email"></p>
+  <p><span>Firma</span> <span id="firma-box" contenteditable="true" role="textbox"></span></p>
+</form>
+</body>
+</html>

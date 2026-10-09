@@ -245,3 +245,55 @@ class OriginServer:
     def __exit__(self, *exc) -> None:
         self._httpd.shutdown()
         self._httpd.server_close()
+
+
+TEST_DIB = struct.pack("<IiiHHIIiiII", 40, 2, 2, 1, 24, 0, 16, 2835, 2835, 0, 0) + b"\x00\x00\xff\xff\xff\xff\x00\x00" * 2
+"""A 2x2 24-bit device-independent bitmap (CF_DIB) used as test clipboard image content."""
+
+
+@contextlib.contextmanager
+def user_clipboard_guard(sentinel: str, *, image: bool = True):
+    """For the few tests that need the real Windows clipboard: save the user's clipboard, put
+    ``sentinel`` text (plus :data:`TEST_DIB` when ``image``) on it - marked so that clipboard
+    history and cloud sync skip it - and always put the user's clipboard back afterwards.
+    Yields the :class:`~profilepilot.automation.clipboard.WindowsClipboard` backend."""
+    import sys
+
+    if sys.platform != "win32":
+        import pytest
+
+        pytest.skip("real-clipboard checks are Windows only")
+    from profilepilot.automation.clipboard import CLOUD_FORMAT, HISTORY_FORMAT, WindowsClipboard
+
+    backend = WindowsClipboard()
+    snapshot, _ = backend.snapshot_and_set(sentinel, sensitive=True)  # saves the user's clipboard
+    try:
+        items = {13: (sentinel + "\0").encode("utf-16-le")}  # CF_UNICODETEXT
+        if image:
+            items[8] = TEST_DIB  # CF_DIB
+        for name in (HISTORY_FORMAT, CLOUD_FORMAT):
+            items[backend._fmt(name)] = b"\0\0\0\0"
+        backend.set_formats(items)
+        yield backend
+    finally:
+        backend.restore(snapshot, None)  # unconditional: the user's content comes back
+
+
+def clipboard_text_now(backend) -> str | None:
+    """CF_UNICODETEXT currently on the clipboard (tests only), without the trailing NUL."""
+    data = backend.current_formats().get("13")  # the global block may be a byte longer than the text
+    return data[: len(data) // 2 * 2].decode("utf-16-le").split("\0", 1)[0] if data else None
+
+
+def pages_from_dir(directory, replacements: dict[str, str] | None = None) -> dict[str, str]:
+    """``{"/<name>.html": html}`` for every HTML file in ``directory`` (for :class:`OriginServer`),
+    with each ``replacements`` key replaced by its value (e.g. ``{{CARD_ORIGIN}}`` -> a URL)."""
+    from pathlib import Path
+
+    pages = {}
+    for path in sorted(Path(directory).glob("*.html")):
+        html = path.read_text(encoding="utf-8")
+        for old, new in (replacements or {}).items():
+            html = html.replace(old, new)
+        pages[f"/{path.name}"] = html
+    return pages

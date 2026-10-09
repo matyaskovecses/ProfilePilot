@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Card input frame</title>
+<style>input { display: block; margin: 4px 0; width: 260px; }</style>
+</head>
+<body>
+<!-- Like Stripe Elements: name="cardnumber" / "exp-date" / "cvc"; the inputs re-format what is
+     typed or pasted (card number in groups of four, expiry as "MM / YY"). -->
+<input name="cardnumber" autocomplete="cc-number" inputmode="numeric" placeholder="1234 1234 1234 1234"
+       aria-label="Credit or debit card number">
+<input name="exp-date" inputmode="numeric" placeholder="MM / YY" aria-label="Credit or debit card expiration date">
+<input name="cvc" inputmode="numeric" maxlength="4" placeholder="CVC" aria-label="Credit or debit card CVC/CVV">
+<script>
+  window.events = [];
+  for (const type of ['paste', 'beforeinput', 'input']) {
+    document.addEventListener(type, e => events.push({type, trusted: e.isTrusted, inputType: e.inputType || null,
+                                                      target: e.target.name}), true);
+  }
+  const number = document.querySelector('[name=cardnumber]');
+  number.addEventListener('input', () => {
+    const digits = number.value.replace(/\D/g, '').slice(0, 16);
+    number.value = digits.replace(/(\d{4})(?=\d)/g, '$1 ');
+  });
+  const exp = document.querySelector('[name=exp-date]');
+  exp.addEventListener('input', () => {
+    const digits = exp.value.replace(/\D/g, '').slice(0, 4);
+    exp.value = digits.length > 2 ? digits.slice(0, 2) + ' / ' + digits.slice(2) : digits;
+  });
+</script>
+</body>
+</html>

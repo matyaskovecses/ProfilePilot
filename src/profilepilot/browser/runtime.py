@@ -49,6 +49,17 @@ EXIT_FAILED = 1
 EXIT_USAGE = 2
 EXIT_ALREADY_RUNNING = 3
 EXIT_IN_USE = 4
+EXIT_IN_CLIENT_JOB = 5
+"""The host found itself in a client's kill-on-close job and was asked to say so (see below)."""
+LEAVE_CLIENT_JOB_ENV = "PROFILEPILOT_HOST_LEAVE_CLIENT_JOB"
+"""Set to "1" for a host spawned with ``subprocess`` *only when the user opted in*
+(``AppConfig.escape_client_job`` or :data:`ESCAPE_CLIENT_JOB_ENV`): if it still landed in a
+kill-on-close job (the official Python MCP SDK's stdio client puts servers in one without allowing
+breakaway, and nested jobs can swallow ``CREATE_BREAKAWAY_FROM_JOB`` silently), it exits with
+:data:`EXIT_IN_CLIENT_JOB` before doing anything, and the manager starts it again through WMI, outside
+every job. By default the host respects the client's job: it records ``client_job`` and the tools tell
+the user that the browser closes with the client."""
+ESCAPE_CLIENT_JOB_ENV = "PROFILEPILOT_ESCAPE_CLIENT_JOB"
 
 HOST_LOCK_NAME = "host.lock"
 HOST_STDERR_NAME = "host-stderr.log"
@@ -120,6 +131,100 @@ def host_command(profile_id: str, root: Path | str, window: WindowMode | None = 
     if window:
         argv += ["--window", window]
     return argv, env
+
+
+def first_error_line(exc: BaseException) -> str:
+    text = str(exc).strip()
+    return text.splitlines()[0][:200] if text else type(exc).__name__
+
+
+_WMI_DETACHED_PROCESS = 0x8
+_WMI_CREATE_NEW_PROCESS_GROUP = 0x200
+_SW_HIDE = 0
+
+
+def spawn_outside_job(argv: list[str], env: dict[str, str], cwd: str | None) -> int:
+    """Windows: start ``argv`` through WMI ``Win32_Process.Create``. The process is created by the
+    WMI provider host, so it is in none of our jobs (verified: no job, same interactive session, parent
+    WmiPrvSE.exe), unlike anything ``CreateProcess`` starts from inside a kill-on-close job that does
+    not allow breakaway. Returns the new PID. Raises on any failure (no WMI, refused, ...)."""
+    if sys.platform != "win32":
+        raise ProfilePilotError("WMI process creation is Windows-only.")
+    import pythoncom  # type: ignore[import-not-found]
+    import win32com.client  # type: ignore[import-not-found]
+
+    pythoncom.CoInitialize()  # this runs in worker threads
+    try:
+        wmi = win32com.client.GetObject("winmgmts:")
+        startup = wmi.Get("Win32_ProcessStartup").SpawnInstance_()
+        startup.ShowWindow = _SW_HIDE
+        startup.CreateFlags = _WMI_DETACHED_PROCESS | _WMI_CREATE_NEW_PROCESS_GROUP
+        startup.EnvironmentVariables = [f"{k}={v}" for k, v in env.items() if k and not k.startswith("=")]
+        process = wmi.Get("Win32_Process")
+        params = process.Methods_("Create").InParameters.SpawnInstance_()
+        params.CommandLine = subprocess.list2cmdline(argv)
+        if cwd:
+            params.CurrentDirectory = cwd
+        params.ProcessStartupInformation = startup
+        result = process.ExecMethod_("Create", params)
+        if int(result.ReturnValue) != 0:
+            raise LaunchError(f"Win32_Process.Create failed with code {int(result.ReturnValue)}.")
+        return int(result.ProcessId)
+    finally:
+        pythoncom.CoUninitialize()
+
+
+class _HostProcess:
+    """``Popen``-like ``pid`` / ``poll()`` / ``wait()`` for a host we did not start ourselves (WMI).
+    A process handle is opened right away, so the exit code stays readable after the process exits."""
+
+    _SYNCHRONIZE = 0x00100000
+    _QUERY_LIMITED = 0x1000
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        self.returncode: int | None = None
+        self._handle: Any = None
+        try:
+            import win32api  # type: ignore[import-not-found]
+
+            self._handle = win32api.OpenProcess(self._SYNCHRONIZE | self._QUERY_LIMITED, False, pid)
+        except Exception:  # already gone (or no pywin32): fall back to psutil
+            if not psutil.pid_exists(pid):
+                self.returncode = EXIT_FAILED
+
+    def poll(self) -> int | None:
+        if self.returncode is not None:
+            return self.returncode
+        if self._handle is None:
+            if not psutil.pid_exists(self.pid):
+                self.returncode = EXIT_FAILED
+            return self.returncode
+        import win32event  # type: ignore[import-not-found]
+        import win32process  # type: ignore[import-not-found]
+
+        if win32event.WaitForSingleObject(self._handle, 0) == win32event.WAIT_OBJECT_0:
+            self.returncode = int(win32process.GetExitCodeProcess(self._handle))
+            self._close()
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while self.poll() is None:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired("profilepilot host", timeout or 0)
+            time.sleep(_POLL / 2)
+        assert self.returncode is not None
+        return self.returncode
+
+    def _close(self) -> None:
+        if self._handle is not None:
+            with contextlib.suppress(Exception):
+                self._handle.Close()
+            self._handle = None
+
+    def __del__(self) -> None:
+        self._close()
 
 
 def _tail(path: Path, lines: int = 8, max_bytes: int = 16 * 1024) -> list[str]:
@@ -262,8 +367,12 @@ class RuntimeManager:
                         f"Cannot start '{profile.name}': {len(others)} profiles are already running "
                         f"(max_running = {config.max_running}: {names}). Stop one first or raise max_running."
                     )
-                proc = self._spawn_host(profile, window)
+                escape = config.escape_client_job or os.environ.get(ESCAPE_CLIENT_JOB_ENV) == "1"
+                proc = self._spawn_host(profile, window, leave_client_job=escape)
                 self._wait_registered(profile.id, proc, min(deadline, time.monotonic() + _REGISTER_WAIT))
+                if proc.poll() == EXIT_IN_CLIENT_JOB:
+                    proc = self._respawn_outside_job(profile, window)
+                    self._wait_registered(profile.id, proc, min(deadline, time.monotonic() + _REGISTER_WAIT))
             break
         return self._wait_running(profile, proc, deadline, timeout)
 
@@ -298,8 +407,34 @@ class RuntimeManager:
                 )
             time.sleep(_POLL)
 
-    def _spawn_host(self, profile: Profile, window: WindowMode | None) -> subprocess.Popen:
+    def _respawn_outside_job(self, profile: Profile, window: WindowMode | None) -> "subprocess.Popen | _HostProcess":
+        """The first host landed in the client's kill-on-close job: start it through WMI (its parent is
+        then the WMI provider host, in no job). If that fails, start it inside the job after all; it
+        then records ``client_job`` and the tools tell the user how to keep the browser running."""
         argv, env = host_command(profile.id, self.store.root, window)
+        stderr_path = self.store.profile_dir(profile.id) / HOST_STDERR_NAME
+        root = Path(self.store.root)
+        child_env = dict(env if env is not None else os.environ)
+        child_env.pop(LEAVE_CLIENT_JOB_ENV, None)
+        try:
+            pid = spawn_outside_job([*argv, "--stderr", str(stderr_path)], child_env,
+                                    str(root) if root.is_absolute() else None)
+        except Exception as exc:  # pywin32/WMI missing or refused
+            log.warning("the host is inside this client's kill-on-close job and could not leave it (%s); the "
+                        "browser will close when the client disconnects", first_error_line(exc))
+            return self._spawn_host(profile, window, leave_client_job=False)
+        log.info("started the host for profile %s through WMI, outside the client's job (pid %s)", profile.name, pid)
+        return _HostProcess(pid)
+
+    def _spawn_host(self, profile: Profile, window: WindowMode | None, *,
+                    leave_client_job: bool = False) -> subprocess.Popen:
+        argv, env = host_command(profile.id, self.store.root, window)
+        if sys.platform == "win32":
+            env = dict(env if env is not None else os.environ)
+            if leave_client_job:
+                env[LEAVE_CLIENT_JOB_ENV] = "1"
+            else:
+                env.pop(LEAVE_CLIENT_JOB_ENV, None)
         profile_dir = self.store.profile_dir(profile.id)
         profile_dir.mkdir(parents=True, exist_ok=True)
         stderr_path = profile_dir / HOST_STDERR_NAME

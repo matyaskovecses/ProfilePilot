@@ -1,7 +1,9 @@
 """Page content for models: accessibility snapshots, cleaned page text, extraction, pagination.
 
 * :func:`snapshot` - Playwright's AI accessibility snapshot (``[ref=eN]`` markers that the
-  action tools resolve with ``page.locator("aria-ref=eN")``).
+  action tools resolve with ``page.locator("aria-ref=eN")``). The values of card number, expiry,
+  CVV, SSN, password and one-time-code fields are masked (``••••``), in every frame, also when
+  the user typed them by hand.
 * :func:`read_page` - the readable content of a page as Markdown, plain text or HTML. Hidden
   content (``display:none``, ``visibility:hidden``, ``opacity:0``, zero-size or clipped boxes,
   ``aria-hidden``, off-screen positioning, transparent text, ``<template>``/``<script>``/...)
@@ -78,13 +80,92 @@ async def snapshot(page: "Page", *, depth: int | None = None, ref: str | None = 
     if depth is not None and depth < 0:
         raise ProfilePilotError("depth must be >= 0.")
     if ref is None:
-        return await _aria_snapshot(page, depth=depth, boxes=boxes)
+        return await mask_sensitive_values(page, await _aria_snapshot(page, depth=depth, boxes=boxes))
     ref_id = normalize_ref(ref)
-    full = await _aria_snapshot(page, depth=None, boxes=boxes)
+    full = await mask_sensitive_values(page, await _aria_snapshot(page, depth=None, boxes=boxes))
     sub = subtree(full, ref_id, depth)
     if sub is None:
         raise stale_ref_error(ref_id)
     return sub
+
+
+MASK = "••••"
+_VALUE_NODE_RE = re.compile(r"^( *)- (?:textbox|searchbox|spinbutton|combobox)\b")
+MASK_CHECK_TIMEOUT_MS = 2_000
+MAX_MASK_CHECKS = 300
+"""More filled text boxes than this on one page: the rest are masked without checking."""
+_MASK_CONCURRENCY = 16
+
+
+def _blank_quotes(text: str) -> str:
+    """``text`` with the inside of every quoted string replaced by x's (same length and positions)."""
+    return _QUOTED_RE.sub(lambda m: '"' + "x" * (len(m.group(0)) - 2) + '"', text)
+
+
+def value_nodes(snapshot_text: str) -> list[tuple[int, str, int | None, list[int]]]:
+    """Text boxes that show a value in a snapshot: ``(line index, ref, column where the inline value
+    starts or None, indexes of the node's child "- text:" lines)``."""
+    lines = snapshot_text.splitlines()
+    out = []
+    for i, line in enumerate(lines):
+        match = _VALUE_NODE_RE.match(line)
+        if not match:
+            continue
+        indent = len(match.group(1))
+        blanked = _blank_quotes(line[indent:])
+        sep = blanked.find(": ")
+        refs = _HEADER_REF_RE.findall(blanked if sep < 0 else blanked[:sep])
+        if not refs:
+            continue
+        children: list[int] = []
+        if sep < 0 and blanked.rstrip().endswith(":"):
+            for j in range(i + 1, len(lines)):
+                body = lines[j].lstrip(" ")
+                ind = len(lines[j]) - len(body)
+                if body and ind <= indent:
+                    break
+                if ind == indent + 2 and body.startswith("- text:"):
+                    children.append(j)
+        if sep < 0 and not children:
+            continue  # an empty field
+        out.append((i, refs[-1], indent + sep + 2 if sep >= 0 else None, children))
+    return out
+
+
+async def mask_sensitive_values(page: "Page", snapshot_text: str) -> str:
+    """Replace the shown value of every card number / expiry / CVV / SSN / password / one-time-code
+    field in an AI snapshot with ``••••`` (any frame; classified by
+    :data:`~profilepilot.automation.autofill.SENSITIVE_FIELD_JS`). Fails closed: a field whose ref
+    cannot be resolved or checked is masked too. Values are never logged."""
+    nodes = value_nodes(snapshot_text)
+    if not nodes:
+        return snapshot_text
+    from .autofill import SENSITIVE_FIELD_JS
+
+    limit = asyncio.Semaphore(_MASK_CONCURRENCY)
+
+    async def sensitive(ref: str) -> bool:
+        async with limit:
+            try:
+                return bool(await page.locator(f"aria-ref={ref}").evaluate(SENSITIVE_FIELD_JS,
+                                                                            timeout=MASK_CHECK_TIMEOUT_MS))
+            except Exception:  # unresolvable, detached, timed out: mask
+                return True
+
+    checked = await asyncio.gather(*(sensitive(ref) for _, ref, _, _ in nodes[:MAX_MASK_CHECKS]))
+    flags = list(checked) + [True] * (len(nodes) - len(checked))
+    lines = snapshot_text.splitlines()
+    drop: set[int] = set()
+    for (i, _ref, start, children), masked in zip(nodes, flags):
+        if not masked:
+            continue
+        if start is not None:
+            lines[i] = lines[i][:start] + MASK
+        elif children:
+            first = lines[children[0]]
+            lines[children[0]] = first[: len(first) - len(first.lstrip(" "))] + "- text: " + MASK
+            drop.update(children[1:])
+    return "\n".join(line for j, line in enumerate(lines) if j not in drop)
 
 
 async def _aria_snapshot(page: "Page", *, depth: int | None, boxes: bool) -> str:

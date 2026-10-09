@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Sign up (autocomplete attributes)</title>
+<style>label { display: block; margin: 4px 0; } .trap { position: absolute; left: -9999px; top: 0; }</style>
+</head>
+<body>
+<h1>Create your account</h1>
+<form id="signup" action="/submitted" method="post">
+  <label>First name <input name="fn" autocomplete="given-name"></label>
+  <label>Last name <input name="ln" autocomplete="section-main family-name"></label>
+  <label>Email <input name="em" type="email" autocomplete="email"></label>
+  <label>Username <input name="un" autocomplete="username"></label>
+  <label>Password <input name="pw" type="password" autocomplete="new-password"></label>
+  <label>Phone <input name="ph" type="tel" autocomplete="tel"></label>
+  <label>Fax <input name="fax" type="tel" autocomplete="fax tel"></label>
+  <label>Company <input name="co" autocomplete="organization"></label>
+  <label>Address <input name="a1" autocomplete="shipping address-line1"></label>
+  <label>Apartment, suite <input name="a2" autocomplete="shipping address-line2"></label>
+  <label>City <input name="ci" autocomplete="shipping address-level2"></label>
+  <label>State
+    <select name="st" autocomplete="shipping address-level1">
+      <option value="">Select…</option>
+      <option value="AZ">Arizona</option><option value="CA">California</option>
+      <option value="NY">New York</option><option value="TX">Texas</option>
+    </select>
+  </label>
+  <label>ZIP <input name="zp" autocomplete="shipping postal-code"></label>
+  <label>Country
+    <select name="cn" autocomplete="shipping country">
+      <option value="">--</option><option value="CA">Canada</option>
+      <option value="DE">Germany</option><option value="US">United States</option>
+    </select>
+  </label>
+  <label>Birthday <input name="bd" type="date" autocomplete="bday"></label>
+  <label>Notes <textarea name="notes"></textarea></label>
+  <label>One-time code <input name="otp" autocomplete="one-time-code"></label>
+  <input class="trap" name="hp" autocomplete="off" tabindex="-1" aria-label="Email (leave empty)">
+  <div style="opacity:0"><input name="hp2" aria-label="First name"></div>
+  <label>Referral code <input name="ro" readonly></label>
+  <label>Middle name <input name="dis" disabled autocomplete="additional-name"></label>
+  <label>Newsletter <input type="checkbox" name="nl"></label>
+  <label>Search <input type="search" name="q" aria-label="Search by name"></label>
+  <button type="submit">Sign up</button>
+</form>
+</body>
+</html>

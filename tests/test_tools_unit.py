@@ -428,3 +428,35 @@ async def test_proxy_failures_name_the_relay_error():
     assert await navigation_error(state, session, plain) is plain
     download = await navigation_error(state, session, PlaywrightError("Download is starting"))
     assert str(Path("C:/pp/downloads")) in str(download) and "http_fetch" in str(download)
+
+
+# ---------------------------------------------------------------------- paste chords (the user's own clipboard)
+
+
+@pytest.mark.parametrize("key", ["Control+V", "control+v", "ControlLeft+KeyV", "Control+Shift+V", "ControlOrMeta+V",
+                                 "Meta+V", "MetaRight+v", "Shift+Insert", "Control+Shift+Insert", " Control + v "])
+def test_paste_chords_are_recognised(key):
+    from profilepilot.server.tools_browser import is_paste_chord
+
+    assert is_paste_chord(key)
+
+
+@pytest.mark.parametrize("key", ["Control+A", "Shift+Tab", "Control++", "v", "V", "Insert", "Shift+V", "Alt+V",
+                                 "Enter", "Control+C"])
+def test_other_keys_are_not_paste_chords(key):
+    from profilepilot.server.tools_browser import is_paste_chord
+
+    assert not is_paste_chord(key)
+
+
+@pytest.mark.asyncio
+async def test_press_key_refuses_to_paste_the_users_clipboard(home, monkeypatch):
+    async def no_browser(self, ref, **kw):
+        raise AssertionError("no browser should be started")
+
+    monkeypatch.setattr(BrowserManager, "session", no_browser)
+    home.create_profile("p")
+    async with Client(create_server(store=home)) as client:
+        for key in ("Control+V", "Shift+Insert", "ControlOrMeta+Shift+V"):
+            out = await call(client, "browser_press_key", {"profile": "p", "key": key}, ok=False)
+            assert "system clipboard" in out and "browser_paste" in out

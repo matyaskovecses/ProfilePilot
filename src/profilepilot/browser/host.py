@@ -13,7 +13,9 @@ This module must stay free of Playwright and MCP imports (it is a separate, lean
 must never print: its stdout is not a terminal and logging goes to ``profiles/<id>/host.log``.
 
 Exit codes: 0 ok, 1 launch failure, 2 usage / unknown profile, 3 already running, 4 the profile's
-data directory is in use by another browser process.
+data directory is in use by another browser process, 5 started inside a client's kill-on-close job
+while the spawner asked to be told (``PROFILEPILOT_HOST_LEAVE_CLIENT_JOB=1``): it then starts the host
+again outside that job.
 """
 
 from __future__ import annotations
@@ -49,14 +51,16 @@ from .prefs import has_saved_session, prepare_user_data_dir, profile_in_use
 from .runtime import (
     EXIT_ALREADY_RUNNING,
     EXIT_FAILED,
+    EXIT_IN_CLIENT_JOB,
     EXIT_IN_USE,
     EXIT_OK,
     EXIT_USAGE,
     HOST_LOCK_NAME,
+    LEAVE_CLIENT_JOB_ENV,
     kill_tree,
     process_tree,
 )
-from .winjob import process_in_job, put_self_in_kill_on_close_job
+from .winjob import in_foreign_kill_on_close_job, process_in_job, put_self_in_kill_on_close_job
 
 log = logging.getLogger("profilepilot.browser.host")
 
@@ -185,9 +189,11 @@ def _setup_logging(path: Path) -> logging.Handler:
 class ProfileHost:
     """Runs one profile: relay + control API + Chrome, until Chrome exits or a stop is requested."""
 
-    def __init__(self, store: Store, profile: Profile, window: WindowMode | None = None) -> None:
+    def __init__(self, store: Store, profile: Profile, window: WindowMode | None = None, *,
+                 client_job: bool = False) -> None:
         self.store = store
         self.profile = profile
+        self.client_job = client_job
         self.launch = profile.launch.model_copy(deep=True)
         if window:
             self.launch.window = window
@@ -207,6 +213,9 @@ class ProfileHost:
         started = time.monotonic()
         self._install_signal_handlers()
         asyncio.get_running_loop().set_exception_handler(_quiet_connection_resets)
+        if self.client_job:
+            log.warning("running inside the kill-on-close job of the client that started this host: the browser "
+                        "will close when that client disconnects")
         if put_self_in_kill_on_close_job() is None and _WINDOWS:
             log.warning("running without a kill-on-close job: Chrome may outlive a crashed host")
         try:
@@ -297,6 +306,7 @@ class ProfileHost:
             control_port=self.control.port,
             control_token=token,
             window=launch.window,
+            client_job=True if self.client_job else None,
         )
         self._write_info()
 
@@ -496,7 +506,8 @@ class ProfileHost:
 # --------------------------------------------------------------------------- entry points
 
 
-def run_host(profile_id: str, root: Path | None = None, *, window: WindowMode | None = None) -> int:
+def run_host(profile_id: str, root: Path | None = None, *, window: WindowMode | None = None,
+             client_job: bool = False) -> int:
     """Run the host for ``profile_id`` until its browser exits. Returns the process exit code."""
     try:
         store = Store(root)
@@ -516,7 +527,7 @@ def run_host(profile_id: str, root: Path | None = None, *, window: WindowMode | 
         log.info("host starting for profile %s (%s), pid %s, window=%s", profile.name, profile.id, os.getpid(),
                  window or profile.launch.window)
         try:
-            return asyncio.run(ProfileHost(store, profile, window).run())
+            return asyncio.run(ProfileHost(store, profile, window, client_job=client_job).run())
         finally:
             handler.flush()
     finally:
@@ -529,11 +540,32 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("profile_id")
     parser.add_argument("--root", type=Path, default=None, help="ProfilePilot data root")
     parser.add_argument("--window", choices=["normal", "offscreen", "headless"], default=None)
+    parser.add_argument("--stderr", type=Path, default=None, help="append stderr to this file (no inherited handle)")
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
         return int(exc.code or 0) if isinstance(exc.code, int) else EXIT_USAGE
-    return run_host(args.profile_id, args.root, window=args.window)
+    if args.stderr is not None:
+        _redirect_stderr(args.stderr)
+    # Before anything else (lock, job object, Chrome): a host inside a client's kill-on-close job
+    # dies when that client disconnects. If the spawner can start us elsewhere, let it.
+    client_job = in_foreign_kill_on_close_job()
+    if client_job and os.environ.get(LEAVE_CLIENT_JOB_ENV) == "1":
+        return EXIT_IN_CLIENT_JOB
+    return run_host(args.profile_id, args.root, window=args.window, client_job=client_job)
+
+
+def _redirect_stderr(path: Path) -> None:
+    """A host started through WMI has no inherited stderr: write it (Python tracebacks, fatal
+    errors) to ``path`` instead."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stream = open(path, "a", encoding="utf-8", errors="replace", buffering=1)  # noqa: SIM115 - process lifetime
+    except OSError:
+        return
+    with contextlib.suppress(OSError, ValueError):
+        os.dup2(stream.fileno(), 2)
+    sys.stderr = stream
 
 
 if __name__ == "__main__":

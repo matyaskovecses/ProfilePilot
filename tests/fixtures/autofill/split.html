@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Split fields</title>
+<style>div { margin: 6px 0; } input { width: 4em; }</style>
+</head>
+<body>
+<h1>Verification</h1>
+<form id="split">
+  <div><label for="p1">Phone</label>
+    (<input id="p1" name="p1" maxlength="3">) <input name="p2" maxlength="3"> - <input name="p3" maxlength="4">
+  </div>
+  <div><label for="s1">SSN</label>
+    <input id="s1" name="s1" maxlength="3"> - <input name="s2" maxlength="2"> - <input name="s3" maxlength="4">
+  </div>
+  <div><label for="c1">Card number</label>
+    <input id="c1" name="c1" maxlength="4" inputmode="numeric"> <input name="c2" maxlength="4" inputmode="numeric">
+    <input name="c3" maxlength="4" inputmode="numeric"> <input name="c4" maxlength="4" inputmode="numeric">
+  </div>
+  <div><span>Date of birth</span>
+    <input name="dm" placeholder="MM" maxlength="2"> / <input name="dd" placeholder="DD" maxlength="2"> /
+    <input name="dy" placeholder="YYYY" maxlength="4">
+  </div>
+  <div><label for="cvv">CVV</label> <input id="cvv" name="cvv" maxlength="4" size="4"></div>
+  <div><label for="ssn4">Last 4 of SSN</label> <input id="ssn4" name="ssn4" maxlength="4"></div>
+</form>
+</body>
+</html>

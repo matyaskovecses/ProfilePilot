@@ -26,7 +26,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, AsyncIterator, Awaitable, Callable, Literal, TypeVar
+from typing import TYPE_CHECKING, Annotated, Any, AsyncIterator, Awaitable, Callable, Iterable, Literal, TypeVar
 
 import anyio
 import anyio.to_thread
@@ -82,6 +82,8 @@ proxy_test(profile=...).
 them in the profile's window.
 - Confirm with the user before destructive or irreversible actions (profile_delete, \
 cookies_clear, proxy_remove, purchases, posting, sending messages).
+- Forms: form_autofill(profile) fills the user's saved identity (identity_list); card, SSN and \
+password fields only via form_autofill_sensitive, which the user approves. Never invent personal data.
 - Profiles named shardx:<name> come from the optional ShardX backend.
 """
 
@@ -138,10 +140,64 @@ class AppState:
     remote: bool = False
     files_anywhere: bool = False
     """Local mode only: cookie file tools may use paths outside the data root (``--files-anywhere``)."""
+    sensitive_autofill: bool = True
+    """``form_autofill_sensitive`` is registered (always locally; remote only with
+    ``--allow-sensitive-autofill``)."""
     user_agents: dict[str, str] = field(default_factory=dict)
     """Cached ``navigator.userAgent`` per session key (used by ``http_fetch``)."""
     accept_languages: dict[str, str] = field(default_factory=dict)
     """Cached ``Accept-Language`` header (from ``navigator.languages``) per session key."""
+    filled_secrets: dict[str, set[str]] = field(default_factory=dict, repr=False)
+    """Per session key (survives CDP reconnects): the card numbers, SSNs and passwords (and their
+    common renderings) that ``form_autofill_sensitive`` put into this profile's pages. Every
+    page-reading tool output for the profile has them replaced by :data:`REDACTED`. Kept until the
+    profile is deleted or the server exits: a restarted profile can restore form values with its
+    session, and over-redaction is harmless."""
+    secret_pages: dict[str, set[str]] = field(default_factory=dict, repr=False)
+    """Per session key: URLs (without fragment) of the pages that received sensitive values. In
+    remote mode ``browser_evaluate`` / ``browser_screenshot`` refuse such a page until it navigates
+    away (scripts can transform a value past the redaction; screenshots show it as pixels)."""
+
+    @property
+    def clipboard_lock(self) -> Path:
+        """Lock file that serialises type-paste through the shared system clipboard."""
+        return self.store.clipboard_lock
+
+    def remember_secrets(self, key: str, variants: Iterable[str], page_url: str | None = None) -> None:
+        """Register sensitive values filled into the pages of session ``key`` (see :meth:`redact`)."""
+        needles = {v for v in variants if len(v) >= MIN_REDACTED_LENGTH}
+        if needles:
+            self.filled_secrets.setdefault(key, set()).update(needles)
+        if page_url:
+            self.secret_pages.setdefault(key, set()).add(_without_fragment(page_url))
+
+    def redact(self, key: str, text: str) -> str:
+        """``text`` with every registered sensitive value of session ``key`` replaced."""
+        needles = self.filled_secrets.get(key)
+        if not needles or not text:
+            return text
+        for needle in sorted(needles, key=len, reverse=True):
+            if needle in text:
+                text = text.replace(needle, REDACTED)
+        return text
+
+    def holds_secrets(self, key: str, page_url: str) -> bool:
+        """Did ``form_autofill_sensitive`` fill sensitive values into the page at ``page_url``?"""
+        return _without_fragment(page_url) in self.secret_pages.get(key, ())
+
+    def forget_secrets(self, key: str) -> None:
+        self.filled_secrets.pop(key, None)
+        self.secret_pages.pop(key, None)
+
+
+REDACTED = "[redacted]"
+MIN_REDACTED_LENGTH = 5
+"""Shorter values (a CVV, an expiry month, the last 4 digits that the masked view shows anyway)
+would mangle unrelated text such as element refs; snapshots mask such fields by their meaning."""
+
+
+def _without_fragment(url: str) -> str:
+    return (url or "").split("#", 1)[0]
 
 
 def get_state(ctx: Context) -> AppState:
@@ -179,6 +235,7 @@ def create_server(
     remote: bool = False,
     allow_private: bool = False,
     files_anywhere: bool = False,
+    allow_sensitive_autofill: bool = False,
     token_verifier: "TokenVerifier | None" = None,
     auth: "AuthSettings | None" = None,
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO",
@@ -192,6 +249,9 @@ def create_server(
         ``allow_private``, and cookie files are confined to the exports folders.
     :param files_anywhere: local mode only: let the cookie file tools use any folder (by default
         they are confined to the exports folders of the data root, like in remote mode).
+    :param allow_sensitive_autofill: remote mode only: also register ``form_autofill_sensitive``
+        (card, SSN and password autofill). Local servers always offer it; every call still needs
+        the user's approval and an allow-listed site.
     :param token_verifier: / ``auth``: bearer-token auth for the HTTP transport (see :mod:`.http`).
     """
     store = store if store is not None else Store(root)
@@ -200,6 +260,7 @@ def create_server(
     if enable_shardx is None:
         enable_shardx = shardx is not None or store.load_config().shardx.enabled
     policy = UrlPolicy(remote=remote, allow_private=allow_private)
+    sensitive_autofill = not remote or allow_sensitive_autofill
 
     @asynccontextmanager
     async def lifespan(_server: MCPServer) -> AsyncIterator[AppState]:
@@ -214,7 +275,7 @@ def create_server(
             owns_shardx = True
         browsers = BrowserManager(store, rt, sx)
         state = AppState(store=store, runtime=rt, browsers=browsers, policy=policy, shardx=sx, remote=remote,
-                         files_anywhere=files_anywhere)
+                         files_anywhere=files_anywhere, sensitive_autofill=sensitive_autofill)
         log.info("ProfilePilot server ready (data root %s, %s)", store.root, policy.describe())
         try:
             yield state
@@ -246,11 +307,12 @@ def create_server(
         **kwargs,
     )
 
-    from . import tools_browser, tools_data, tools_profiles
+    from . import tools_browser, tools_data, tools_identity, tools_profiles
 
     tools_profiles.register(server)
     tools_browser.register(server)
     tools_data.register(server)
+    tools_identity.register(server, sensitive=sensitive_autofill)
     if enable_shardx:
         from . import tools_shardx
 
@@ -305,8 +367,10 @@ def add_tool(
     open_world: bool,
     invoking: str,
     invoked: str,
+    meta: dict[str, Any] | None = None,
 ) -> None:
-    """Register ``fn`` (wrapped in :func:`tool_guard`) with annotations and status meta."""
+    """Register ``fn`` (wrapped in :func:`tool_guard`) with annotations and status meta
+    (``meta`` adds further ``_meta`` keys, e.g. :data:`REQUIRES_USER_INTERACTION`)."""
     server.add_tool(
         tool_guard(fn),
         name=fn.__name__,
@@ -315,9 +379,13 @@ def add_tool(
         annotations=annotations(
             read_only=read_only, destructive=destructive, idempotent=idempotent, open_world=open_world, title=title
         ),
-        meta=invocation_meta(invoking, invoked),
+        meta={**(meta or {}), **invocation_meta(invoking, invoked)},
         structured_output=False,
     )
+
+
+REQUIRES_USER_INTERACTION = "anthropic/requiresUserInteraction"
+"""Tool ``_meta`` key: Claude clients ask the user to approve every call of the tool."""
 
 
 # ---------------------------------------------------------------------- error handling

@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Secure checkout</title>
+<style>label { display: block; margin: 4px 0; } iframe { width: 460px; height: 170px; border: 1px solid #ccc; }</style>
+</head>
+<body>
+<h1>Verify and pay</h1>
+<form id="secure">
+  <label>Email <input type="email" name="email" autocomplete="email"></label>
+  <label>Social Security Number <input name="ssn_main"></label>
+  <label>Password <input type="password" name="pw" autocomplete="current-password"></label>
+  <!-- the shop's card processor (allowed for card fields) -->
+  <iframe id="card-frame" title="Secure card payment input frame" src="{{CARD_ORIGIN}}/card_frame.html"></iframe>
+  <!-- a third-party widget of another origin (reviews / chat / ads): must never get an SSN or card number -->
+  <p>What our customers say</p>
+  <iframe id="widget" title="Reviews" src="{{WIDGET_ORIGIN}}/widget_frame.html" style="height: 120px"></iframe>
+</form>
+</body>
+</html>

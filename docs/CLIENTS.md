@@ -236,7 +236,10 @@ Keep `tunnel-client run` running while you use ChatGPT. Run only one tunnel clie
 > and cookies, spend your proxy traffic and read pages as you. ChatGPT cannot send a password, so
 > the only protection is a long secret in the URL path. Keep the URL private, run the tunnel only
 > while you need it, and prefer profiles without important logins. Remote mode blocks `file://`,
-> `localhost` and private-network addresses; do not pass `--allow-private-network`.
+> `localhost` and private-network addresses; do not pass `--allow-private-network`. It also does
+> not offer `form_autofill_sensitive` (card, SSN and password autofill) unless you start the server
+> with `--allow-sensitive-autofill`; even then it only fills sites you allowed with
+> `profilepilot identity allow`.
 
 1. Start a tunnel to local port 8931 and note its public host name. With a Cloudflare quick tunnel
    (no account needed; the name changes on every run):
@@ -277,7 +280,13 @@ Restart Cursor or reload the server under **Cursor Settings > MCP**.
 
 ## Any other MCP client
 
-- **stdio:** command `<absolute path to python>`, arguments `-m profilepilot serve`.
+- **stdio:** command `<absolute path to python>`, arguments `-m profilepilot serve`. Some clients
+  (for example the official Python MCP SDK's `stdio_client`, used by many Python agent frameworks)
+  run the server in a Windows job that kills the server's whole process tree when the client
+  disconnects. ProfilePilot detects that and starts the profile's host outside the job (through
+  WMI), so browsers keep running. If that is not possible (no WMI), `profile_start` and
+  `profile_status` say so; start the profile from a terminal (`profilepilot profile start NAME`)
+  or connect over `serve --http` to keep it running.
 - **Streamable HTTP:** `profilepilot serve --http --port 8931 --auth token`, with the token in
   `PROFILEPILOT_TOKEN`. URL `http://127.0.0.1:8931/mcp`, header `Authorization: Bearer <TOKEN>`.
 

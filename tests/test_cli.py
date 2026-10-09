@@ -191,6 +191,86 @@ def test_serve_argument_validation(cli):
     assert refused.returncode == 1 and "Refusing" in refused.stderr
 
 
+TEST_CARD = "4242424242424242"  # the public Stripe test card number
+TEST_SSN = "000-12-3456"
+
+
+def test_identity_commands_never_take_or_print_sensitive_values(cli):
+    ident = "Testy McTestface"
+    out = cli("identity", "create", ident, "--set", "first_name=Testy", "--set", "last_name=McTestface",
+              "--set", "email=testy@example.test", "--set", "zip=12345").stdout
+    assert f"Created identity '{ident}'" in out and f'identity secret "{ident}" <field>' in out
+    refused = cli("identity", "create", "Other", "--set", f"ssn={TEST_SSN}", ok=False)
+    assert refused.returncode == 1 and "never taken from the command line" in refused.stderr
+    assert "profilepilot identity secret Other ssn" in refused.stderr
+    assert [i["name"] for i in json.loads(cli("identity", "list", "--json").stdout)] == [ident]
+
+    stored = cli("identity", "secret", ident, "card_number", "--stdin", stdin="4242 4242 4242 4242\n").stdout
+    assert "Stored card_number" in stored and "visa •••• 4242" in stored and "identity allow" in stored
+    cli("identity", "secret", ident, "ssn", "--stdin", stdin=TEST_SSN + "\r\n")
+    cli("identity", "secret", ident, "cvv", "--stdin", stdin="123\n")
+    argv = cli("identity", "secret", ident, "ssn", TEST_SSN, ok=False)
+    assert argv.returncode == 1 and "Never put the value on the command line" in argv.stderr
+    luhn = cli("identity", "secret", ident, "card_number", "--stdin", stdin="4242 4242 4242 4241\n", ok=False)
+    assert luhn.returncode == 1 and "Luhn" in luhn.stderr and "4241" not in luhn.stderr
+    no_tty = cli("identity", "secret", ident, "password", stdin="", ok=False)
+    assert no_tty.returncode == 1 and "--stdin" in no_tty.stderr
+    plain = cli("identity", "secret", ident, "email", "--stdin", stdin="x@example.test\n", ok=False)
+    assert "not a sensitive field" in plain.stderr
+    missing = cli("identity", "secret", ident, TEST_CARD, "--stdin", stdin="1\n", ok=False)
+    assert "Unknown identity field given" in missing.stderr
+
+    store = Store(cli.home)
+    from profilepilot.identity import IdentityStore
+
+    record = IdentityStore(store).get(ident)
+    assert store.secrets.get(f"identity:{record.id}:card_number") == TEST_CARD
+    assert store.secrets.get(f"identity:{record.id}:ssn") == TEST_SSN
+    assert store.secrets.get(f"identity:{record.id}:card_cvv") == "123"
+    on_disk = (cli.home / "identities.json").read_text(encoding="utf-8")
+    assert TEST_CARD not in on_disk and TEST_SSN not in on_disk and '"123"' not in on_disk
+
+    shown = cli("identity", "show", ident).stdout
+    assert "visa •••• 4242" in shown and "•••-••-3456" in shown and "testy@example.test" in shown
+    view = json.loads(cli("identity", "show", ident, "--json").stdout)
+    assert view["fields"]["card_cvv"] == "set" and view["fields"]["postal_code"] == "12345"
+
+    assert "https://shop.example.test" in cli("identity", "allow", ident, "https://Shop.Example.test/checkout").stdout
+    assert "needs HTTPS" in cli("identity", "allow", ident, "http://plain.example.test").stdout
+    cli("identity", "disallow", ident, "http://plain.example.test")
+    assert json.loads(cli("identity", "list", "--json").stdout)[0]["allowed_origins"] == ["https://shop.example.test"]
+
+    assert f"identity {ident}" in cli("profile", "create", "shop", "--identity", ident, "--window", "offscreen").stdout
+    listing = cli("profile", "list").stdout
+    assert "IDENTITY" in listing and ident in listing
+    cli("profile", "update", "shop", "--identity", "")
+    assert Store(cli.home).get_profile("shop").identity_id is None
+    cli("profile", "update", "shop", "--identity", ident)
+    assert "identity:  Testy McTestface" in cli("profile", "show", "shop").stdout
+
+    out = cli("identity", "set", ident, "city=Testville", "zip=").stdout
+    assert "set city" in out and "removed postal_code" in out
+    cli("identity", "clear", ident, "ssn")
+    assert Store(cli.home).secrets.get(f"identity:{record.id}:ssn") is None
+    fields = {f["key"]: f for f in json.loads(cli("identity", "fields", "--json").stdout)}
+    assert fields["card_number"]["sensitive"] and "cc" in fields["card_number"]["aliases"]
+    assert not fields["email"]["sensitive"]
+
+    unconfirmed = cli("identity", "delete", ident, stdin="", ok=False)
+    assert unconfirmed.returncode == 1 and "--yes" in unconfirmed.stderr
+    out = cli("identity", "delete", ident, "--yes").stdout
+    assert f"Deleted identity '{ident}'" in out and "Unlinked from: shop" in out
+    assert Store(cli.home).get_profile("shop").identity_id is None
+    assert Store(cli.home).secrets.get(f"identity:{record.id}:card_number") is None
+
+    serve = cli("serve", "--allow-sensitive-autofill", ok=False)
+    assert serve.returncode == 1 and "needs --http" in serve.stderr
+
+    for output in cli.history:
+        for secret in (TEST_CARD, "4242 4242 4242 4242", TEST_SSN, "000123456"):
+            assert secret not in output
+
+
 def _kill_leftovers(marker: Path) -> None:
     from profilepilot.browser.runtime import kill_tree
 

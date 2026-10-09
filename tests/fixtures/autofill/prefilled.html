@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Pre-filled</title></head>
+<body>
+<form id="pre">
+  <p><label>First name <input name="fn" autocomplete="given-name"></label></p>
+  <p><label>Email <input name="em" type="email" autocomplete="email" value="already@example.test"></label></p>
+  <p><label>Country
+    <select name="cn" autocomplete="country">
+      <option value="">--</option><option value="DE" selected>Germany</option><option value="US">United States</option>
+    </select></label></p>
+  <p><label>City <input name="ci" autocomplete="address-level2"></label></p>
+  <section id="billing">
+    <p><label>Billing city <input name="bci" autocomplete="billing address-level2"></label></p>
+    <p><label>Billing ZIP <input name="bzp" autocomplete="billing postal-code"></label></p>
+  </section>
+</form>
+</body>
+</html>

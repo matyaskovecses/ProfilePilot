@@ -17,7 +17,10 @@ clients (DESIGN section 6):
   - ``none``: refused unless the server binds a loopback address *and* ``i_understand`` is set.
 
 * the URL policy runs in remote mode: localhost / private-network targets are blocked unless
-  ``allow_private``.
+  ``allow_private``;
+* ``form_autofill_sensitive`` (card, SSN and password autofill) is not offered unless
+  ``allow_sensitive_autofill`` (``--allow-sensitive-autofill``): remote clients such as ChatGPT
+  cannot be relied on to ask the user before every call.
 
 Uvicorn's access log is disabled: request lines would contain the secret path.
 """
@@ -129,6 +132,7 @@ class HttpPlan:
     token: str | None = None
     token_generated: bool = False
     urls: list[str] = field(default_factory=list)
+    sensitive_autofill: bool = False
 
 
 def build_http_app(
@@ -146,6 +150,7 @@ def build_http_app(
     store: Store | None = None,
     runtime: Any = None,
     log_level: str = "INFO",
+    allow_sensitive_autofill: bool = False,
 ) -> HttpPlan:
     """Build the Starlette app of the remote server (validating the auth choice)."""
     from .app import create_server
@@ -186,6 +191,7 @@ def build_http_app(
 
     server = create_server(
         store=store, runtime=runtime, remote=True, allow_private=allow_private,
+        allow_sensitive_autofill=allow_sensitive_autofill,
         token_verifier=verifier, auth=auth_settings, log_level=log_level.upper(),  # type: ignore[arg-type]
     )
     app = server.streamable_http_app(
@@ -198,7 +204,7 @@ def build_http_app(
     local_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else (f"[{host}]" if ":" in host else host)
     urls = [f"http://{local_host}:{port}{endpoint}"] + [f"https://{h}{endpoint}" for h in publics]
     return HttpPlan(app=app, server=server, host=host, port=int(port), path=endpoint, auth=auth, token=token,
-                    token_generated=generated, urls=urls)
+                    token_generated=generated, urls=urls, sensitive_autofill=allow_sensitive_autofill)
 
 
 def describe_plan(plan: HttpPlan) -> str:
@@ -214,6 +220,12 @@ def describe_plan(plan: HttpPlan) -> str:
     if plan.auth == "token" and plan.token_generated:
         lines.append(f"Generated token (shown once; set {ENV_TOKEN} to keep a fixed one): {plan.token}")
     lines.append("Remote mode: localhost and private-network URLs are blocked unless --allow-private-network.")
+    if plan.sensitive_autofill:
+        lines.append("Sensitive autofill (card, SSN, password) is ON: form_autofill_sensitive is offered to remote "
+                     "clients (only on sites allowed with 'profilepilot identity allow').")
+    else:
+        lines.append("Sensitive autofill (card, SSN, password) is off for remote clients "
+                     "(--allow-sensitive-autofill enables it).")
     return "\n".join(lines)
 
 
@@ -231,6 +243,7 @@ def serve_http(
     root: Path | str | None = None,
     log_level: str = "INFO",
     announce: Callable[[str], None] | None = None,
+    allow_sensitive_autofill: bool = False,
 ) -> None:
     """Run the remote MCP server until interrupted (blocking).
 
@@ -243,7 +256,7 @@ def serve_http(
     plan = build_http_app(
         host=host, port=port, path=path, public_hosts=public_hosts, auth=auth, token=token,
         allow_private=allow_private, i_understand=i_understand, new_secret=new_secret, root=root,
-        log_level=log_level,
+        log_level=log_level, allow_sensitive_autofill=allow_sensitive_autofill,
     )
     banner = describe_plan(plan)
     if announce is not None:

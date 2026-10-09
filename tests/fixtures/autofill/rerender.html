@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Re-rendering form</title></head>
+<body>
+<form id="spa">
+  <p><label>Country
+    <select name="country" autocomplete="country">
+      <option value="">--</option><option value="US">United States</option><option value="DE">Germany</option>
+    </select></label></p>
+  <div id="box"><p><label>City <input name="city" autocomplete="address-level2"></label></p></div>
+  <div id="extra"></div>
+</form>
+<script>
+  // Like many single-page apps: choosing a country re-renders the address block (new nodes) and
+  // reveals fields that depend on the country.
+  document.querySelector('[name=country]').addEventListener('change', () => {
+    document.getElementById('box').innerHTML =
+      '<p><label>City <input name="city" autocomplete="address-level2"></label></p>';
+    document.getElementById('extra').innerHTML =
+      '<p><label>ZIP code <input name="zip" autocomplete="postal-code"></label></p>';
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Newsletter</title>
+<style>iframe { border: 0; }</style>
+</head>
+<body>
+<h1>Get our newsletter</h1>
+<!-- Classic autofill phishing: only the email box is visible; everything else is hidden from a
+     person but looks like a normal, visible form field to naive checks. -->
+<form id="news">
+  <label>Email <input name="email" type="email"></label>
+  <div style="height:0;overflow:hidden">
+    <label>Full name <input name="fullname" autocomplete="name"></label>
+    <label>Street address <input name="street" autocomplete="street-address"></label>
+    <label>Phone <input name="tel" type="tel" autocomplete="tel"></label>
+    <label>Date of birth <input name="bday" autocomplete="bday"></label>
+  </div>
+  <input name="city" autocomplete="address-level2" style="position:absolute;left:5000px;top:10px">
+  <input name="zip" autocomplete="postal-code" style="opacity:0.01">
+  <input name="country" autocomplete="country-name" style="clip-path:inset(100%)">
+  <div style="position:relative;display:inline-block"><input name="org" autocomplete="organization">
+    <div style="position:absolute;inset:0;background:#fff"></div></div>
+  <div style="opacity:0.2"><div style="opacity:0.3"><input name="faded" autocomplete="family-name"></div></div>
+  <button type="button">Subscribe</button>
+</form>
+<!-- hidden frames: nearly transparent, and too small to see -->
+<iframe id="ghost" src="{{WIDGET_ORIGIN}}/name_frame.html" style="width:300px;height:80px;opacity:0.05"></iframe>
+<iframe id="tiny" src="{{WIDGET_ORIGIN}}/name_frame.html" style="width:6px;height:6px"></iframe>
+</body>
+</html>

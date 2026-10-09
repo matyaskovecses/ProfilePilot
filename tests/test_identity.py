@@ -113,3 +113,32 @@ def test_helpers():
     assert normalize_origin("http://a.test:8080/x") == "http://a.test:8080"
     assert derived_values({"birth_date": "1990-03-14"}) == {"birth_year": "1990", "birth_month": "03", "birth_day": "14"}
     assert {"ssn", "card_number", "card_cvv", "card_exp_month", "card_exp_year", "password"} == SENSITIVE_FIELDS
+
+
+def test_origins_keep_non_default_ports_and_reject_non_web_pages(ids):
+    assert normalize_origin("https://Shop.example.test:443/pay") == "https://shop.example.test"
+    assert normalize_origin("http://shop.example.test:80/") == "http://shop.example.test"
+    # only the scheme's own default port is dropped: these are different origins
+    assert normalize_origin("http://shop.example.test:443") == "http://shop.example.test:443"
+    assert normalize_origin("https://shop.example.test:80") == "https://shop.example.test:80"
+    assert normalize_origin("http://[::1]:8080/x") == "http://[::1]:8080"
+    for page in ("about:blank", "data:text/html,<p>x</p>", "chrome://newtab", "https://x.test:notaport/"):
+        with pytest.raises(ProfilePilotError, match="Not a web origin"):
+            normalize_origin(page)
+    ids.create("Me")
+    for page in ("about:blank", "data:text/html,<p>x</p>"):
+        with pytest.raises(PolicyError, match="only works on http"):
+            ids.check_sensitive_origin("Me", page)
+
+
+def test_card_numbers_and_ssns_are_refused_as_plain_values(ids):
+    ids.create("Me", {"phone": "+49 4111 1111 1111 1"})  # a long phone number is not a card number
+    for key, value in (("company", TEST_CARD), ("username", "4242424242424242"), ("city", "000-12-3456"),
+                       ("address_line2", "000 12 3456")):
+        with pytest.raises(PolicyError, match="profilepilot identity secret") as exc:
+            ids.update("Me", {key: value})
+        assert value not in str(exc.value) and "Nothing was saved" in str(exc.value)
+        with pytest.raises(PolicyError):
+            ids.create(f"Other {key}", {key: value})
+    assert ids.get("Me").values == {"phone": "+49 4111 1111 1111 1"}
+    ids.update("Me", {"company": "Example Test Co 4242", "postal_code": "12345-6789"})  # ordinary values pass

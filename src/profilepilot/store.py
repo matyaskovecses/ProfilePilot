@@ -4,7 +4,9 @@ Layout (``root`` defaults to :func:`profilepilot.paths.data_root`)::
 
     config.json                      AppConfig
     proxies.json                     {"proxies": [ProxyRecord, ...]}   (no passwords)
+    identities.json                  autofill identities (no sensitive values; see identity.py)
     secrets.json                     fallback secret store (only if no OS keyring)
+    clipboard.lock                   serialises type-paste through the system clipboard
     profiles/<id>/profile.json       Profile
     profiles/<id>/udd/               Chrome --user-data-dir (cookies, history, storage, cache)
     profiles/<id>/runtime.json       RuntimeInfo while running (written by the host process)
@@ -83,6 +85,8 @@ class Store:
         self.trash_dir = self.root / "trash"
         self.proxies_file = self.root / "proxies.json"
         self.config_file = self.root / "config.json"
+        self.clipboard_lock = self.root / "clipboard.lock"
+        """Cross-process lock serialising type-paste (see :mod:`profilepilot.automation.clipboard`)."""
         self.profiles_dir.mkdir(exist_ok=True)
         self.secrets = secrets or SecretStore(self.root)
 
@@ -180,10 +184,13 @@ class Store:
         browser: str = "auto",
         launch: LaunchOptions | dict[str, Any] | None = None,
         color: str | None = None,
+        identity_id: str | None = None,
     ) -> Profile:
+        """Create a profile. ``proxy_id`` / ``identity_id`` accept a name, id or unique id prefix."""
         name = _validate_name(name)
         if proxy_id:
             proxy_id = self.get_proxy(proxy_id).id
+        identity_id = self._identity_id(identity_id)
         with self._profiles_lock:
             if any(p.name.casefold() == name.casefold() for p in self.list_profiles()):
                 raise ConflictError(f"A profile named '{name}' already exists.")
@@ -195,7 +202,7 @@ class Store:
                 launch_opts.window = self.load_config().default_window
             profile = Profile(
                 id=pid, name=name, notes=notes, tags=_clean_tags(tags), proxy_id=proxy_id,
-                browser=browser or "auto", launch=launch_opts, color=color,
+                browser=browser or "auto", launch=launch_opts, color=color, identity_id=identity_id,
             )
             self.user_data_dir(pid).mkdir(parents=True, exist_ok=True)
             write_json(self._profile_file(pid), profile.model_dump(mode="json"))
@@ -218,9 +225,13 @@ class Store:
         return profile
 
     def update_profile(self, ref: str, *, expected_rev: int | None = None, **changes: Any) -> Profile:
-        """Update fields. Supported keys: name, notes, tags, color, proxy_id, browser, launch (dict, merged)."""
+        """Update fields. Supported keys: name, notes, tags, color, proxy_id, identity_id, browser,
+        launch (dict, merged). ``proxy_id`` / ``identity_id`` take a name, id or id prefix; None or
+        ``""`` removes the link."""
         with self._profiles_lock:
             profile = self.get_profile(ref)
+            if "identity_id" in changes:
+                profile.identity_id = self._identity_id(changes.pop("identity_id"))
             if "name" in changes and changes["name"] is not None:
                 new_name = _validate_name(changes.pop("name"))
                 if new_name.casefold() != profile.name.casefold() and any(
@@ -246,6 +257,18 @@ class Store:
             if unknown:
                 raise ProfilePilotError(f"Unknown profile field(s): {', '.join(unknown)}")
             return self.save_profile(profile, expected_rev=expected_rev)
+
+    def _identity_id(self, ref: str | None) -> str | None:
+        """The id of identity ``ref`` (name, id or unique id prefix); None for None / ``""``."""
+        ref = (ref or "").strip()
+        if not ref:
+            return None
+        from .identity import IdentityStore  # lazy: identity.py is not needed by most store users
+
+        return IdentityStore(self).get(ref).id
+
+    def profiles_using_identity(self, identity_id: str) -> list[Profile]:
+        return [p for p in self.list_profiles() if p.identity_id == identity_id]
 
     def touch_started(self, profile_id: str) -> None:
         path = self._profile_file(profile_id)
@@ -312,9 +335,15 @@ class Store:
         src = self.get_profile(ref)
         if copy_data:
             self._ensure_not_in_use(src, "clone its browser data")
+        identity_id = src.identity_id
+        if identity_id:
+            try:
+                self._identity_id(identity_id)
+            except NotFoundError:  # the linked identity was deleted meanwhile: do not copy a dead link
+                identity_id = None
         clone = self.create_profile(
             new_name, notes=src.notes, tags=src.tags, proxy_id=src.proxy_id, browser=src.browser,
-            launch=src.launch.model_copy(deep=True), color=src.color,
+            launch=src.launch.model_copy(deep=True), color=src.color, identity_id=identity_id,
         )
         if copy_data:
             dst = self.user_data_dir(clone.id)
@@ -403,7 +432,9 @@ class Store:
         orphan_cutoff = time.time() - older_than_days * 86400
         for orphan in self._orphaned_trash_dirs():
             try:
-                if orphan.stat().st_mtime <= orphan_cutoff:
+                # older_than_days <= 0 means "everything": a just-created folder's NTFS mtime can be a
+                # few microseconds *after* time.time(), so never rely on the comparison for that case.
+                if older_than_days <= 0 or orphan.stat().st_mtime <= orphan_cutoff:
                     _rmtree(orphan)
             except OSError:
                 pass

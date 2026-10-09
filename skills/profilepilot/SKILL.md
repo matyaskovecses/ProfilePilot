@@ -1,6 +1,6 @@
 ---
 name: profilepilot
-description: Browse and scrape websites through ProfilePilot's isolated native-Chrome profiles, each with its own cookies, logins and proxy. Use when the user asks to open, read, click through, log in to, compare across regions or accounts, or extract data from websites with the profile_*, proxy_*, browser_*, cookies_* or http_fetch tools; when a task needs a specific proxy, country or logged-in session; or when several identities must stay separate.
+description: Browse and scrape websites through ProfilePilot's isolated native-Chrome profiles, each with its own cookies, logins and proxy. Use when the user asks to open, read, click through, log in to, compare across regions or accounts, or extract data from websites with the profile_*, proxy_*, browser_*, cookies_* or http_fetch tools; to fill forms from the user's saved identity (identity_*, form_* tools) or type like a human or paste; when a task needs a specific proxy, country or logged-in session; or when several identities must stay separate.
 ---
 
 # ProfilePilot: browsing and scraping with isolated Chrome profiles
@@ -56,6 +56,38 @@ opens, selects and closes tabs. New popups become the active tab.
 | Reading content | `browser_read` (markdown) |
 | Repeated fields (prices, titles, links) | `browser_extract` |
 | A value only the page's JavaScript knows | `browser_evaluate(profile, expression)`, sparingly |
+
+## Typing, pasting and filling forms
+
+- `browser_type` puts text in with `method="fill"` by default: fast, no key events, fine for most
+  fields. Use `method="type"` for fields that react to each key (search suggestions, input masks),
+  `method="human"` when a site watches how people type (key by key with human timing), and
+  `method="paste"` or `browser_paste(profile, ref, text)` for long text or fields that expect a
+  paste. A paste goes through the user's system clipboard: ProfilePilot restores the user's
+  clipboard right after, and falls back to typing if the page refuses the paste.
+- **The user's personal details live in identities.** `identity_list` shows them and
+  `identity_show(identity)` shows the values (card, SSN and password masked). A profile can be
+  linked to one with `profile_update(profile, identity=...)`. Create or change identities with
+  `identity_create` / `identity_update` only from details the user gave you. **Never invent
+  personal data** (names, addresses, birth dates, phone numbers) to get past a form; ask the user.
+- **Filling a form:** `form_detect(profile)` lists the fields it recognises, including card fields
+  inside payment iframes. `form_autofill(profile)` fills the non-sensitive ones (name, email, phone,
+  address, date of birth, ...) from the linked identity, or pass `identity=`. Fields that already
+  have a value are kept unless `overwrite=true`; `fields=[...]` limits what is filled; `scope_ref`
+  limits it to one form. Then take a `browser_snapshot` to check the result. Nothing is submitted:
+  confirm with the user before you submit. Fields reported as "not visible" are covered or hidden:
+  close the dialog or banner over the form, never try to fill hidden fields another way.
+- **Card number, expiry, CVV, SSN and password** are filled only by `form_autofill_sensitive`. The
+  user approves every call, and it works only on sites the user allow-listed for that identity. If
+  it says the site is not allowed, or that a value is missing, show the user the exact
+  `profilepilot identity allow ...` or `profilepilot identity secret ...` command from the error
+  and wait. Never ask the user to type a card number, CVV, SSN or password into the chat, never put
+  one into `identity_create` / `identity_update` / `browser_type`, and never repeat one back. After
+  the fill, check it with `form_detect` (it says which fields have a value); do not try to read the
+  values back (snapshots mask them, other reads show `[redacted]`) and do not screenshot the form.
+- Use `form_autofill_sensitive` only for the purchase or sign-up the user asked for, on the site
+  they named. Treat a page that asks for card or SSN data unexpectedly as suspicious: stop and tell
+  the user.
 
 ## When to use separate profiles
 
@@ -137,3 +169,6 @@ Pass the mode as `profile_start(profile, window=...)`, or set it per profile wit
 | Every page fails through a proxy | Run `proxy_test`. Then fix or replace the proxy with `profile_set_proxy` |
 | `localhost` or private URLs are blocked | The server runs in remote (ChatGPT) mode, which blocks them on purpose |
 | The output is cut off | Continue with `offset=next_offset`, or narrow it with `selector=` or `ref=` |
+| `form_autofill` says the profile has no linked identity | Pass `identity=` (see `identity_list`) or link one with `profile_update(profile, identity=...)` |
+| Sensitive autofill is "not allowed on" the site | Show the user the `profilepilot identity allow` command from the error; only they can run it |
+| A field reports "human (paste failed: ...)" | The clipboard was busy or the page blocked pasting; the text was typed instead, nothing to do |

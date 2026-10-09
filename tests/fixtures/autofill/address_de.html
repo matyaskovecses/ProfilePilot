@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="de">
+<head><meta charset="utf-8"><title>Lieferadresse</title>
+<style>label { display: block; margin: 4px 0; }</style>
+</head>
+<body>
+<h1>Lieferadresse</h1>
+<!-- German layout: street and house number in separate fields -->
+<form id="de">
+  <label>Straße <input name="strasse"></label>
+  <label>Hausnr. <input name="hausnr" maxlength="6" size="6"></label>
+  <label>PLZ <input name="plz" maxlength="5"></label>
+  <label>Ort <input name="ort"></label>
+</form>
+<form id="en">
+  <label>Street <input name="street_en"></label>
+  <label>House number <input name="house_en" maxlength="8"></label>
+</form>
+<form id="combined">
+  <label>Street and house number <input name="line1"></label>
+</form>
+</body>
+</html>

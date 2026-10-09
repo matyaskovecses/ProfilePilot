@@ -18,6 +18,7 @@ from pydantic import Field
 
 from ..automation.manager import SHARDX_PREFIX, is_shardx_ref
 from ..errors import ConflictError, NotFoundError, ProfilePilotError, RestartRequiredError
+from ..identity import Identity, IdentityStore
 from ..models import Profile, ProxyCheck, ProxyRecord, RuntimeInfo
 from ..proxy.url import ProxyEndpoint, ProxyParseError, parse_proxy
 from ..safety import UrlPolicy, normalize_url
@@ -53,6 +54,12 @@ BrowserArg = Annotated[
     Literal["auto", "chrome", "edge", "brave", "chromium"] | None,
     Field(description="Which installed browser to use (default auto: Chrome, then Edge, Brave, Chromium)."),
 ]
+IdentityLinkArg = Annotated[
+    str,
+    NoneOK,
+    Field(description="Identity (name or id, see identity_list) whose details form_autofill uses for this profile "
+                      "by default; '' removes the link."),
+]
 # Model-facing tools accept only browser *kinds*: a custom executable path or extra Chrome switches
 # (e.g. --renderer-cmd-prefix) would let a model run arbitrary programs. Both stay available in
 # the CLI (``profilepilot profile update --browser PATH --extra-arg ...``), typed by the user.
@@ -71,7 +78,8 @@ def proxy_label(record: ProxyRecord | None) -> str:
     return f"{record.name} ({record.redacted_url()})"
 
 
-def profile_line(profile: Profile, proxies: dict[str, ProxyRecord], info: RuntimeInfo | None) -> str:
+def profile_line(profile: Profile, proxies: dict[str, ProxyRecord], info: RuntimeInfo | None,
+                 identities: dict[str, str] | None = None) -> str:
     parts = [f"- {profile.name} (id {profile.id})"]
     parts.append(f"running, {info.window} window" if info else "stopped")
     if profile.proxy_id:
@@ -81,6 +89,9 @@ def profile_line(profile: Profile, proxies: dict[str, ProxyRecord], info: Runtim
         parts.append("no proxy")
     if profile.tags:
         parts.append("tags " + ", ".join(profile.tags))
+    if profile.identity_id:
+        name = (identities or {}).get(profile.identity_id)
+        parts.append(f"identity {name}" if name else f"identity {profile.identity_id} (missing)")
     if profile.launch.lang:
         parts.append(f"lang {profile.launch.lang}")
     if profile.launch.timezone:
@@ -110,7 +121,17 @@ def runtime_text(profile_name: str, info: RuntimeInfo) -> str:
         lines.append("Proxy: none (the browser connects directly).")
     if info.cdp_http_url:
         lines.append(f"DevTools endpoint: {info.cdp_http_url}")
+    if info.client_job:
+        lines.append(CLIENT_JOB_WARNING.format(name=profile_name))
     return "\n".join(lines)
+
+
+CLIENT_JOB_WARNING = (
+    "Note: this MCP client kills its server's processes when it disconnects, so this browser will close with it. "
+    "To keep it running across conversations, the user can start it from a terminal (profilepilot profile start "
+    "\"{name}\"), connect over profilepilot serve --http, or opt in to escape_client_job in config.json "
+    "(Windows; restarts the host through WMI outside the client's job)."
+)
 
 
 def check_text(label: str, result: ProxyCheck) -> str:
@@ -204,8 +225,9 @@ async def profile_list(
         return "No profiles yet. Create one with profile_create(name, proxy?)."
     proxies = {p.id: p for p in await run_sync(state.store.list_proxies)}
     running = {i.profile_id: i for i in await run_sync(state.runtime.list_running)}
+    identities = {i.id: i.name for i in await run_sync(IdentityStore(state.store).list)}
     lines = [f"{len(profiles)} profile(s), {sum(1 for p in profiles if p.id in running)} running:"]
-    lines += [profile_line(p, proxies, running.get(p.id)) for p in profiles]
+    lines += [profile_line(p, proxies, running.get(p.id), identities) for p in profiles]
     return paginate_text("\n".join(lines), offset, max_chars)
 
 
@@ -223,6 +245,7 @@ async def profile_create(
     timezone: Annotated[str, NoneOK, Field(description="IANA timezone override, e.g. 'Europe/Berlin' (opt-in).")] = None,
     start_url: Annotated[str, NoneOK, Field(description="Page opened when the profile starts.")] = None,
     proxy_scheme: SchemeArg = "http",
+    identity: IdentityLinkArg = None,
 ) -> str:
     """Create a profile: a new isolated Chrome identity with its own cookies, storage and optional proxy."""
     state = get_state(ctx)
@@ -231,11 +254,12 @@ async def profile_create(
         url = normalize_url(start_url or "")
         await state.policy.acheck(url)
 
-    def create() -> tuple[Profile, ProxyRecord | None]:
+    def create() -> tuple[Profile, ProxyRecord | None, Identity | None]:
         store = state.store
         clean = (name or "").strip()
         if clean and any(p.name.casefold() == clean.casefold() for p in store.list_profiles()):
             raise ConflictError(f"A profile named '{clean}' already exists. Pick another name or use it.")
+        linked = IdentityStore(store).get(identity or "") if not is_blank(identity) else None
         record = resolve_or_save_proxy(store, proxy, name_hint=clean, scheme=proxy_scheme,
                                        policy=state.policy) if not is_blank(proxy) else None
         launch: dict[str, Any] = {"window": window or store.load_config().default_window}
@@ -247,17 +271,19 @@ async def profile_create(
             launch["start_url"] = url
         created = store.create_profile(
             clean, notes=notes or "", tags=tags or (), proxy_id=record.id if record else None,
-            browser=browser or "auto", launch=launch,
+            browser=browser or "auto", launch=launch, identity_id=linked.id if linked else None,
         )
-        return created, record
+        return created, record, linked
 
-    profile, record = await run_sync(create)
+    profile, record, linked = await run_sync(create)
     lines = [
         f"Created profile '{profile.name}' (id {profile.id}).",
         f"Proxy: {proxy_label(record)}.",
         f"Window: {profile.launch.window}. Browser tools start it automatically "
         "(profile_start only to pick a different window mode).",
     ]
+    if linked is not None:
+        lines.append(f"Identity for form autofill: {linked.name}.")
     if profile.launch.window == "headless":
         lines.append("Note: headless mode is detectable by websites (HeadlessChrome user agent).")
     return "\n".join(lines)
@@ -277,9 +303,10 @@ async def profile_update(
     restore_session: Annotated[bool | None, Field(description="Reopen tabs and keep session cookies across restarts.")] = None,
     webrtc: Annotated[Literal["auto", "proxy_only", "default"] | None, Field(
         description="WebRTC policy: auto (proxy_only when proxied), proxy_only, default.")] = None,
+    identity: IdentityLinkArg = None,
 ) -> str:
-    """Change a profile's name, notes, tags or launch settings. Use profile_set_proxy for its proxy.
-    Launch settings apply at the next start."""
+    """Change a profile's name, notes, tags, linked identity or launch settings. Use profile_set_proxy for
+    its proxy. Launch settings apply at the next start."""
     state = get_state(ctx)
     if is_shardx_ref(profile):
         raise ProfilePilotError("ShardX profiles are managed in the ShardX launcher.")
@@ -301,19 +328,27 @@ async def profile_update(
     if webrtc is not None:
         launch["webrtc"] = webrtc
 
-    def update() -> tuple[Profile, bool]:
+    def update() -> tuple[Profile, bool, Identity | None]:
         current = state.store.get_profile(profile)
+        links: dict[str, Any] = {}
+        if identity is not None:
+            links["identity_id"] = identity.strip() or None
         updated = state.store.update_profile(
             current.id, name=name, notes=notes, tags=tags,
             browser=browser,
             launch=launch or None,
+            **links,
         )
-        return updated, state.runtime.status(updated.id) is not None
+        linked = IdentityStore(state.store).get(updated.identity_id) if identity and updated.identity_id else None
+        return updated, state.runtime.status(updated.id) is not None, linked
 
-    updated, running = await run_sync(update)
-    changed = [k for k, v in {"name": name, "notes": notes, "tags": tags, "browser": browser}.items() if v is not None]
+    updated, running, linked = await run_sync(update)
+    changed = [k for k, v in {"name": name, "notes": notes, "tags": tags, "browser": browser,
+                              "identity": identity}.items() if v is not None]
     changed += sorted(launch)
     lines = [f"Updated profile '{updated.name}' (id {updated.id}): {', '.join(changed) or 'nothing changed'}."]
+    if identity is not None:
+        lines.append(f"Identity for form autofill: {linked.name}." if linked else "No identity is linked any more.")
     if running and (launch or browser is not None):
         lines.append("The profile is running: launch changes apply after profile_stop + profile_start.")
     return "\n".join(lines)
@@ -328,6 +363,7 @@ async def profile_delete(ctx: Context, profile: ProfileArg) -> str:
     target = await run_sync(state.store.get_profile, profile)
     await state.browsers.disconnect(target.id)
     entry = await run_sync(state.store.delete_profile, target.id)
+    state.forget_secrets(target.id)  # its pages are gone with it
     return (
         f"Moved profile '{entry.name}' to the trash (trash id {entry.trash_id}). "
         f"The user can restore it with: profilepilot profile restore {entry.trash_id}"

@@ -37,9 +37,11 @@ PROFILE_TOOLS = {
 BROWSER_TOOLS = {
     "browser_navigate", "browser_snapshot", "browser_click", "browser_type", "browser_press_key",
     "browser_select_option", "browser_hover", "browser_scroll", "browser_wait_for", "browser_screenshot",
-    "browser_read", "browser_extract", "browser_evaluate", "browser_tabs",
+    "browser_read", "browser_extract", "browser_evaluate", "browser_tabs", "browser_paste",
 }
 DATA_TOOLS = {"cookies_get", "cookies_set", "cookies_clear", "cookies_export", "cookies_import", "http_fetch"}
+IDENTITY_TOOLS = {"identity_list", "identity_show", "identity_create", "identity_update", "form_detect",
+                  "form_autofill", "form_autofill_sensitive"}
 SHARDX_TOOLS = {"shardx_status", "shardx_profiles", "shardx_start", "shardx_stop"}
 
 SECRET = "Sup3r-S3cret!pw"
@@ -97,7 +99,7 @@ async def test_tool_catalogue_and_annotations(home):
     async with Client(create_server(store=home)) as client:
         tools = (await client.list_tools()).tools
     names = {t.name for t in tools}
-    assert names == PROFILE_TOOLS | BROWSER_TOOLS | DATA_TOOLS  # ShardX tools only when enabled
+    assert names == PROFILE_TOOLS | BROWSER_TOOLS | DATA_TOOLS | IDENTITY_TOOLS  # ShardX tools only when enabled
     for tool in tools:
         a = tool.annotations
         assert a is not None, tool.name
@@ -114,6 +116,10 @@ async def test_tool_catalogue_and_annotations(home):
     assert by_name["browser_snapshot"].annotations.read_only_hint is True
     assert by_name["http_fetch"].annotations.open_world_hint is True
     assert "profile" in by_name["browser_navigate"].input_schema["required"]
+    sensitive = by_name["form_autofill_sensitive"]
+    assert sensitive.annotations.destructive_hint is True and sensitive.annotations.idempotent_hint is False
+    assert sensitive.meta["anthropic/requiresUserInteraction"] is True
+    assert by_name["form_detect"].annotations.read_only_hint is True
 
 
 def test_instructions_are_short_and_front_loaded():
@@ -603,3 +609,65 @@ async def test_cookie_files_roundtrip(chrome_home, tmp_path):
             for name in ("src", "dst"):
                 await rec.call("profile_stop", {"profile": name})
             rec.assert_no_secret("v-123456")
+
+
+# ---------------------------------------------------------------------- browsers outlive their MCP client
+
+
+async def _start_via_python_sdk_stdio_client(chrome_home, tmp_path, extra_env):
+    import os
+
+    from mcp.client.stdio import StdioServerParameters, stdio_client
+
+    from profilepilot.browser.runtime import RuntimeManager
+
+    env = {k: v for k, v in os.environ.items() if k != "PROFILEPILOT_ESCAPE_CLIENT_JOB"}
+    env.update({"PROFILEPILOT_HOME": str(chrome_home.root), "PROFILEPILOT_SECRETS": "file", **extra_env})
+    params = StdioServerParameters(command=sys.executable, args=["-m", "profilepilot", "serve"], env=env,
+                                   cwd=str(Path(__file__).resolve().parents[1]))
+    with open(tmp_path / "stderr.log", "w", encoding="utf-8") as errlog:
+        async with Client(stdio_client(params, errlog=errlog)) as client:
+            started = text_of(await client.call_tool("profile_start", {"profile": "p", "window": "offscreen"}))
+            runtime = RuntimeManager(chrome_home)
+            info = runtime.status("p")
+    assert "is running" in started and info is not None
+    await asyncio.sleep(2.0)  # the client's job is closed by now; a host inside it would be gone
+    return started, info, runtime
+
+
+@pytest.mark.chrome
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows job objects")
+async def test_python_sdk_client_job_is_respected_by_default(chrome_home, tmp_path):
+    """The official Python SDK's stdio client runs its server in a kill-on-close job that does not
+    allow breakaway. By default ProfilePilot respects that job (no WMI escape): the browser closes
+    with the client and the tool output tells the user how to keep it running."""
+    from profilepilot.server.tools_profiles import CLIENT_JOB_WARNING
+
+    chrome_home.create_profile("p")
+    started, info, runtime = await _start_via_python_sdk_stdio_client(chrome_home, tmp_path, {})
+    assert info.client_job
+    assert CLIENT_JOB_WARNING.split(",")[0] in started and "escape_client_job" in started
+    assert runtime.status("p") is None  # the host died with the client's job
+
+
+@pytest.mark.chrome
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows job objects")
+async def test_python_sdk_client_job_escape_is_opt_in(chrome_home, tmp_path):
+    """With PROFILEPILOT_ESCAPE_CLIENT_JOB=1 the host restarts itself through WMI outside the
+    client's job, so the browser outlives the client."""
+    import importlib.util
+
+    if importlib.util.find_spec("win32com") is None:
+        pytest.skip("pywin32 (WMI) not available")
+    chrome_home.create_profile("p")
+    started, info, runtime = await _start_via_python_sdk_stdio_client(
+        chrome_home, tmp_path, {"PROFILEPILOT_ESCAPE_CLIENT_JOB": "1"})
+    try:
+        assert not info.client_job
+        assert "kills its server's processes" not in started
+        after = runtime.status("p")
+        assert after is not None and after.host_pid == info.host_pid and psutil.pid_exists(info.chrome_pid or -1)
+    finally:
+        runtime.stop("p")

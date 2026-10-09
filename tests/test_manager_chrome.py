@@ -409,5 +409,7 @@ async def test_minimized_window_never_takes_the_focus(env: Env):
     with pytest.raises(ProfilePilotError, match="minimized"):
         await session.page(0)
     await session.close_tab(0)
-    assert win32gui.IsIconic(hwnd)
-    assert win32gui.GetForegroundWindow() == foreground != hwnd
+    assert win32gui.IsIconic(hwnd)  # still minimized: never restored
+    # The foreground window did not change. (Windows may keep reporting a just-minimized window as
+    # the foreground one when it was active, so don't require foreground != hwnd - only "unchanged".)
+    assert win32gui.GetForegroundWindow() == foreground

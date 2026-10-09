@@ -4,6 +4,7 @@ Commands::
 
     serve [--http ...]                       MCP server (stdio by default; --http for remote clients)
     profile list|create|show|start|stop|delete|restore|clone|update
+    identity list|show|create|set|secret|clear|allow|disallow|delete|fields
     proxy list|add|import|remove|test
     status | stop-all
     install <client> | install print | uninstall <client>
@@ -13,6 +14,8 @@ Commands::
 Output is a human-friendly table; ``--json`` prints machine-readable JSON instead. The CLI never
 prints secrets: proxies are shown redacted, running profiles without their control token, and
 proxy specs / tokens can be read from stdin (``-``) so they never appear in the process list.
+Sensitive identity values (card, SSN, password) are only read from a hidden prompt or stdin
+(``identity secret``), never from argv, and only shown masked.
 
 Heavy modules (Playwright, the MCP SDK) are only imported by the commands that need them.
 """
@@ -25,6 +28,7 @@ import json
 import logging
 import os
 import platform
+import re
 import sys
 from importlib import metadata
 from pathlib import Path
@@ -167,6 +171,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if not args.http:
         if args.public_host or args.auth or args.token or args.allow_private_network:
             raise CliError("--public-host/--auth/--token/--allow-private-network need --http.")
+        if args.allow_sensitive_autofill:
+            raise CliError("--allow-sensitive-autofill needs --http (the local stdio server always offers "
+                           "form_autofill_sensitive; each call still needs the user's approval).")
         from .server.app import serve_stdio
 
         serve_stdio(args.home, log_level=args.log_level, files_anywhere=args.files_anywhere)
@@ -182,7 +189,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         host=args.host, port=args.port, path=args.path, public_hosts=args.public_host or [],
         auth=args.auth or "secret-path", token=token, allow_private=args.allow_private_network,
         i_understand=args.i_understand, new_secret=args.new_secret, root=args.home, log_level=args.log_level,
-        announce=lambda banner: _err(banner),
+        announce=lambda banner: _err(banner), allow_sensitive_autofill=args.allow_sensitive_autofill,
     )
     return 0
 
@@ -201,6 +208,7 @@ def cmd_profile_list(args: argparse.Namespace) -> int:
     profiles = store.list_profiles(args.tag)
     proxies = _proxy_map(store)
     running = {i.profile_id: i for i in _runtime(store).list_running()} if profiles else {}
+    identities = _identity_names(store) if any(p.identity_id for p in profiles) else {}
 
     def text() -> str:
         if not profiles:
@@ -209,9 +217,10 @@ def cmd_profile_list(args: argparse.Namespace) -> int:
             (p.name, p.id, "running" if p.id in running else "stopped",
              running[p.id].window if p.id in running else p.launch.window,
              _proxy_text(proxies.get(p.proxy_id)) if p.proxy_id else "-", ", ".join(p.tags) or "-")
+            + ((identities.get(p.identity_id, "(missing)") if p.identity_id else "-",) if identities else ())
             for p in profiles
         ]
-        return table(rows, ["NAME", "ID", "STATE", "WINDOW", "PROXY", "TAGS"])
+        return table(rows, ["NAME", "ID", "STATE", "WINDOW", "PROXY", "TAGS"] + (["IDENTITY"] if identities else []))
 
     data = [{**p.summary(), "running": p.id in running,
              "proxy": proxies[p.proxy_id].summary() if p.proxy_id in proxies else None} for p in profiles]
@@ -237,11 +246,12 @@ def cmd_profile_create(args: argparse.Namespace) -> int:
         launch["extra_args"] = validate_extra_args(args.extra_arg)
     profile = store.create_profile(
         name, notes=args.notes or "", tags=args.tag or (), proxy_id=record.id if record else None,
-        browser=args.browser or "auto", launch=launch,
+        browser=args.browser or "auto", launch=launch, identity_id=args.identity or None,
     )
+    identity = _identity_names(store).get(profile.identity_id or "")
     emit(args, {**profile.summary(), "proxy": record.summary() if record else None},
          f"Created profile '{profile.name}' (id {profile.id}), proxy {_proxy_text(record)}, "
-         f"window {profile.launch.window}.")
+         f"window {profile.launch.window}" + (f", identity {identity}." if identity else "."))
     return 0
 
 
@@ -250,14 +260,16 @@ def cmd_profile_show(args: argparse.Namespace) -> int:
     profile = store.get_profile(args.profile)
     info = _runtime(store).status(profile.id)
     record = store.get_proxy(profile.proxy_id) if profile.proxy_id else None
+    identity = _identity_names(store).get(profile.identity_id, "(missing)") if profile.identity_id else None
     data = {"profile": profile.model_dump(mode="json"), "proxy": record.summary() if record else None,
-            "runtime": info.public() if info else None}
+            "identity": identity, "runtime": info.public() if info else None}
 
     def text() -> str:
         launch = profile.launch
         lines = [
             f"{profile.name} (id {profile.id})",
             f"  proxy:     {_proxy_text(record)}",
+            f"  identity:  {identity or '-'}",
             f"  tags:      {', '.join(profile.tags) or '-'}",
             f"  browser:   {profile.browser}",
             f"  window:    {launch.window}; webrtc {launch.webrtc}; restore session {launch.restore_session}",
@@ -355,6 +367,8 @@ def cmd_profile_update(args: argparse.Namespace) -> int:
         record = _resolve_proxy(store, proxy, name_hint=profile.name, scheme=args.proxy_scheme)
     if proxy_changed:
         changes["proxy_id"] = record.id if record else None
+    if args.identity is not None:
+        changes["identity_id"] = args.identity.strip() or None  # '' unlinks
     updated = store.update_profile(profile.id, **changes)
     notes = []
     runtime = _runtime(store)
@@ -368,6 +382,262 @@ def cmd_profile_update(args: argparse.Namespace) -> int:
         if launch or args.browser:
             notes.append("launch changes apply after a restart")
     emit(args, updated.summary(), f"Updated '{updated.name}'." + (f" ({'; '.join(notes)})" if notes else ""))
+    return 0
+
+
+# ---------------------------------------------------------------------- identity
+
+CONFIRM_TWICE = ("card_number", "ssn", "password")
+"""Sensitive fields that are typed twice at the hidden prompt (a typo would go unnoticed)."""
+
+
+def _identities(store: Store) -> Any:
+    from .identity import IdentityStore
+
+    return IdentityStore(store)
+
+
+def _identity_names(store: Store) -> dict[str, str]:
+    return {i.id: i.name for i in _identities(store).list()}
+
+
+_SAFE_NAME = re.compile(r"[A-Za-z0-9_.@+-]+")
+_QUOTABLE_NAME = re.compile(r"[^\"`$%!^&|<>\\]+")
+
+
+def shell_name(name: str, fallback: str = "<identity>") -> str:
+    """How to write a name in a command the user pastes into a terminal: bare, double-quoted, or
+    ``fallback`` (e.g. the id) when quoting would not be safe in every shell."""
+    name = (name or "").strip()
+    if _SAFE_NAME.fullmatch(name):
+        return name
+    if name and _QUOTABLE_NAME.fullmatch(name):
+        return f'"{name}"'
+    return fallback
+
+
+def _field(name: str) -> str:
+    """Canonical field key; an unknown name is only echoed when it looks like a name (not a value)."""
+    from .identity import FIELDS, field_key
+
+    try:
+        return field_key(name)
+    except ProfilePilotError:
+        shown = f"'{name}'" if re.fullmatch(r"[A-Za-z][A-Za-z _-]{0,39}", name or "") else "given"
+        raise CliError(f"Unknown identity field {shown}. Known fields: {', '.join(FIELDS)} "
+                       "(see: profilepilot identity fields).") from None
+
+
+def _assignments(items: Sequence[str] | None, identity: str) -> dict[str, str | None]:
+    """``KEY=VALUE`` arguments -> {key: value or None}. Sensitive keys are refused (never stored from argv)."""
+    from .identity import FIELDS
+
+    out: dict[str, str | None] = {}
+    for item in items or ():
+        key, sep, value = item.partition("=")
+        if not sep or not key.strip():
+            raise CliError("Values are given as KEY=VALUE, e.g. email=jane@example.com (see: profilepilot identity "
+                           "fields).")
+        canonical = _field(key.strip())
+        if FIELDS[canonical].sensitive:
+            raise CliError(
+                f"'{canonical}' is sensitive and is never taken from the command line; nothing was stored. Use: "
+                f"profilepilot identity secret {identity} {canonical}  (it asks for the value without showing it). "
+                "The value you typed may be in your shell history: consider removing it."
+            )
+        out[canonical] = value if value.strip() else None
+    return out
+
+
+def _identity_data(store: Store, ident: Any) -> dict[str, Any]:
+    return {"id": ident.id, "name": ident.name, "fields": sorted(ident.values),
+            "sensitive_set": sorted(ident.sensitive_set), "allowed_origins": ident.allowed_origins,
+            "profiles": [p.name for p in store.profiles_using_identity(ident.id)]}
+
+
+def cmd_identity_list(args: argparse.Namespace) -> int:
+    store = _store(args)
+    items = [_identity_data(store, i) for i in _identities(store).list()]
+    emit(args, items, lambda: table(
+        [(i["name"], i["id"], len(i["fields"]), ", ".join(i["sensitive_set"]) or "-",
+          ", ".join(i["allowed_origins"]) or "-", ", ".join(i["profiles"]) or "-") for i in items],
+        ["NAME", "ID", "FIELDS", "SENSITIVE", "SENSITIVE AUTOFILL ON", "PROFILES"],
+    ) if items else "No identities. Create one with: profilepilot identity create <name> --set first_name=...")
+    return 0
+
+
+def cmd_identity_show(args: argparse.Namespace) -> int:
+    from .identity import FIELDS
+
+    store = _store(args)
+    ids = _identities(store)
+    ident = ids.get(args.identity)
+    view = ids.masked(ident.id)
+    view["profiles"] = [p.name for p in store.profiles_using_identity(ident.id)]
+
+    def text() -> str:
+        width = max(len(k) for k in FIELDS)
+        lines = [f"{ident.name} (id {ident.id})"]
+        if ident.notes:
+            lines.append(f"  notes: {ident.notes}")
+        fields = view["fields"]
+        lines += [f"  {k.ljust(width)}  {fields[k]}" for k in FIELDS if k in fields] or ["  (no values)"]
+        lines.append(f"  sensitive autofill on: {', '.join(ident.allowed_origins) or '- (none)'}")
+        lines.append(f"  profiles: {', '.join(view['profiles']) or '-'}")
+        return "\n".join(lines)
+
+    emit(args, view, text)
+    return 0
+
+
+def cmd_identity_create(args: argparse.Namespace) -> int:
+    store = _store(args)
+    values = _assignments(args.assignments, shell_name(args.name, "<identity>"))
+    ident = _identities(store).create(args.name, {k: v for k, v in values.items() if v is not None},
+                                      notes=args.notes or "")
+    emit(args, _identity_data(store, ident),
+         f"Created identity '{ident.name}' (id {ident.id}) with {len(ident.values)} value(s). Add card, SSN or "
+         f"password values with: profilepilot identity secret {shell_name(ident.name, ident.id)} <field>")
+    return 0
+
+
+def cmd_identity_set(args: argparse.Namespace) -> int:
+    store = _store(args)
+    ids = _identities(store)
+    ident = ids.get(args.identity)
+    values = _assignments(args.assignments, shell_name(ident.name, ident.id))
+    if not values and args.name is None and args.notes is None:
+        raise CliError("Nothing to change: give KEY=VALUE pairs, --name or --notes.")
+    updated = ids.update(ident.id, values, name=args.name, notes=args.notes)
+    removed = sorted(k for k, v in values.items() if v is None)
+    emit(args, _identity_data(store, updated),
+         f"Updated identity '{updated.name}'" + (f": set {', '.join(k for k in values if k not in removed)}"
+                                                if len(values) > len(removed) else "")
+         + (f"; removed {', '.join(removed)}" if removed else "") + ".")
+    return 0
+
+
+def cmd_identity_secret(args: argparse.Namespace) -> int:
+    from .identity import FIELDS
+
+    if args.value:
+        raise CliError("Never put the value on the command line (it ends up in your shell history and the process "
+                       "list); nothing was stored. Run the command without it and type the value at the prompt, or "
+                       "pipe it in with --stdin.")
+    store = _store(args)
+    ids = _identities(store)
+    key = _field(args.field)
+    ident = ids.get(args.identity)
+    if not FIELDS[key].sensitive:
+        raise CliError(f"'{key}' is not a sensitive field; set it with: profilepilot identity set "
+                       f"{shell_name(ident.name, ident.id)} {key}=VALUE")
+    label = FIELDS[key].label
+    if args.stdin:
+        value = (sys.stdin.readline() if sys.stdin is not None else "").rstrip("\r\n")
+    else:
+        if sys.stdin is None or not sys.stdin.isatty():
+            raise CliError("No terminal to ask in: pipe the value in with --stdin.")
+        try:
+            value = getpass.getpass(f"{label} for '{ident.name}' (input is hidden): ")
+            if key in CONFIRM_TWICE and value.strip():
+                if getpass.getpass(f"Repeat the {label.lower()}: ") != value:
+                    raise CliError("The two entries differ; nothing was stored.")
+        except EOFError:
+            raise CliError("No value was given; nothing was stored.") from None
+    if not value.strip():
+        raise CliError(f"No value given; nothing was stored. To remove a stored value use: profilepilot identity "
+                       f"clear {shell_name(ident.name, ident.id)} {key}")
+    ident = ids.set_sensitive(ident.id, key, value)
+    value = ""
+    masked = ids.masked(ident.id)["fields"].get(key, "set")
+    hint = "" if ident.allowed_origins else (
+        f" Sensitive autofill works only on sites you allow: profilepilot identity allow "
+        f"{shell_name(ident.name, ident.id)} https://shop.example.com")
+    emit(args, {"identity": ident.name, "field": key, "stored": True, "masked": masked},
+         f"Stored {key} for identity '{ident.name}' ({masked}) in the {store.secrets.backend} secret store.{hint}")
+    return 0
+
+
+def cmd_identity_clear(args: argparse.Namespace) -> int:
+    from .identity import FIELDS
+
+    store = _store(args)
+    ids = _identities(store)
+    key = _field(args.field)
+    ident = ids.get(args.identity)
+    if FIELDS[key].sensitive:
+        ident = ids.set_sensitive(ident.id, key, None)
+    else:
+        ident = ids.update(ident.id, {key: None})
+    emit(args, _identity_data(store, ident), f"Removed {key} from identity '{ident.name}'.")
+    return 0
+
+
+def cmd_identity_allow(args: argparse.Namespace) -> int:
+    from urllib.parse import urlsplit
+
+    from .identity import normalize_origin
+
+    store = _store(args)
+    ids = _identities(store)
+    origin = normalize_origin(args.origin)
+    ident = ids.allow_origin(args.identity, origin)
+    note = ""
+    if origin.startswith("http://") and urlsplit(origin).hostname not in ("127.0.0.1", "localhost", "::1"):
+        note = " Note: sensitive autofill also needs HTTPS, so it will not run on this http:// origin."
+    emit(args, _identity_data(store, ident),
+         f"Sensitive autofill (card, SSN, password) of '{ident.name}' is now allowed on {origin}.{note}")
+    return 0
+
+
+def cmd_identity_disallow(args: argparse.Namespace) -> int:
+    from .identity import normalize_origin
+
+    store = _store(args)
+    origin = normalize_origin(args.origin)
+    ident = _identities(store).disallow_origin(args.identity, origin)
+    emit(args, _identity_data(store, ident), f"Sensitive autofill of '{ident.name}' is no longer allowed on {origin}.")
+    return 0
+
+
+def cmd_identity_delete(args: argparse.Namespace) -> int:
+    store = _store(args)
+    ids = _identities(store)
+    ident = ids.get(args.identity)
+    linked = store.profiles_using_identity(ident.id)
+    if not args.yes:
+        if sys.stdin is None or not sys.stdin.isatty():
+            raise CliError("Add --yes to delete without the confirmation prompt.")
+        extra = f" It is linked to {len(linked)} profile(s), which will be unlinked." if linked else ""
+        try:
+            answer = input(f"Delete identity '{ident.name}' and its stored card/SSN/password values?{extra} [y/N] ")
+        except EOFError:  # e.g. stdin is the NUL device, which Windows reports as a terminal
+            raise CliError("No answer was given; add --yes to delete without the confirmation prompt.") from None
+        if answer.strip().lower() not in ("y", "yes"):
+            _out("Cancelled; nothing was deleted.")
+            return 1
+    name = ids.delete(ident.id)
+    for profile in linked:
+        store.update_profile(profile.id, identity_id=None)
+    emit(args, {"deleted": name, "unlinked_profiles": [p.name for p in linked]},
+         f"Deleted identity '{name}' and its stored secrets."
+         + (f" Unlinked from: {', '.join(p.name for p in linked)}." if linked else ""))
+    return 0
+
+
+def cmd_identity_fields(args: argparse.Namespace) -> int:
+    from .identity import ALIASES, FIELDS
+
+    aliases: dict[str, list[str]] = {}
+    for alias, key in ALIASES.items():
+        aliases.setdefault(key, []).append(alias)
+    data = [{"key": s.key, "label": s.label, "sensitive": s.sensitive, "group": s.group,
+             "aliases": sorted(aliases.get(s.key, [])), "help": s.help} for s in FIELDS.values()]
+    emit(args, data, lambda: table(
+        [(d["key"], d["label"], "yes (identity secret)" if d["sensitive"] else "-", ", ".join(d["aliases"]) or "-",
+          d["help"] or "") for d in data],
+        ["KEY", "LABEL", "SENSITIVE", "ALIASES", "NOTES"],
+    ))
     return 0
 
 
@@ -764,6 +1034,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--files-anywhere", action="store_true",
                    help="stdio only: let cookies_export / cookies_import use any folder, not just the "
                         "profiles' exports folders")
+    p.add_argument("--allow-sensitive-autofill", action="store_true",
+                   help="--http only: also offer form_autofill_sensitive (card, SSN, password) to remote clients")
     p.add_argument("--i-understand", action="store_true", help="confirm --auth none on a loopback host")
     p.add_argument("--new-secret", action="store_true", help="rotate the secret path")
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
@@ -785,6 +1057,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timezone", help="IANA timezone override, e.g. Europe/Berlin")
     p.add_argument("--start-url")
     p.add_argument("--extra-arg", action="append", help="extra Chrome switch (repeatable)")
+    p.add_argument("--identity", help="identity (name or id) that form autofill uses for this profile")
     p = add(psub, "show", "show a profile", cmd_profile_show)
     p.add_argument("profile")
     p = add(psub, "start", "start a profile's Chrome", cmd_profile_start)
@@ -821,6 +1094,46 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-restore-session", dest="restore_session", action="store_false")
     p.add_argument("--webrtc", choices=["auto", "proxy_only", "default"])
     p.add_argument("--extra-arg", action="append", help="replace the extra Chrome switches (repeatable; '' clears)")
+    p.add_argument("--identity", help="identity (name or id) for form autofill; '' removes the link")
+
+    # identity
+    idn = sub.add_parser("identity", help="manage identities for form autofill", parents=[common],
+                         description="Identities hold your details for form autofill. Card numbers, CVVs, SSNs and "
+                                     "passwords are stored in the OS secret store with 'identity secret' and are "
+                                     "only filled on sites you allow with 'identity allow'.")
+    isub = idn.add_subparsers(dest="action", metavar="<action>", required=True)
+    add(isub, "list", "list identities", cmd_identity_list)
+    p = add(isub, "show", "show an identity (card, SSN and password masked)", cmd_identity_show)
+    p.add_argument("identity")
+    p = add(isub, "create", "create an identity", cmd_identity_create)
+    p.add_argument("name")
+    p.add_argument("--set", dest="assignments", action="append", metavar="KEY=VALUE",
+                   help="a non-sensitive value, e.g. --set email=jane@example.com (repeatable)")
+    p.add_argument("--notes")
+    p = add(isub, "set", "set non-sensitive values (KEY= removes one)", cmd_identity_set)
+    p.add_argument("identity")
+    p.add_argument("assignments", nargs="*", metavar="KEY=VALUE")
+    p.add_argument("--name", help="rename the identity")
+    p.add_argument("--notes")
+    p = add(isub, "secret", "store a card number, expiry, CVV, SSN or password (asked for without echo; "
+                            "never on the command line)", cmd_identity_secret)
+    p.add_argument("identity")
+    p.add_argument("field", help="card_number, card_exp_month, card_exp_year, card_cvv, ssn or password")
+    p.add_argument("value", nargs="*", help=argparse.SUPPRESS)  # refused: values never come from argv
+    p.add_argument("--stdin", action="store_true", help="read the value from one line of stdin instead")
+    p = add(isub, "clear", "remove one value (sensitive or not)", cmd_identity_clear)
+    p.add_argument("identity")
+    p.add_argument("field")
+    p = add(isub, "allow", "allow sensitive autofill on a site, e.g. https://shop.example.com", cmd_identity_allow)
+    p.add_argument("identity")
+    p.add_argument("origin")
+    p = add(isub, "disallow", "stop allowing sensitive autofill on a site", cmd_identity_disallow)
+    p.add_argument("identity")
+    p.add_argument("origin")
+    p = add(isub, "delete", "delete an identity and its stored secrets", cmd_identity_delete)
+    p.add_argument("identity")
+    p.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+    add(isub, "fields", "list the identity field keys", cmd_identity_fields)
 
     # proxy
     prx = sub.add_parser("proxy", help="manage proxies", parents=[common])
@@ -916,4 +1229,4 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
 
-__all__ = ["main", "build_parser"]
+__all__ = ["main", "build_parser", "shell_name"]

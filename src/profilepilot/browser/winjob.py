@@ -63,6 +63,29 @@ def put_self_in_kill_on_close_job() -> Any | None:
     return job
 
 
+def in_foreign_kill_on_close_job() -> bool:
+    """Is this process inside a job that kills it when the job's last handle closes - typically the
+    job an MCP client put its server in (the official Python SDK's stdio client does, without
+    allowing breakaway), which a host spawned with ``CREATE_BREAKAWAY_FROM_JOB`` can still end up in
+    (nested jobs)? Call it before :func:`put_self_in_kill_on_close_job`. False when unknown."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import win32api  # type: ignore[import-not-found]
+        import win32job  # type: ignore[import-not-found]
+    except ImportError:
+        return False
+    try:
+        if not win32job.IsProcessInJob(win32api.GetCurrentProcess(), None):
+            return False
+        # A NULL handle queries the job the calling process belongs to (its immediate job).
+        info = win32job.QueryInformationJobObject(None, win32job.JobObjectExtendedLimitInformation)
+        return bool(info["BasicLimitInformation"]["LimitFlags"] & win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+    except Exception as exc:
+        log.debug("could not inspect the enclosing job object: %s", exc)
+        return False
+
+
 def process_in_job(pid: int, job: Any | None = None) -> bool:
     """True if ``pid`` belongs to ``job`` (default: the job created by this module)."""
     job = job if job is not None else _JOB_HANDLE

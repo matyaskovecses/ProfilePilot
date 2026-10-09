@@ -24,10 +24,12 @@ used as an optional backend.
 | Chrome 136+ refuses remote debugging on the *default* user-data-dir. | Every profile has its own `--user-data-dir`. |
 | A second Chrome on the same user-data-dir hands its command line to the running one and exits 0. | Per-profile lock + detect "exited quickly without a listener". |
 | MCP hosts (Claude Desktop / Code, libuv) run servers in a kill-on-close job with silent breakaway. | A detached host process spawned by the MCP server survives server restarts. |
+| The official Python MCP SDK's `stdio_client` runs the server in a kill-on-close job **without** breakaway; a host spawned with `CREATE_BREAKAWAY_FROM_JOB` still lands in it (no error) and dies within a second of the client closing. A process created through WMI `Win32_Process.Create` is in no job (parent `WmiPrvSE.exe`, same interactive session). | The host checks its own job before anything else; inside a foreign kill-on-close job it exits with code 5 and `RuntimeManager` starts it again through WMI. Without WMI it runs inside the job, records `client_job` and the tools say how to keep the browser running. |
 | Playwright 1.63 Python: `connect_over_cdp(url, no_defaults=True)`, `page.aria_snapshot(mode="ai", depth=, boxes=)` emits `[ref=eN]`; `page.locator("aria-ref=eN")` resolves a ref; `browser.close()` on a CDP connection only disconnects. | Snapshot/ref-based tools; always use `browser.contexts[0]` (the persistent profile context), never `new_context()`. |
 | MCP SDK 2.3: `from mcp.server import MCPServer`; `run("streamable-http", host, port, streamable_http_path, json_response, stateless_http, transport_security)`; `Image` in `mcp.server.mcpserver`; `ToolAnnotations` snake_case in `mcp.types`. DNS-rebinding protection auto-on for loopback hosts. | See §6. |
 | ChatGPT custom MCP: public HTTPS Streamable HTTP or OpenAI Secure MCP Tunnel; auth only none/OAuth (no static API keys); `readOnlyHint`/`destructiveHint`/`openWorldHint` should be set; images may not reach the model. | Text-first outputs; secret-path auth option; Secure Tunnel documented. |
 | Scrapling 0.4.15 `cdp_url` attach always calls `browser.new_context()` (loses profile cookies, applies dark scheme/DPR2/UA override). | Our Scrapling integration subclasses the session to reuse `contexts[0]`. |
+| A CDP `Control+Shift+V` (Playwright `keyboard.press`) pastes the system clipboard into the focused field, also inside out-of-process iframes and while the window is not the OS foreground window; the page gets a trusted `paste` event and `insertFromPaste` input events. Chrome has read the clipboard when `keyboard.press` returns. | "Type-paste" (`browser_paste`, autofill `method="paste"`) holds the text on the clipboard only for the key press: see `automation/typing.py` and `docs/design/AUTOFILL.md`. The same chord sent by `browser_press_key` would paste the *user's* clipboard, so that tool refuses paste chords. |
 
 ## 2. Process model
 
@@ -48,7 +50,11 @@ used as an optional backend.
 ```
 
 * The **host** is the unit of "a running profile". It exits when Chrome exits (user closed the
-  window, or `Browser.close`). Browsers therefore outlive MCP servers; any client can attach.
+  window, or `Browser.close`). Browsers therefore outlive MCP servers; any client can attach. This
+  holds also for clients that kill their server's process tree through a job object without
+  breakaway (the Python SDK's stdio client): the host leaves such a job by being restarted through
+  WMI (see §1). Only where that fails does the browser close with the client, and `profile_start` /
+  `profile_status` then say so.
 * `runtime.json` (`RuntimeInfo`) is the discovery mechanism. A profile is *running* iff
   runtime.json exists, `state == "running"`, host PID alive, Chrome PID alive with matching
   `create_time`, and `/json/version` answers on `cdp_port`. Anything else is stale and is cleaned.
@@ -66,7 +72,8 @@ To implement (one owner each — agents must only create/modify the files they o
 | **B: automation & content** | `automation/__init__.py`, `automation/manager.py`, `automation/content.py`, `automation/cookies.py`, `safety.py`, `proxy/check.py`, tests `tests/test_content.py`, `tests/test_cookies.py`, `tests/test_safety.py`, `tests/test_proxy_check.py` |
 | **C: integrations** | `integrations/__init__.py`, `integrations/shardx.py`, `integrations/scrapling.py`, `client.py`, tests `tests/test_shardx.py`, `tests/test_scrapling_integration.py` |
 | **D: packaging & install** | `install.py`, `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json`, `skills/profilepilot/SKILL.md`, `mcpb/manifest.json`, `scripts/build_mcpb.py`, `.mcpbignore`, `LICENSE`, tests `tests/test_install.py` |
-| **E: MCP server & CLI** (after A–C) | `server/__init__.py`, `server/app.py`, `server/tools_profiles.py`, `server/tools_browser.py`, `server/tools_data.py`, `server/tools_shardx.py`, `server/http.py`, `cli.py`, `__main__.py`, tests `tests/test_server.py`, `tests/test_cli.py` |
+| **E: MCP server & CLI** (after A–C) | `server/__init__.py`, `server/app.py`, `server/tools_profiles.py`, `server/tools_browser.py`, `server/tools_data.py`, `server/tools_shardx.py`, `server/tools_identity.py`, `server/http.py`, `cli.py`, `__main__.py`, tests `tests/test_server.py`, `tests/test_cli.py`, `tests/test_identity_tools.py` |
+| **F: typing & autofill** (spec: `docs/design/AUTOFILL.md`) | `identity.py`, `automation/clipboard.py`, `automation/typing.py`, `automation/autofill.py`, tests `tests/test_identity.py`, `tests/test_clipboard.py`, `tests/test_typing.py`, `tests/test_autofill.py` |
 
 ### 3.1 `browser/flags.py` (A)
 
@@ -287,8 +294,10 @@ Profiles & proxies: `profile_list`, `profile_create(name, proxy?, tags?, notes?,
 
 Browser: `browser_navigate(profile, url | "back" | "forward" | "reload", wait_until?)`,
 `browser_snapshot(profile, ref?, depth?, max_chars?, offset?)`,
-`browser_click(profile, ref|selector, button?, double?)`, `browser_type(profile, ref|selector, text, submit?, clear?)`,
-`browser_press_key(profile, key)`, `browser_select_option(profile, ref|selector, values)`, `browser_hover`,
+`browser_click(profile, ref|selector, button?, double?)`, `browser_type(profile, ref|selector, text, submit?, clear?, method?)`
+(`method`: `fill` (default) | `type` (= the old `slowly`) | `human` (key by key with human timing) | `paste` (system
+clipboard + Ctrl/⌘+Shift+V, a real trusted paste; the clipboard is restored)), `browser_paste(profile, ref|selector, text, clear?, submit?)`,
+`browser_press_key(profile, key)` (paste chords such as Ctrl+V / Shift+Insert are refused: they would paste the user's own clipboard), `browser_select_option(profile, ref|selector, values)`, `browser_hover`,
 `browser_scroll(profile, direction|ref, amount?)`, `browser_wait_for(profile, text?|selector?|seconds?)`,
 `browser_screenshot(profile, full_page?, ref?)` → Image + caption, `browser_read(profile, format, selector?, main_only?, max_chars?, offset?)`,
 `browser_extract(profile, css?|xpath?, attr?, limit?)`, `browser_evaluate(profile, expression)`,
@@ -306,10 +315,26 @@ downloads folder (PDF text via the optional `profilepilot[pdf]` extra).
 Optional free-text parameters are annotated as plain `str` (default None): the MCP SDK `json.loads`
 every other string argument, which turned `'{"a": 1}'` into a dict and `'null'` into None.
 
+Identities & forms (`server/tools_identity.py`; spec `docs/design/AUTOFILL.md`): `identity_list`, `identity_show(identity)`
+(card / SSN / password masked), `identity_create(name, fields, notes?)`, `identity_update(identity, fields?, name?, notes?)`.
+These handle non-sensitive fields only: sensitive keys are refused with the exact `profilepilot identity secret NAME FIELD`
+command the user must run (deleting an identity is CLI-only too). `form_detect(profile, scope_ref?, scope_selector?)`
+(read-only: kind, label, control, iframe origin, split part), `form_autofill(profile, identity?, fields?, method="paste",
+overwrite?, scope_ref?, scope_selector?)` (non-sensitive kinds; the identity defaults to the profile's linked one),
+`form_autofill_sensitive(profile, identity?, fields?, method="paste", overwrite?, scope_ref?, scope_selector?)` (card,
+expiry, CVV, SSN, password; `destructive_hint`, `_meta["anthropic/requiresUserInteraction"] = true`). The sensitive tool
+checks `IdentityStore.check_sensitive_origin` on the top-level URL *before* any secret is read and stops the fill if the
+page leaves that origin; child frames get sensitive values only when they are same-origin, allow-listed, or (card fields only)
+a known payment processor's https frame; remote (HTTP) servers register it only with `--allow-sensitive-autofill`. Snapshots
+mask card / CVV / SSN / password values in every frame, and every page-reading tool output of a profile has the values that
+`form_autofill_sensitive` filled replaced by `[redacted]`.
+`profile_create` / `profile_update` take `identity` (name or id; `""` unlinks). Type-paste is serialised across
+processes by `<data root>/clipboard.lock`. Tool output never contains sensitive values.
+
 ShardX (only registered when enabled): `shardx_status`, `shardx_profiles`, `shardx_start(profile)`, `shardx_stop(profile)`.
 
 ## 6. Remote (HTTP) mode
-`profilepilot serve --http --host 127.0.0.1 --port 8931 --path /mcp [--public-host H]... [--auth secret-path|token|none] [--token T] [--allow-private-network]`.
+`profilepilot serve --http --host 127.0.0.1 --port 8931 --path /mcp [--public-host H]... [--auth secret-path|token|none] [--token T] [--allow-private-network] [--allow-sensitive-autofill]`.
 * `json_response=True`, `stateless_http=True` (cloudflared quick tunnels have no SSE).
 * `TransportSecuritySettings(allowed_hosts=[*loopback, H, H:*], allowed_origins=[https://H])`.
 * `--auth token`: static bearer via `TokenVerifier` (Claude Code / Codex `--header`). `--auth secret-path`
@@ -320,4 +345,6 @@ ShardX (only registered when enabled): `shardx_status`, `shardx_profiles`, `shar
   can move itself to a blocked address with scripts, timers, meta refresh or popups); blocked tabs
   are navigated to about:blank (`browser_tabs` blanks them all). Proxy hosts are checked too.
 * Cookie files: writes only to the session's own exports folder, reads from any exports folder.
+* `form_autofill_sensitive` is not registered unless `--allow-sensitive-autofill` (remote clients cannot be relied on to
+  ask the user before each call); the allow-listed-origin check applies on top.
 * Recommended for ChatGPT: OpenAI Secure MCP Tunnel launching `profilepilot serve` over stdio (no public URL).

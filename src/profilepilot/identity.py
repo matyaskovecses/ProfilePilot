@@ -220,6 +220,35 @@ def card_brand(number: str) -> str:
     return "card"
 
 
+_SSN_SHAPE = re.compile(r"\d{3}[- ]\d{2}[- ]\d{4}")
+
+
+def looks_like_secret(key: str, value: str) -> str | None:
+    """``"ssn"`` or ``"card_number"`` when a value given for the non-sensitive field ``key`` looks
+    like one (an SSN pattern, or a Luhn-valid number of a known card brand; phone numbers are not
+    checked for the latter, they can be that long)."""
+    text = str(value or "").strip()
+    if _SSN_SHAPE.fullmatch(text):
+        return "ssn"
+    compact = re.sub(r"[\s-]", "", text)
+    if (key != "phone" and compact.isdigit() and 13 <= len(compact) <= 19 and luhn_ok(compact)
+            and card_brand(compact) != "card"):
+        return "card_number"
+    return None
+
+
+def refuse_secret_like(key: str, value: str, identity_name: str) -> None:
+    """Raise PolicyError when a non-sensitive value looks like a card number or SSN (it would be
+    stored in plain JSON and shown in clear). The value is never echoed."""
+    kind = looks_like_secret(key, value)
+    if kind:
+        what = "an SSN" if kind == "ssn" else "a card number"
+        raise PolicyError(
+            f"The value for '{key}' looks like {what}. Sensitive values are only stored by the user, in a "
+            f"terminal: profilepilot identity secret \"{identity_name}\" {kind}. Nothing was saved."
+        )
+
+
 def mask(key: str, value: str) -> str:
     """Masked rendering of a sensitive value that is safe to show to a model."""
     if key == "card_number":
@@ -234,11 +263,17 @@ def normalize_origin(origin: str) -> str:
     text = origin.strip()
     if "://" not in text:
         text = "https://" + text
-    parts = urlsplit(text)
-    if parts.scheme not in ("https", "http") or not parts.hostname:
+    try:
+        parts = urlsplit(text)
+        hostname, port_number = parts.hostname, parts.port  # .port raises for "about:blank", "data:..."
+    except ValueError:
+        raise ProfilePilotError(f"Not a web origin: {origin!r}") from None
+    if parts.scheme not in ("https", "http") or not hostname:
         raise ProfilePilotError(f"Not a web origin: {origin!r}")
-    port = f":{parts.port}" if parts.port and parts.port not in (80, 443) else ""
-    return f"{parts.scheme}://{parts.hostname.lower()}{port}"
+    default_port = 443 if parts.scheme == "https" else 80  # only the scheme's own default is dropped
+    port = f":{port_number}" if port_number and port_number != default_port else ""
+    host = f"[{hostname.lower()}]" if ":" in hostname else hostname.lower()
+    return f"{parts.scheme}://{host}{port}"
 
 
 # --------------------------------------------------------------------------- models / store
@@ -313,6 +348,8 @@ class IdentityStore:
     def create(self, name: str, values: dict[str, str] | None = None, *, notes: str = "") -> Identity:
         name = _valid_name(name)
         clean = self._clean_values(values or {}, allow_sensitive=False)
+        for key, value in clean.items():
+            refuse_secret_like(key, value, name)
         with lock_for(self.file):
             items = self._load()
             if any(i.name.casefold() == name.casefold() for i in items):
@@ -338,7 +375,9 @@ class IdentityStore:
                 if raw_val is None or not str(raw_val).strip():
                     ident.values.pop(key, None)
                 else:
-                    ident.values[key] = normalize_value(key, raw_val)
+                    value = normalize_value(key, raw_val)
+                    refuse_secret_like(key, value, ident.name)
+                    ident.values[key] = value
             if name is not None:
                 new = _valid_name(name)
                 if any(i.name.casefold() == new.casefold() and i.id != ident.id for i in items):

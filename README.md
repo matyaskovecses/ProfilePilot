@@ -32,6 +32,7 @@ Codex   ─┘                                   └─ profile "research" → C
   - Page reading outputs markdown, text or HTML, with hidden prompt-injection text removed.
   - Scrapling-powered CSS/XPath extraction.
   - Screenshots, tabs, cookies, and HTTP requests made with a profile's cookies and proxy.
+- **Human-like input and form autofill.** Type key by key with realistic timing, or paste through the real system clipboard (a genuine, trusted paste event). Fill sign-up, address and checkout forms (including card fields in Stripe-style iframes) from identities *you* entered; card numbers and SSNs stay in the OS keyring and are only filled on sites you allow.
 - **Shared by all your AI clients.** Profiles keep running in the background, so Claude, ChatGPT, the CLI and your Python scripts can all attach to the same live profile.
 - **Scrapling integration.** Point Scrapling's fetchers and spiders at a profile and they reuse its cookies, logins and proxy (see [docs/SCRAPLING.md](docs/SCRAPLING.md)).
 - **Optional ShardX backend.** Drive profiles from ShardX/ShardBrowser through its local API with the same tools. These profiles are labelled as a spoofed engine.
@@ -84,6 +85,67 @@ What the AI does:
 
 Each profile keeps its own cookies, so logins and carts stay separate.
 
+## Typing, paste & autofill
+
+`browser_type` takes a `method`:
+
+| Method | What the page sees | Use it for |
+|---|---|---|
+| `fill` (default) | the value appears at once, with an `input` event but no key events | most fields |
+| `type` | one key event per character, at a fixed pace | fields that react to each key (search suggestions, masks) |
+| `human` | key by key with human timing: varied intervals, longer pauses after spaces and punctuation, Shift held for capitals | sites that look at how people type |
+| `paste` | a real paste from the system clipboard with Ctrl+Shift+V (⌘⇧V on macOS): a trusted `paste` event and `insertFromPaste` input | long text, and fields that expect pasting |
+
+`browser_paste(profile, ref, text)` is the same as `method="paste"`. While the text is on the clipboard,
+ProfilePilot holds a lock (so two profiles never paste at the same time), keeps the text out of Windows
+clipboard history and cloud sync, and then puts your own clipboard content back. If the page
+refuses the paste, the text is typed instead.
+
+**Identities.** An identity is a named set of your details: name, email, phone, address, date of
+birth, company. Nothing is ever generated: you (or the AI, from what you tell it) enter the values.
+Card number, expiry, CVV, SSN and password are *sensitive*: they are stored only in the OS keyring,
+you enter them yourself in a terminal, and the AI only ever sees them masked (`visa •••• 4242`): page
+snapshots mask such fields, and once they are filled every page read of that profile shows them as
+`[redacted]`. Screenshots are pixels and cannot be redacted (remote servers refuse screenshots and
+JavaScript on such a page).
+
+```bash
+profilepilot identity create "Jane" --set first_name=Jane --set last_name=Doe --set email=jane@example.com --set zip=94105
+```
+
+```bash
+profilepilot identity secret "Jane" card_number
+```
+
+```bash
+profilepilot identity allow "Jane" https://shop.example.com
+```
+
+```bash
+profilepilot profile update shop-us --identity "Jane"
+```
+
+`identity secret` asks for the value without showing it (twice for card numbers, SSNs and
+passwords) and never takes it from the command line; `--stdin` reads one line instead. `identity
+allow` lists the sites where sensitive fields may be filled.
+
+**Autofill.** `form_detect` lists the fields of the current page (also inside cross-origin iframes
+such as Stripe's card fields). `form_autofill` fills the non-sensitive ones from the profile's
+identity: text fields, selects (countries, states, months, years), date inputs, gender radios and
+split fields (phone 3-3-4, SSN 3-2-4, card 4×4). `form_autofill_sensitive` fills card, SSN and
+password fields, with three safeguards:
+
+- you approve every call (Claude asks; the tool is marked destructive for ChatGPT);
+- the page's site must be on the identity's allow-list. That is checked before any secret is read,
+  and filling stops if the page moves to another site. Iframes of other sites get nothing, except
+  card fields in the frames of known payment processors (Stripe, Braintree, Adyen, Checkout.com,
+  PayPal, Square) and frames whose origin you allow-listed too;
+- a remote (`serve --http`) server only offers it when started with `--allow-sensitive-autofill`.
+
+Hidden fields (zero-size, clipped, transparent, covered by another element) are never filled, so
+a page cannot collect your details in fields you cannot see. Nothing is submitted for you, and tool
+output never contains the values.
+
 ## Command line
 
 ```bash
@@ -108,6 +170,10 @@ profilepilot proxy test shop-us
 
 ```bash
 profilepilot profile stop shop-us
+```
+
+```bash
+profilepilot identity list
 ```
 
 ```bash
@@ -143,7 +209,9 @@ More recipes, including `FetcherSession` with profile cookies and spiders, are i
 |---|---|
 | Profiles | `profile_list`, `profile_create`, `profile_update`, `profile_clone`, `profile_delete`, `profile_start`, `profile_stop`, `profile_status`, `profile_set_proxy` |
 | Proxies | `proxy_list`, `proxy_add` (accepts a whole list at once), `proxy_remove`, `proxy_test` |
-| Browser | `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_press_key`, `browser_select_option`, `browser_hover`, `browser_scroll`, `browser_wait_for`, `browser_screenshot`, `browser_read`, `browser_extract`, `browser_evaluate`, `browser_tabs` |
+| Browser | `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type` (fill, type, human or paste), `browser_paste`, `browser_press_key`, `browser_select_option`, `browser_hover`, `browser_scroll`, `browser_wait_for`, `browser_screenshot`, `browser_read`, `browser_extract`, `browser_evaluate`, `browser_tabs` |
+| Identities | `identity_list`, `identity_show` (sensitive values masked), `identity_create`, `identity_update` (non-sensitive values only) |
+| Forms | `form_detect`, `form_autofill`, `form_autofill_sensitive` (card, SSN, password: needs your approval and an allowed site) |
 | Data | `cookies_get`, `cookies_set`, `cookies_clear`, `cookies_export`, `cookies_import`, `http_fetch` |
 | ShardX (optional) | `shardx_status`, `shardx_profiles`, `shardx_start`, `shardx_stop`. Every browser tool also accepts `profile="shardx:<name>"`. |
 
