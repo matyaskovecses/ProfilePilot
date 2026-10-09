@@ -210,7 +210,8 @@ def test_allow_private_lifts_only_the_address_restriction(fake_dns):
 ])
 def test_parse_ip_host_follows_browser_rules(host, expected):
     result = parse_ip_host(host)
-    assert (str(result) if result is not None else None) == expected
+    # Compare addresses, not strings: Python 3.13 prints IPv4-mapped IPv6 as ::ffff:1.2.3.4
+    assert result == (ipaddress.ip_address(expected) if expected is not None else None)
 
 
 @pytest.mark.parametrize("host", ["1.2.3.256", "1.2.3.4.5", "08.0.0.1", "example.123", "0x.0x.0x.0x100"])

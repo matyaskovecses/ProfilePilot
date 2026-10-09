@@ -10,7 +10,10 @@ import re
 import shutil
 import sys
 import textwrap
-import tomllib
+try:
+    import tomllib
+except ImportError:  # Python 3.10
+    import tomli as tomllib  # type: ignore[no-redef]
 import zipfile
 from dataclasses import replace
 from pathlib import Path
@@ -22,7 +25,10 @@ from profilepilot import install
 from profilepilot.install import InstallError, Locations
 
 ROOT = Path(__file__).resolve().parent.parent
-PY = r"C:\Users\Test User\pp\.venv\Scripts\python.exe"  # spaces + backslashes on purpose
+# A native interpreter path for this OS (spaces on purpose; backslashes on Windows). The installer
+# resolves paths in the running OS's own form, so a Windows path is not "absolute" on Linux/macOS.
+PY = (r"C:\Users\Test User\pp\.venv\Scripts\python.exe" if sys.platform == "win32"
+      else "/opt/Test User/pp/.venv/bin/python")
 
 
 @pytest.fixture(autouse=True)
@@ -329,7 +335,7 @@ def test_codex_crlf_bom_and_quote_in_path(loc):
     cfg = loc.codex_config()
     cfg.parent.mkdir(parents=True)
     cfg.write_bytes(b"\xef\xbb\xbfmodel = \"x\"\r\n")
-    weird = r"C:\Users\O'Brien\py\python.exe"
+    weird = r"C:\Users\O'Brien\py\python.exe" if sys.platform == "win32" else "/Users/O'Brien/py/python"
     install.register("codex", python=weird, locations=loc)
     raw = cfg.read_bytes()
     assert raw.startswith(b"\xef\xbb\xbfmodel = \"x\"\r\n\r\n[mcp_servers.profilepilot]\r\n")

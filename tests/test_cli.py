@@ -146,7 +146,12 @@ def test_install_print_dry_run_and_uninstall(cli):
     only = cli("install", "print", "--client", "codex", "--port", "9000").stdout
     assert "[mcp_servers.profilepilot]" in only and "## codex" in only and "## cursor" not in only
 
-    config = cli.users / "Roaming" / "Claude" / "claude_desktop_config.json"
+    if sys.platform == "win32":
+        config = cli.users / "Roaming" / "Claude" / "claude_desktop_config.json"
+    elif sys.platform == "darwin":
+        config = cli.users / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json"
+    else:
+        config = cli.users / "xdg" / "Claude" / "claude_desktop_config.json"
     cli("install", "claude-desktop", "--dry-run")
     assert not config.exists()
     report = cli("install", "claude-desktop").stdout

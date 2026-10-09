@@ -206,6 +206,12 @@ class ManagedProcess:
     def alive(self) -> bool:
         return self.proc.poll() is None
 
+    def drain(self, timeout: float = 2.0) -> None:
+        """Give the output reader a moment to collect what a process printed just before it ended
+        (e.g. a traceback), so :meth:`tail` shows the real error."""
+        if not self.alive():
+            self._reader.join(timeout)
+
     def wait_for(self, parse: Callable[[str], str | None], timeout: float) -> str | None:
         """The first value ``parse`` finds in the output, or None (timeout / the process ended)."""
         deadline = time.monotonic() + timeout
@@ -645,6 +651,7 @@ class Wizard:
             self._children.append(server)
             self.out("Starting the ProfilePilot server...")
             if not wait_server_ready(port, server, self.server_timeout):
+                server.drain()
                 self.out("The ProfilePilot server did not start:")
                 for line in server.tail():
                     self.out(f"    {line}")
