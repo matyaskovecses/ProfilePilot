@@ -22,7 +22,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import psutil
 from filelock import FileLock, Timeout
@@ -638,10 +638,13 @@ class RuntimeManager:
         self._clean_stale(profile.id, info)
         return True
 
-    def stop_all(self, timeout: float = 20.0) -> list[str]:
-        """Stop every profile with a live host. Returns the names of the stopped profiles."""
+    def stop_all(self, timeout: float = 20.0, *, keep: Callable[[RuntimeInfo], bool] | None = None) -> list[str]:
+        """Stop every profile with a live host (except those ``keep`` returns True for). Returns the
+        names of the stopped profiles."""
         stopped: list[str] = []
         for info in self._live_hosts():
+            if keep is not None and keep(info):
+                continue
             try:
                 if self.stop(info.profile_id, timeout=timeout):
                     stopped.append(info.profile_name)

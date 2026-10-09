@@ -356,6 +356,15 @@ page leaves that origin; child frames get sensitive values only when they are sa
 a known payment processor's https frame; remote (HTTP) servers register it only with `--allow-sensitive-autofill`. Snapshots
 mask card / CVV / SSN / password values in every frame, and every page-reading tool output of a profile has the values that
 `form_autofill_sensitive` filled replaced by `[redacted]`.
+Browser-saved addresses (`chrome_autofill.py`): `form_autofill(identity=...)` also takes `chrome` (the active profile of
+the first installed Chrome / Edge / Brave / Chromium), `chrome:<browser>`, `chrome:<browser>/<profile>` or `profile` (the
+ProfilePilot profile's own window), with `address=<n>`; without a linked identity it falls back to `profile`, then `chrome`
+(`AppConfig.autofill_from_browser`, default on). An identity can be linked to a source (`IdentityStore.connect_chrome`):
+its non-sensitive values are then read live at fill time, its own values win, and a name or address is never stitched
+together from both (`merge_live`). `autofill_sources(profile?)` lists identities and sources with each address as name
+and locality only. Only `addresses` / `address_type_tokens` of `Web Data` are read, through an immutable read-only
+SQLite connection whose authorizer denies every other table; cards, passwords, form history and Chrome's ID-document
+store are never touched, and `form_autofill_sensitive` refuses browser sources.
 `profile_create` / `profile_update` take `identity` (name or id; `""` unlinks). Type-paste is serialised across
 processes by `<data root>/clipboard.lock`. Tool output never contains sensitive values.
 

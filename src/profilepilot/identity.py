@@ -287,12 +287,20 @@ class Identity(_Model):
     sensitive_set: list[str] = Field(default_factory=list)
     allowed_origins: list[str] = Field(default_factory=list)
     """Origins where sensitive fields may be autofilled (managed by the user via the CLI)."""
+    chrome_source: str | None = None
+    """Live link to a browser's saved addresses (``chrome``, ``chrome:edge``, ``chrome:chrome/Default``):
+    its non-sensitive fields are read at fill time; values stored in ``values`` win."""
+    chrome_address: str | None = None
+    """GUID of the linked saved address; None = the most used one."""
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
 
     def summary(self) -> dict[str, Any]:
         """Model-safe view: non-sensitive values in clear, sensitive ones masked by the caller."""
-        return {"id": self.id, "name": self.name, "fields": sorted([*self.values, *self.sensitive_set])}
+        out: dict[str, Any] = {"id": self.id, "name": self.name, "fields": sorted([*self.values, *self.sensitive_set])}
+        if self.chrome_source:
+            out["chrome"] = self.chrome_source
+        return out
 
 
 class IdentityStore:
@@ -429,6 +437,50 @@ class IdentityStore:
             self._save(items)
             return ident
 
+    def connect_chrome(self, ref: str, source: str = "chrome", address: int | str | None = None) -> Identity:
+        """Link the identity to a browser profile's saved addresses (read live at fill time). The
+        source and address are checked now; the address is remembered by its Chrome GUID."""
+        from .chrome_autofill import PROFILE_SOURCE, pick_address, read_addresses, resolve_source
+
+        text = (source or "chrome").strip()
+        if text.lower() == PROFILE_SOURCE:
+            raise ProfilePilotError("An identity can link to a browser of yours (chrome, chrome:edge, "
+                                    "chrome:chrome/Default), not to 'profile'.")
+        resolved = resolve_source(text)
+        chosen = pick_address(read_addresses(resolved), address) if address not in (None, "") else None
+        with lock_for(self.file):
+            items = self._load()
+            ident = _find(items, self.get(ref).id)
+            # "chrome" / "chrome:<browser>" stay symbolic (they follow the browser's active profile), unless a
+            # specific address was picked: its GUID only exists in that one browser profile.
+            ident.chrome_source = text if "/" not in text and chosen is None else resolved.ref
+            ident.chrome_address = chosen.guid if chosen else None
+            ident.updated_at = utcnow()
+            self._save(items)
+            return ident
+
+    def disconnect_chrome(self, ref: str) -> Identity:
+        with lock_for(self.file):
+            items = self._load()
+            ident = _find(items, self.get(ref).id)
+            ident.chrome_source = ident.chrome_address = None
+            ident.updated_at = utcnow()
+            self._save(items)
+            return ident
+
+    def chrome_values(self, ident: Identity) -> tuple[dict[str, str], str | None]:
+        """Live non-sensitive values of the linked browser address, and a model-safe note. Never
+        raises: a missing or unreadable browser profile only yields a note."""
+        if not ident.chrome_source:
+            return {}, None
+        from .chrome_autofill import source_values
+
+        try:
+            values, source, chosen = source_values(ident.chrome_source, address=ident.chrome_address)
+        except ProfilePilotError as exc:
+            return {}, f"browser link unavailable ({exc})"
+        return values, f"{source.label}: {chosen.summary()}"
+
     def delete(self, ref: str) -> str:
         with lock_for(self.file):
             items = self._load()
@@ -447,16 +499,23 @@ class IdentityStore:
         for key in sorted(ident.sensitive_set):
             value = self.store.secrets.get(self._secret_key(ident.id, key))
             fields[key] = mask(key, value) if value else "missing (re-enter it)"
-        return {
+        out: dict[str, Any] = {
             "id": ident.id, "name": ident.name, "notes": ident.notes, "fields": fields,
             "sensitive_allowed_origins": ident.allowed_origins,
         }
+        if ident.chrome_source:
+            live, note = self.chrome_values(ident)
+            merged = merge_live(ident.values, live)
+            out["chrome"] = {"source": ident.chrome_source, "address": note,
+                             "fields_from_chrome": sorted(k for k in merged if k not in ident.values)}
+        return out
 
     def fill_values(self, ref: str, *, include_sensitive: bool = False, fields: Iterable[str] | None = None) -> dict[str, str]:
         """Resolved values for autofill (incl. derived ones). Sensitive values only when
         ``include_sensitive`` - callers must enforce :meth:`check_sensitive_origin` first."""
         ident = self.get(ref)
-        vals = dict(ident.values)
+        live, _note = self.chrome_values(ident)
+        vals = merge_live(ident.values, live)
         if include_sensitive:
             for key in ident.sensitive_set:
                 value = self.store.secrets.get(self._secret_key(ident.id, key))
@@ -506,6 +565,23 @@ DERIVED_SOURCES = {
     "ssn_digits": {"ssn"}, "ssn_area": {"ssn"}, "ssn_group": {"ssn"}, "ssn_serial": {"ssn"},
     "card_name": {"first_name", "last_name"},
 }
+
+
+#: Taken from one place only: a name or an address is never stitched together from the identity's own
+#: values and a linked browser address.
+WHOLE_GROUPS = (frozenset({"first_name", "middle_name", "last_name", "full_name"}),
+                frozenset(k for k, s in FIELDS.items() if s.group == "address"))
+
+
+def merge_live(own: dict[str, str], live: dict[str, str]) -> dict[str, str]:
+    """The identity's own values over a linked browser address's. A name or address part the identity
+    sets replaces the browser's whole name or address."""
+    live = dict(live)
+    for group in WHOLE_GROUPS:
+        if group & own.keys():
+            for key in group:
+                live.pop(key, None)
+    return {**live, **own}
 
 
 def _derived_from(key: str) -> set[str]:

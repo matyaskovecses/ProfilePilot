@@ -22,6 +22,7 @@
   - **Sensitive fields** (SSN, card, password) can only be set by you in a terminal.
   - They're filled only on sites you allow-list, after your approval.
   - They're redacted from everything the AI reads back.
+- **Browser-saved addresses:** autofill can use the addresses you saved in Chrome, Edge or Brave (`identity="chrome"`, `autofill_sources`, `profilepilot identity connect-chrome`). They're read live and read-only, and only names, email, phone, company and address; cards, passwords and form history are never opened.
 - **ShardX backend (optional):** drive ShardX/ShardBrowser profiles with the same tools.
 
 ### ProfilePilot Manager and human handoff

@@ -368,3 +368,20 @@ async def test_serve_http_subprocess_with_bearer_token(tmp_path):
         log.close()
     banner = (tmp_path / "serve.log").read_text(encoding="utf-8")
     assert f"127.0.0.1:{port}/mcp" in banner and token not in banner  # a supplied token is never echoed
+
+
+def test_commands_that_drive_a_profile_respect_the_pause(cli):
+    cli("profile", "create", "p")
+    cli("profile", "pause", "p", "--note", "logging in")
+    for args in (("profile", "start", "p"), ("profile", "stop", "p"), ("profile", "delete", "p"),
+                 ("profile", "update", "p", "--no-proxy"), ("profile", "clone", "p", "q", "--copy-data")):
+        refused = cli(*args, ok=False)
+        assert refused.returncode == 1, args
+        assert "'p' is paused for the AI" in refused.stderr and 'profile resume "p"' in refused.stderr, args
+        assert "--ignore-pause" in refused.stderr
+    cli("profile", "update", "p", "--notes", "harmless")  # no live effect: allowed
+    cli("profile", "clone", "p", "q")  # settings only
+    assert "'p' was not running" in cli("profile", "stop", "p", "--ignore-pause").stdout
+    assert json.loads(cli("stop-all", "--json").stdout) == {"stopped": [], "kept_paused": []}
+    cli("profile", "resume", "p")
+    assert "Moved 'p' to the trash" in cli("profile", "delete", "p").stdout

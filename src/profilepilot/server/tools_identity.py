@@ -24,6 +24,8 @@ expiry, CVV, SSN, password - that live only in the OS secret store. Policy:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import asyncio
 import contextlib
 import logging
@@ -73,7 +75,16 @@ IdentityRefArg = Annotated[str, Field(description="Identity name, id or unique i
 IdentityArg = Annotated[
     str,
     NoneOK,
-    Field(description="Identity name or id (default: the identity linked to the profile; see identity_list)."),
+    Field(description="Identity name or id (default: the identity linked to the profile; see identity_list), or a "
+                      "browser's saved addresses: 'chrome' (the user's active Chrome profile), 'chrome:edge', "
+                      "'chrome:chrome/Profile 1', or 'profile' (addresses saved in this profile's own window). "
+                      "See autofill_sources."),
+]
+AddressArg = Annotated[
+    str,
+    NoneOK,
+    Field(description="With a browser source: which saved address, as its number from autofill_sources "
+                      "(default: the one used most)."),
 ]
 FieldValuesArg = Annotated[
     dict[str, str | int | None] | None,
@@ -317,6 +328,11 @@ def progress_reporter(ctx: Context) -> Callable[[int, int], Any]:
 
 async def resolve_identity(state: AppState, profile: str, identity: str | None) -> Identity:
     """``identity`` if given, else the profile's linked identity (clear errors otherwise)."""
+    return await run_sync(resolve_identity_sync, state, profile, identity)
+
+
+def resolve_identity_sync(state: AppState, profile: str, identity: str | None) -> Identity:
+    """Blocking part of :func:`resolve_identity`."""
 
     def resolve() -> Identity:
         ids = IdentityStore(state.store)
@@ -331,8 +347,9 @@ async def resolve_identity(state: AppState, profile: str, identity: str | None) 
                     "There are no identities yet: create one with identity_create(name, fields) from details the "
                     "user gives you (never invent them).")
             raise ProfilePilotError(
-                f"Profile '{prof.name}' has no linked identity. Pass identity=<name>, or link one with "
-                f"profile_update(profile='{prof.name}', identity=<name>). {hint}"
+                f"Profile '{prof.name}' has no linked identity. Pass identity=<name> (or identity='chrome' for the "
+                f"user's saved browser addresses), or link one with profile_update(profile='{prof.name}', "
+                f"identity=<name>). {hint}"
             )
         try:
             return ids.get(prof.identity_id)
@@ -341,6 +358,49 @@ async def resolve_identity(state: AppState, profile: str, identity: str | None) 
                 f"The identity linked to profile '{prof.name}' no longer exists. Pass identity=<name>, or link "
                 "another one with profile_update(profile, identity=<name>)."
             ) from None
+
+    return resolve()
+
+
+@dataclass
+class FillSource:
+    """Where form_autofill takes its values from: a saved identity or a browser's saved address."""
+
+    label: str
+    ident: Identity | None = None
+    browser_ref: str | None = None
+
+
+async def resolve_fill_source(state: AppState, profile: str, identity: str | None,
+                              address: str | None) -> tuple[FillSource, dict[str, str] | None]:
+    """The identity (or browser source) to fill from, with the browser values already read."""
+    from ..chrome_autofill import is_source_ref, source_values
+
+    def browser(ref: str) -> tuple[FillSource, dict[str, str]]:
+        prof = None if is_shardx_ref(profile) else state.store.get_profile(profile)
+        if ref.strip().lower() == "profile" and prof is None:
+            raise ProfilePilotError("ShardX profiles have no 'profile' browser source here: use identity='chrome'.")
+        values, source, chosen = source_values(ref, address=None if is_blank(address) else address,
+                                               store=state.store, profile=prof)
+        return FillSource(f"{source.label}, saved address '{chosen.summary()}'", browser_ref=source.ref), values
+
+    def resolve() -> tuple[FillSource, dict[str, str] | None]:
+        if not is_blank(identity) and is_source_ref(str(identity)):
+            return browser(str(identity))
+        try:
+            ident = resolve_identity_sync(state, profile, identity)
+            return FillSource(f"identity '{ident.name}'", ident=ident), None
+        except ProfilePilotError as missing:
+            # No identity given or linked: the browser's own saved addresses, when the user allows it.
+            if not is_blank(identity) or not state.store.load_config().autofill_from_browser:
+                raise
+            for ref in ("profile", "chrome"):
+                try:
+                    return browser(ref)
+                except ProfilePilotError:
+                    continue
+            raise ProfilePilotError(f"{missing} The browsers on this computer have no saved addresses either "
+                                    "(see autofill_sources).") from None
 
     return await run_sync(resolve)
 
@@ -402,6 +462,8 @@ async def identity_list(ctx: Context) -> str:
             parts.append(f"sensitive stored: {', '.join(k for k in FIELDS if k in ident.sensitive_set)}")
         if ident.allowed_origins:
             parts.append("sensitive autofill allowed on " + ", ".join(ident.allowed_origins))
+        if ident.chrome_source:
+            parts.append(f"linked to the browser's saved address ({ident.chrome_source})")
         if users.get(ident.id):
             parts.append("linked to " + ", ".join(users[ident.id]))
         lines.append(" | ".join(parts))
@@ -428,6 +490,10 @@ async def identity_show(ctx: Context, identity: IdentityRefArg) -> str:
         lines += [f"  {k}: {fields[k]}{' (sensitive)' if k in SENSITIVE_FIELDS else ''}" for k in shown]
     else:
         lines.append("  (no values yet: add them with identity_update)")
+    if view.get("chrome"):
+        link = view["chrome"]
+        lines.append(f"Linked browser address: {link['address'] or link['source']}. Read at fill time (values not "
+                     f"shown): {', '.join(link['fields_from_chrome']) or 'no fields'}. The identity's own values win.")
     missing = [k for k in FIELDS if k in SENSITIVE_FIELDS and k not in fields]
     if missing:
         lines.append(f"Sensitive fields not stored: {', '.join(missing)}. Only the user can add them, in a terminal: "
@@ -539,6 +605,7 @@ async def form_autofill(
     ctx: Context,
     profile: ProfileArg,
     identity: IdentityArg = None,
+    address: AddressArg = None,
     fields: FillFieldsArg = None,
     method: MethodArg = "paste",
     overwrite: OverwriteArg = False,
@@ -546,29 +613,37 @@ async def form_autofill(
     scope_selector: ScopeSelectorArg = None,
     tab: TabArg = None,
 ) -> str:
-    """Fill the page's form from the user's saved identity (default: the profile's linked identity):
-    names, email, phone, address, date of birth, company and so on, in every frame. Card, SSN and
-    password fields are skipped (form_autofill_sensitive). Values are never shown, fields that
+    """Fill the page's form from the user's saved identity (default: the profile's linked identity)
+    or from the addresses the user saved in their browser (identity='chrome', 'chrome:edge',
+    'profile'; see autofill_sources): names, email, phone, address, date of birth, company and so
+    on, in every frame. Without a linked identity the browser's saved addresses are used. Card, SSN
+    and password fields are skipped (form_autofill_sensitive). Values are never shown, fields that
     already have a value are kept (unless overwrite), and nothing is submitted."""
     state = get_state(ctx)
     wanted = wanted_keys(fields)
     if wanted and wanted & SENSITIVE_FIELDS:
         raise ProfilePilotError(f"{', '.join(k for k in FIELDS if k in wanted & SENSITIVE_FIELDS)}: card, SSN and "
                                 "password fields are only filled by form_autofill_sensitive.")
-    ident = await resolve_identity(state, profile, identity)
+    source, browser_values = await resolve_fill_source(state, profile, identity, address)
+    ident = source.ident
     state, session, page = await open_page(ctx, profile, tab)
     scope = await _scope(session, page, scope_ref, scope_selector)
-    values = await run_sync(partial(IdentityStore(state.store).fill_values, ident.id, include_sensitive=False,
-                                    fields=wanted))
+    if ident is not None:
+        values = await run_sync(partial(IdentityStore(state.store).fill_values, ident.id, include_sensitive=False,
+                                        fields=wanted))
+    else:
+        values = browser_fill_values(browser_values or {}, wanted)
     if not values:
-        raise ProfilePilotError(f"Identity '{ident.name}' has no values{' for those fields' if wanted else ''} to fill; "
-                                "add them with identity_update (details the user gives you).")
+        what = f"identity '{ident.name}'" if ident else source.label
+        raise ProfilePilotError(f"The {what} has no values{' for those fields' if wanted else ''} to fill"
+                                + ("; add them with identity_update (details the user gives you)." if ident else "."))
     report = await autofill(page, values, method=method, sensitive_keys=set(SENSITIVE_FIELDS),
                             clipboard_lock=state.clipboard_lock, only=wanted, overwrite=overwrite, scope=scope,
                             progress=progress_reporter(ctx))
-    log.info("form_autofill: %d filled, %d skipped (identity %s)", len(report.filled), len(report.skipped), ident.id)
-    lines = [report_text(report, f"Autofill from identity '{ident.name}' ({method}):")]
-    lines += report_hints(report, ident, sensitive_tool=False)
+    log.info("form_autofill: %d filled, %d skipped (%s)", len(report.filled), len(report.skipped),
+             ident.id if ident else source.browser_ref)
+    lines = [report_text(report, f"Autofill from {source.label} ({method}):")]
+    lines += report_hints(report, ident, sensitive_tool=False)  # type: ignore[arg-type]
     if any(e.get("reason", "").startswith("sensitive field") for e in report.skipped):
         lines.append("Card, SSN and password fields were left empty. If the user wants them filled, call "
                      "form_autofill_sensitive (the user approves it)." if state.sensitive_autofill else
@@ -605,6 +680,11 @@ async def form_autofill_sensitive(
                                 f"form_autofill. Sensitive keys: {SENSITIVE_KEYS_TEXT}.")
     secret_keys = wanted & SENSITIVE_FIELDS if wanted else set(SENSITIVE_FIELDS)
     keys = secret_keys | ((wanted or set()) - SENSITIVE_FIELDS)
+    from ..chrome_autofill import is_source_ref
+
+    if not is_blank(identity) and is_source_ref(str(identity)):
+        raise ProfilePilotError("Card, SSN and password values are never taken from the browser's saved data. Use an "
+                                "identity that holds them (identity_list); only the user can add them, in a terminal.")
     ident = await resolve_identity(state, profile, identity)
     if not secret_keys & set(ident.sensitive_set):
         names = ", ".join(k for k in FIELDS if k in secret_keys)
@@ -633,6 +713,61 @@ async def form_autofill_sensitive(
     lines += report_hints(report, ident, sensitive_tool=True)
     lines.append(SENSITIVE_NO_SUBMIT_NOTE)
     return await after_action(state, session, page, "\n".join(lines))
+
+
+def browser_fill_values(values: dict[str, str], wanted: set[str] | None) -> dict[str, str]:
+    """Browser-saved values plus the derived ones (full name, phone digits ...), never sensitive keys."""
+    from ..identity import _derived_from, derived_values
+
+    out = {k: v for k, v in values.items() if k not in SENSITIVE_FIELDS}
+    out.update({k: v for k, v in derived_values(out).items() if k not in out})
+    if wanted:
+        out = {k: v for k, v in out.items() if k in wanted or _derived_from(k) & wanted}
+    return out
+
+
+async def autofill_sources(
+    ctx: Context,
+    profile: Annotated[str, NoneOK, Field(description="Also list the addresses saved in this profile's own window.")] = None,
+) -> str:
+    """List where form_autofill can take the user's details from: saved identities, and the
+    addresses the user saved in their own browsers (Chrome, Edge, Brave profiles on this computer,
+    the active one marked) and in a profile's window. Each address is shown as name and city only.
+    Pass the source as form_autofill(identity='chrome:chrome/Default', address=2). Browser data
+    never includes cards, passwords or ID numbers."""
+    state = get_state(ctx)
+    from ..chrome_autofill import discover_sources, profile_source, read_addresses
+
+    def collect() -> list[str]:
+        lines: list[str] = []
+        idents = IdentityStore(state.store).list()
+        if idents:
+            lines.append("Identities: " + ", ".join(
+                i.name + (f" (linked to {i.chrome_source})" if i.chrome_source else "") for i in idents))
+        sources = []
+        if profile and not is_blank(profile) and not is_shardx_ref(profile):
+            sources.append(profile_source(state.store, state.store.get_profile(profile)))
+        sources += discover_sources()
+        for src in sources:
+            try:
+                addresses = read_addresses(src)
+            except ProfilePilotError as exc:
+                lines.append(f"{src.ref} - {src.label}: {exc}")
+                continue
+            if not addresses:
+                continue
+            lines.append(f"{src.ref} - {src.label}: {len(addresses)} saved address(es)")
+            lines += [f"  {n}. {a.summary()}" for n, a in enumerate(addresses[:10], 1)]
+            if len(addresses) > 10:
+                lines.append(f"  ... and {len(addresses) - 10} more")
+        if not lines:
+            return ["No identities and no addresses saved in a browser on this computer."]
+        return lines
+
+    lines = await run_sync(collect)
+    lines.append("Use with form_autofill(profile, identity=<source>, address=<number>). 'chrome' = the active Chrome "
+                 "profile; without a linked identity form_autofill uses the browser's saved addresses by itself.")
+    return "\n".join(lines)
 
 
 async def autofill_on_origin(page: Page, origin: str, values: dict[str, str], **kwargs: Any) -> AutofillReport:
@@ -683,6 +818,8 @@ def register(server: MCPServer, *, sensitive: bool = True) -> None:
              open_world=False, invoking="Saving the identity…", invoked="Identity saved")
     add_tool(server, identity_update, title="Update identity", read_only=False, destructive=False, idempotent=True,
              open_world=False, invoking="Updating the identity…", invoked="Identity updated")
+    add_tool(server, autofill_sources, title="List autofill sources", read_only=True, destructive=False,
+             idempotent=True, open_world=False, invoking="Looking for saved details…", invoked="Sources listed")
     add_tool(server, form_detect, title="Detect form fields", read_only=True, destructive=False, idempotent=True,
              open_world=False, invoking="Finding form fields…", invoked="Form fields found")
     add_tool(server, form_autofill, title="Autofill form", read_only=False, destructive=False, idempotent=True,

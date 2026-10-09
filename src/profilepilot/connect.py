@@ -1,4 +1,4 @@
-"""``profilepilot connect chatgpt | status | stop``: share ProfilePilot with ChatGPT, step by step.
+"""``profilepilot connect chatgpt | status | stop | unlock``: share ProfilePilot with ChatGPT, step by step.
 
 ChatGPT (on the web) cannot start programs on this computer: it only talks to MCP servers on the
 internet. The wizard explains that in plain language and offers three ways:
@@ -15,7 +15,9 @@ C. **ngrok** (free account): the same with ``ngrok http``; ``--ngrok-domain`` ke
 
 With B and C the server is protected by OAuth with a **pairing code** (see
 :mod:`profilepilot.server.oauth`): ChatGPT's sign-in page asks for the code shown here, so only
-someone who can see this screen can connect. The wizard keeps running until Ctrl+C (or
+someone who can see this screen can connect. If someone else used up the wrong-code attempts,
+``profilepilot connect unlock`` (on this computer) makes a new code that works right away. The
+wizard keeps running until Ctrl+C (or
 ``profilepilot connect stop`` from another terminal), then stops both processes. While it runs,
 ``<data root>/chatgpt.json`` (``url``, ``mcp_url``, ``started_at``, pids) lets ProfilePilot Manager
 and ``connect status`` show the connection.
@@ -402,6 +404,10 @@ def _clock(value: Any) -> str:
         return "?"
 
 
+def _same_url(a: Any, b: Any) -> bool:
+    return isinstance(a, str) and isinstance(b, str) and a.rstrip("/").lower() == b.rstrip("/").lower()
+
+
 def status_text(info: dict[str, Any]) -> str:
     lines: list[str] = []
     if info.get("running"):
@@ -411,16 +417,45 @@ def status_text(info: dict[str, Any]) -> str:
     else:
         lines.append("ChatGPT connection: off. Start it with: profilepilot connect chatgpt")
     lines.append(f"  Pairing code:  {info.get('pairing_code')}   (asked on the sign-in page; changes after each use)")
+    lines.append("                 Enter it only on ProfilePilot's own sign-in page; never give it to anyone, "
+                 "including an AI in a chat.")
+    if info.get("unlock_until"):
+        lines.append(f"  Sign-in unlocked until {_clock(info.get('unlock_until'))}: the pairing code above works "
+                     "even after wrong attempts.")
+    elif info.get("locked_until"):
+        lines.append(f"  Sign-in LOCKED until {_clock(info.get('locked_until'))}: too many wrong pairing codes were "
+                     "entered (if not by you, someone else knows the address).")
+        lines.append("  To sign in now: profilepilot connect unlock")
     connections = info.get("connections") or []
     if connections:
         lines.append("  Connected apps:")
         for grant in connections:
             name = grant.get("client_name") or grant.get("client_id") or "app"
+            old = (info.get("running") and grant.get("resource") and info.get("mcp_url")
+                   and not _same_url(grant.get("resource"), info.get("mcp_url")))
+            note = "; approved for an earlier address, it must sign in again" if old else ""
             lines.append(f"    - {name} (approved {_clock(grant.get('created_at'))}, last used "
-                         f"{_clock(grant.get('last_used_at'))})")
+                         f"{_clock(grant.get('last_used_at'))}{note})")
     else:
         lines.append("  Connected apps: none")
     return "\n".join(lines)
+
+
+def unlock_sharing(store: Any) -> str:
+    """``profilepilot connect unlock``: when someone else used up the wrong-code attempts, make a
+    new pairing code that the sign-in page accepts for the next few minutes (see
+    :func:`profilepilot.server.oauth.unlock_sign_in`). Returns the text to show the user."""
+    from .server.oauth import UNLOCK_TTL, unlock_sign_in
+
+    code = unlock_sign_in(store)
+    minutes = max(1, UNLOCK_TTL // 60)
+    return "\n".join([
+        f"New pairing code: {code}   (longer than usual, so nobody can guess it in the meantime)",
+        f"For the next {minutes} minutes the sign-in page accepts it even if wrong codes were entered before.",
+        "Go back to the sign-in page (reload it, or start the connection again in ChatGPT) and enter this code.",
+        "If you did not enter wrong codes yourself, someone else knows the address: after signing in, consider",
+        "`profilepilot connect stop` and a new tunnel.",
+    ])
 
 
 def stop_sharing(store: Any, *, revoke: bool = False, timeout: float = 8.0) -> str:
@@ -657,6 +692,8 @@ class Wizard:
                     self.out(f"    {line}")
                 return 1
             mcp_url = public + MCP_PATH
+            with contextlib.suppress(Exception):  # the server makes a new code when it starts: show that one
+                code = pairing_code(self.store)
             self._write_state(public, mcp_url, option.kind, port, server, tunnel)
             self._card(mcp_url, code, option.kind)
             return self._watch(public, server, tunnel, code, OAuthStore(self.store.root), pairing_code)
@@ -719,6 +756,8 @@ class Wizard:
         self.out("  3. Connection: paste the URL above.  Authentication: OAuth.")
         self.out("  4. Accept the warning and create it. A ProfilePilot sign-in page opens:")
         self.out("     enter the pairing code and click Approve.")
+        self.out("Never give the pairing code to anyone, not even to an AI in a chat: ProfilePilot only asks for it")
+        self.out("on its own sign-in page.")
         self.out("Claude (claude.ai) works too: Settings > Connectors > Add custom connector > same URL.")
         if kind == "cloudflared":
             self.out("This address changes every time you run this. Next time, update the URL in ChatGPT")
@@ -732,6 +771,7 @@ class Wizard:
             threading.Thread(target=self._report_reachability, args=(public,), daemon=True).start()
         known = {g["grant_id"] for g in db.grants()}
         last_code = code
+        warned_lock: float | None = None
         while not self.stop_event.wait(self.poll_interval):
             state = read_state(self.store)
             if not state or state.get("pid") != os.getpid() or state.get("stopping"):
@@ -755,6 +795,13 @@ class Wizard:
                 if fresh != last_code:
                     last_code = fresh
                     self.out(f"Pairing code for the next sign-in: {fresh}")
+            with contextlib.suppress(Exception):
+                locked = db.sign_in_lock().get("locked_until")
+                if locked and locked != warned_lock:
+                    warned_lock = locked
+                    self.out(f"Warning: too many wrong pairing codes were entered; sign-in is locked until "
+                             f"{_clock(locked)}. If that was not you, someone else knows the address.")
+                    self.out("To sign in now, run in another terminal: profilepilot connect unlock")
         return 0
 
     def _report_reachability(self, public: str) -> None:
@@ -812,6 +859,11 @@ def cmd_connect_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_connect_unlock(args: argparse.Namespace) -> int:
+    _print(unlock_sharing(_store(args)))
+    return 0
+
+
 def add_cli(subparsers: Any, common: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Add ``connect chatgpt|status|stop`` to the ``profilepilot`` parser (see WIRE-IN.md)."""
     parser = subparsers.add_parser("connect", help="share ProfilePilot with ChatGPT (tunnel + sign-in)",
@@ -839,10 +891,13 @@ def add_cli(subparsers: Any, common: argparse.ArgumentParser) -> argparse.Argume
         cmd_connect_status)
     stop = add("stop", "stop sharing ProfilePilot with ChatGPT", cmd_connect_stop)
     stop.add_argument("--revoke", action="store_true", help="also sign out every connected app")
+    add("unlock", "after too many wrong pairing codes: a new code that the sign-in page accepts right away",
+        cmd_connect_unlock)
     return parser
 
 
 __all__ = [
     "CHATGPT_FILE", "INTRO", "ManagedProcess", "Wizard", "add_cli", "find_executable", "parse_cloudflared_url",
     "parse_ngrok_url", "read_state", "server_command", "status_info", "status_text", "stop_sharing", "tunnel_argv",
+    "unlock_sharing",
 ]

@@ -41,7 +41,7 @@ from typing import Any, Callable, Iterable, Sequence
 from pydantic import ValidationError
 
 from . import __version__
-from .errors import ConflictError, ProfilePilotError, RestartRequiredError
+from .errors import ConflictError, NotFoundError, ProfilePilotError, RestartRequiredError
 from .models import Profile, ProxyCheck, ProxyRecord, RuntimeInfo
 from .proxy.url import ProxyParseError
 from .store import Store
@@ -295,9 +295,44 @@ def cmd_profile_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def _check_not_paused(store: Store, profile: Any, args: argparse.Namespace) -> None:
+    """Commands that drive a profile's browser, exit IP or data refuse while the user has control of it
+    (an AI with a shell can run this CLI too). ``--ignore-pause`` is the user's explicit override."""
+    if getattr(args, "ignore_pause", False):
+        return
+    from .control import ControlStore, ProfilePausedError
+
+    try:
+        ControlStore(store).check_not_paused(profile.id)
+    except ProfilePausedError as exc:
+        raise ProfilePausedError(
+            f"'{profile.name}' is paused for the AI (you took control, or it waits for your help). Hand it back "
+            f"with: profilepilot profile resume \"{profile.name}\" - or pass --ignore-pause to act on it anyway.",
+            profile_id=exc.profile_id, pause=exc.pause) from None
+
+
+def _paused(store: Store) -> Callable[[Any], bool]:
+    """``RuntimeInfo -> bool``: is that running profile paused (fails closed on an unreadable state)?"""
+    from .control import ControlStore
+
+    control = ControlStore(store)
+
+    def paused(info: Any) -> bool:
+        try:
+            control.check_not_paused(info.profile_id)
+        except NotFoundError:
+            return False
+        except ProfilePilotError:
+            return True
+        return False
+
+    return paused
+
+
 def cmd_profile_start(args: argparse.Namespace) -> int:
     store = _store(args)
     profile = store.get_profile(args.profile)
+    _check_not_paused(store, profile, args)
     info = _runtime(store).start(profile.id, timeout=args.timeout, window=args.window)
     emit(args, info.public(), _runtime_lines(profile.name, info))
     return 0
@@ -306,6 +341,7 @@ def cmd_profile_start(args: argparse.Namespace) -> int:
 def cmd_profile_stop(args: argparse.Namespace) -> int:
     store = _store(args)
     profile = store.get_profile(args.profile)
+    _check_not_paused(store, profile, args)
     stopped = _runtime(store).stop(profile.id, timeout=args.timeout)
     emit(args, {"profile": profile.name, "stopped": stopped},
          f"Stopped '{profile.name}'." if stopped else f"'{profile.name}' was not running.")
@@ -314,6 +350,7 @@ def cmd_profile_stop(args: argparse.Namespace) -> int:
 
 def cmd_profile_delete(args: argparse.Namespace) -> int:
     store = _store(args)
+    _check_not_paused(store, store.get_profile(args.profile), args)
     entry = store.delete_profile(args.profile)
     emit(args, entry.model_dump(mode="json"),
          f"Moved '{entry.name}' to the trash ({entry.size_bytes // 1024} KB). "
@@ -337,6 +374,8 @@ def cmd_profile_restore(args: argparse.Namespace) -> int:
 def cmd_profile_clone(args: argparse.Namespace) -> int:
     store = _store(args)
     source = store.get_profile(args.profile)
+    if args.copy_data:  # copies its cookies and logins while the user may be signing in
+        _check_not_paused(store, source, args)
     clone = store.clone_profile(source.id, args.new_name, copy_data=args.copy_data)
     emit(args, clone.summary(), f"Cloned '{source.name}' to '{clone.name}' (id {clone.id})"
                                 + (" including browser data." if args.copy_data else " (settings only)."))
@@ -367,6 +406,8 @@ def cmd_profile_update(args: argparse.Namespace) -> int:
     proxy = _proxy_arg(args)
     record: ProxyRecord | None = None
     proxy_changed = proxy is not None or args.no_proxy
+    if proxy_changed:  # switched live: it would change the exit IP under the user's hands
+        _check_not_paused(store, profile, args)
     if proxy:
         record = _resolve_proxy(store, proxy, name_hint=profile.name, scheme=args.proxy_scheme)
     if proxy_changed:
@@ -390,6 +431,8 @@ def cmd_profile_update(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------- identity
+
+IGNORE_PAUSE_HELP = "act even while the profile is paused for the AI (you took control or it waits for help)"
 
 CONFIRM_TWICE = ("card_number", "ssn", "password")
 """Sensitive fields that are typed twice at the hidden prompt (a typo would go unnoticed)."""
@@ -470,6 +513,71 @@ def cmd_identity_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_identity_sources(args: argparse.Namespace) -> int:
+    """Browser profiles on this computer whose saved addresses autofill can use."""
+    from .chrome_autofill import discover_sources, read_addresses
+
+    rows, data = [], []
+    for src in discover_sources():
+        try:
+            addresses = read_addresses(src)
+        except ProfilePilotError as exc:
+            rows.append((src.ref, src.label, "?", str(exc)))
+            continue
+        data.append({"source": src.ref, "label": src.label, "active": src.active,
+                     "addresses": [{"number": n, "summary": a.summary(), "uses": a.use_count}
+                                   for n, a in enumerate(addresses, 1)]})
+        first = addresses[0].summary() if addresses else "-"
+        rows.append((src.ref, src.label, str(len(addresses)), first))
+    emit(args, data, lambda: (table(rows, ["SOURCE", "BROWSER PROFILE", "ADDRESSES", "MOST USED"]) + "\n"
+                              "Link one: profilepilot identity connect-chrome NAME --source SOURCE [--address N]")
+         if rows else "No Chrome, Edge, Brave or Chromium profile with saved data found.")
+    return 0
+
+
+def cmd_identity_connect_chrome(args: argparse.Namespace) -> int:
+    store = _store(args)
+    ids = _identities(store)
+    try:
+        ident = ids.get(args.identity)
+    except ProfilePilotError:
+        if not args.create:
+            raise
+        ident = ids.create(args.identity)
+    ident = ids.connect_chrome(ident.id, args.source, args.address)
+    _live, note = ids.chrome_values(ident)
+    emit(args, ids.masked(ident.id),
+         f"Identity '{ident.name}' now takes its name, email, phone and address live from {note}. "
+         "Values you set on the identity win; cards, passwords and IDs are never read from the browser.")
+    return 0
+
+
+def cmd_identity_disconnect_chrome(args: argparse.Namespace) -> int:
+    store = _store(args)
+    ident = _identities(store).disconnect_chrome(args.identity)
+    emit(args, {"identity": ident.name, "chrome_source": None}, f"Identity '{ident.name}' is no longer linked to a browser.")
+    return 0
+
+
+def cmd_identity_import_chrome(args: argparse.Namespace) -> int:
+    """Copy one browser-saved address into an identity (a snapshot; connect-chrome keeps it live)."""
+    from .chrome_autofill import source_values
+
+    store = _store(args)
+    ids = _identities(store)
+    values, source, chosen = source_values(args.source, address=args.address)
+    try:
+        ident = ids.get(args.identity)
+        ident = ids.update(ident.id, values)
+        verb = "Updated"
+    except ProfilePilotError:
+        ident = ids.create(args.identity, values)
+        verb = "Created"
+    emit(args, ids.masked(ident.id),
+         f"{verb} identity '{ident.name}' from {source.label} ({chosen.summary()}): {', '.join(sorted(values))}.")
+    return 0
+
+
 def cmd_identity_show(args: argparse.Namespace) -> int:
     from .identity import FIELDS
 
@@ -487,6 +595,8 @@ def cmd_identity_show(args: argparse.Namespace) -> int:
         fields = view["fields"]
         lines += [f"  {k.ljust(width)}  {fields[k]}" for k in FIELDS if k in fields] or ["  (no values)"]
         lines.append(f"  sensitive autofill on: {', '.join(ident.allowed_origins) or '- (none)'}")
+        if view.get("chrome"):
+            lines.append(f"  linked browser: {view['chrome']['address'] or view['chrome']['source']}")
         lines.append(f"  profiles: {', '.join(view['profiles']) or '-'}")
         return "\n".join(lines)
 
@@ -793,8 +903,14 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_stop_all(args: argparse.Namespace) -> int:
     store = _store(args)
-    stopped = _runtime(store).stop_all(timeout=args.timeout)
-    emit(args, {"stopped": stopped}, f"Stopped {len(stopped)} profile(s)" + (f": {', '.join(stopped)}." if stopped else "."))
+    runtime = _runtime(store)
+    paused = _paused(store)
+    kept = [] if args.ignore_pause else [i.profile_name for i in runtime.list_running() if paused(i)]
+    stopped = runtime.stop_all(timeout=args.timeout, keep=None if args.ignore_pause else paused)
+    text = f"Stopped {len(stopped)} profile(s)" + (f": {', '.join(stopped)}." if stopped else ".")
+    if kept:
+        text += f" Kept {', '.join(kept)} running: paused for the AI (--ignore-pause stops them too)."
+    emit(args, {"stopped": stopped, "kept_paused": kept}, text)
     return 0
 
 
@@ -1165,9 +1281,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("profile")
     p.add_argument("--window", choices=WINDOW_MODES, help="window mode for this run")
     p.add_argument("--timeout", type=float, default=60.0)
+    p.add_argument("--ignore-pause", action="store_true", help=IGNORE_PAUSE_HELP)
     p = add(psub, "stop", "stop a profile's Chrome", cmd_profile_stop)
     p.add_argument("profile")
     p.add_argument("--timeout", type=float, default=20.0)
+    p.add_argument("--ignore-pause", action="store_true", help=IGNORE_PAUSE_HELP)
     p = add(psub, "pause", "take control: the AI won't act on the profile until 'resume'", cmd_profile_pause)
     p.add_argument("profile")
     p.add_argument("--note", help="shown to the AI, e.g. 'logging in'")
@@ -1175,12 +1293,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("profile")
     p = add(psub, "delete", "move a stopped profile to the trash", cmd_profile_delete)
     p.add_argument("profile")
+    p.add_argument("--ignore-pause", action="store_true", help=IGNORE_PAUSE_HELP)
     p = add(psub, "restore", "restore a profile from the trash (no id: list the trash)", cmd_profile_restore)
     p.add_argument("trash_id", nargs="?")
     p = add(psub, "clone", "copy a profile", cmd_profile_clone)
     p.add_argument("profile")
     p.add_argument("new_name")
     p.add_argument("--copy-data", action="store_true", help="also copy cookies, logins and history")
+    p.add_argument("--ignore-pause", action="store_true", help=IGNORE_PAUSE_HELP)
     p = add(psub, "update", "change a profile", cmd_profile_update)
     p.add_argument("profile")
     p.add_argument("--name")
@@ -1201,6 +1321,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--webrtc", choices=["auto", "proxy_only", "default"])
     p.add_argument("--extra-arg", action="append", help="replace the extra Chrome switches (repeatable; '' clears)")
     p.add_argument("--identity", help="identity (name or id) for form autofill; '' removes the link")
+    p.add_argument("--ignore-pause", action="store_true", help=IGNORE_PAUSE_HELP)
 
     # identity
     idn = sub.add_parser("identity", help="manage identities for form autofill", parents=[common],
@@ -1240,6 +1361,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("identity")
     p.add_argument("--yes", action="store_true", help="do not ask for confirmation")
     add(isub, "fields", "list the identity field keys", cmd_identity_fields)
+    add(isub, "sources", "browser profiles (Chrome, Edge, Brave) whose saved addresses autofill can use",
+        cmd_identity_sources)
+    p = add(isub, "connect-chrome", "take an identity's name/email/phone/address live from a browser's saved "
+            "addresses (never cards or passwords)", cmd_identity_connect_chrome)
+    p.add_argument("identity")
+    p.add_argument("--source", default="chrome",
+                   help="chrome (the active Chrome profile, default), chrome:edge, chrome:chrome/'Profile 1' ...")
+    p.add_argument("--address", default=None, help="saved address number from 'identity sources' (default: most used)")
+    p.add_argument("--create", action="store_true", help="create the identity if it does not exist")
+    p = add(isub, "disconnect-chrome", "stop taking an identity's values from a browser", cmd_identity_disconnect_chrome)
+    p.add_argument("identity")
+    p = add(isub, "import-chrome", "copy one browser-saved address into an identity (a snapshot)",
+            cmd_identity_import_chrome)
+    p.add_argument("identity")
+    p.add_argument("--source", default="chrome")
+    p.add_argument("--address", default=None)
 
     # proxy
     prx = sub.add_parser("proxy", help="manage proxies", parents=[common])
@@ -1264,8 +1401,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=float, default=12.0)
 
     p = add(sub, "status", "list running profiles", cmd_status)
-    p = add(sub, "stop-all", "stop every running profile", cmd_stop_all)
+    p = add(sub, "stop-all", "stop every running profile (except paused ones)", cmd_stop_all)
     p.add_argument("--timeout", type=float, default=20.0)
+    p.add_argument("--ignore-pause", action="store_true", help="also stop profiles that are paused for the AI")
 
     from .install import CLIENTS
 

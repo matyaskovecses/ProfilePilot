@@ -52,13 +52,29 @@ class ProfilePilot:
     :param runtime: an object with the ``RuntimeManager`` interface (``status``, ``list_running``,
         ``start``, ``stop``); by default ``profilepilot.browser.runtime.RuntimeManager`` is created
         lazily on first use.
+    :param ignore_pause: act on profiles the user took control of (or that wait for the user's help
+        after a ``profile_request_help``) too. Off by default: like the AI's tools, everything that
+        drives a profile's browser, its cookies, exit IP or data (:meth:`start`, :meth:`stop`,
+        :meth:`ensure_running` and so :meth:`cdp_url` / :meth:`proxy_url` / :meth:`cookies` /
+        :meth:`set_cookies` / :meth:`http_identity`, :meth:`set_proxy`, :meth:`delete`) raises
+        :class:`~profilepilot.control.ProfilePausedError` on a paused profile. Pass True only in
+        your own scripts, never for an agent.
     """
 
     def __init__(self, root: Path | str | None = None, *, store: Store | None = None,
-                 runtime: "RuntimeManager | Any | None" = None) -> None:
+                 runtime: "RuntimeManager | Any | None" = None, ignore_pause: bool = False) -> None:
         self.store = store if store is not None else Store(root)
         self._runtime = runtime
         self._runtime_lock = threading.Lock()
+        self.ignore_pause = bool(ignore_pause)
+
+    def _check_not_paused(self, profile: Profile) -> None:
+        """Refuse to act on a profile the user controls (see ``ignore_pause``)."""
+        if self.ignore_pause:
+            return
+        from .control import ControlStore
+
+        ControlStore(self.store).check_not_paused(profile.id)
 
     def __repr__(self) -> str:
         return f"ProfilePilot(root={str(self.store.root)!r})"
@@ -133,6 +149,7 @@ class ProfilePilot:
 
     def delete(self, ref: str) -> TrashEntry:
         """Move a stopped profile to the trash (restorable with ``store.restore_profile``)."""
+        self._check_not_paused(self.store.get_profile(ref))
         return self.store.delete_profile(ref)
 
     # ------------------------------------------------------------------ proxies
@@ -160,6 +177,7 @@ class ProfilePilot:
         new proxy applies on the next start.
         """
         profile = self.store.get_profile(ref)
+        self._check_not_paused(profile)
         proxy_id = self._proxy_id(proxy, proxy_scheme) if proxy else None
         profile = self.store.update_profile(profile.id, proxy_id=proxy_id)
         if self.runtime.status(profile.id) is not None:
@@ -183,11 +201,13 @@ class ProfilePilot:
         :param window: override the window mode for this run only (``normal``/``offscreen``/``headless``).
         """
         profile = self.store.get_profile(ref)
+        self._check_not_paused(profile)
         return self.runtime.start(profile.id, timeout=timeout, window=window)
 
     def stop(self, ref: str, *, timeout: float = 20.0) -> bool:
         """Close the profile's browser gracefully. Returns False if it was not running."""
         profile = self.store.get_profile(ref)
+        self._check_not_paused(profile)
         return self.runtime.stop(profile.id, timeout=timeout)
 
     def info(self, ref: str) -> RuntimeInfo | None:
@@ -203,6 +223,7 @@ class ProfilePilot:
                        timeout: float = 60.0) -> RuntimeInfo:
         """Current runtime info; starts the profile if needed (or raises if ``start`` is False)."""
         profile = self.store.get_profile(ref)
+        self._check_not_paused(profile)
         info = self.runtime.status(profile.id)
         if info is not None and info.state == "running":
             return info

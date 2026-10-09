@@ -277,6 +277,10 @@ class AppConfig(_Model):
     """Override for the default browser executable (otherwise auto-detected)."""
     default_window: WindowMode = "normal"
     max_running: int = 20
+    autofill_from_browser: bool = True
+    """form_autofill on a profile with no linked identity uses the addresses saved in a browser:
+    first the profile's own browser, then the user's active Chrome/Edge/Brave profile (names, email,
+    phone, address - never cards, passwords or IDs)."""
     escape_client_job: bool = False
     """Windows, opt-in. Some MCP clients (e.g. the official Python SDK's stdio client) run their
     server inside a kill-on-close job that forbids breakaway, so browsers die when the client

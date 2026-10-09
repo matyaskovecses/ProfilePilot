@@ -24,9 +24,13 @@ profile now. Wait and check profile_status, or ask the user."
 
 from __future__ import annotations
 
+import json
+import logging
 import os
+import random
 import re
 import secrets
+import shutil
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -38,6 +42,8 @@ from .errors import ConflictError, NotFoundError, ProfilePilotError
 from .jsonio import lock_for, read_json, write_json
 from .models import Profile
 from .paths import is_valid_id
+
+log = logging.getLogger("profilepilot.control")
 
 HelpKind = Literal["captcha", "login", "verification", "payment", "other"]
 HelpStatus = Literal["open", "done", "dismissed"]
@@ -56,6 +62,12 @@ RECENT_RESOLVED = timedelta(hours=1)
 SUMMARY_MAX = 200
 ACTIVITY_MAX_BYTES = 5 * 1024 * 1024
 ACTIVITY_KEEP = 2
+READ_ATTEMPTS = 10
+UNREADABLE_NOTE = (
+    "ProfilePilot could not read this profile's control state, so the AI is kept off it. "
+    "Hand it back in ProfilePilot Manager to reset it."
+)
+"""Note of the pause reported for a corrupt ``control.json`` (the pause check fails closed)."""
 
 KIND_LABELS: dict[str, str] = {
     "captcha": "CAPTCHA",
@@ -193,6 +205,13 @@ class ProfilePausedError(ConflictError):
         self.pause = pause
 
 
+class ControlStateError(ProfilePilotError):
+    """A profile's control state could not be read (e.g. ``control.json`` is locked by another process).
+
+    The pause check fails closed: AI tools are refused rather than allowed on a profile whose pause
+    state is unknown."""
+
+
 def refusal_message(profile_name: str, pause: PauseInfo) -> str:
     """The refusal an AI tool returns for a paused profile (actionable, model-facing)."""
     if pause.by == "help":
@@ -226,9 +245,47 @@ class ControlStore:
     def _path(self, profile_id: str) -> Path:
         return self.store.profile_dir(profile_id) / CONTROL_FILE
 
-    def _read(self, profile_id: str) -> dict[str, Any]:
-        data = read_json(self._path(profile_id), {}) or {}
-        return data if isinstance(data, dict) else {}
+    def _read(self, profile_id: str, *, strict: bool = True) -> dict[str, Any]:
+        """The raw ``control.json`` of ``profile_id`` ({} when there is none).
+
+        Fails closed: a corrupt file reads as a user pause (:data:`UNREADABLE_NOTE`; a copy is kept as
+        ``control.json.bad``) instead of "not paused", and a file that stays locked raises
+        :class:`ControlStateError`. With ``strict=False`` (display only) a locked file reads as {}."""
+        path = self._path(profile_id)
+        raw = b""
+        for attempt in range(READ_ATTEMPTS):
+            try:
+                raw = path.read_bytes()
+                break
+            except FileNotFoundError:
+                return {}
+            except OSError as exc:  # PermissionError: a writer or a scanner holds it (Windows)
+                if attempt == READ_ATTEMPTS - 1:
+                    if not strict:
+                        return {}
+                    raise ControlStateError(
+                        f"The control state of this profile ({path.name}) cannot be read right now "
+                        f"({type(exc).__name__}). Try again in a moment."
+                    ) from None
+                time.sleep(0.02 + random.random() * 0.05)
+        for encoding in ("utf-8-sig", "utf-16"):
+            try:
+                data = json.loads(raw.decode(encoding))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if isinstance(data, dict):
+                return data
+            break
+        log.warning("control state of profile %s is unreadable; treating the profile as paused", profile_id)
+        try:
+            shutil.copyfile(path, path.with_suffix(path.suffix + ".bad"))
+        except OSError:
+            pass
+        try:
+            since = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).replace(microsecond=0)
+        except OSError:
+            since = _now()
+        return {"pause": {"paused": True, "by": "user", "since": since.isoformat(), "note": UNREADABLE_NOTE}}
 
     @staticmethod
     def _parse(profile_id: str, data: dict[str, Any]) -> ControlState:
@@ -272,11 +329,12 @@ class ControlStore:
         profile = self.store.get_profile(ref)
         return self._parse(profile.id, self._read(profile.id))
 
-    def state_by_id(self, profile_id: str) -> ControlState:
-        """Like :meth:`state` for a known id (no profile lookup; empty state for a missing file)."""
+    def state_by_id(self, profile_id: str, *, strict: bool = True) -> ControlState:
+        """Like :meth:`state` for a known id (no profile lookup; empty state for a missing file).
+        ``strict=False`` is for display: a file that stays locked reads as "no pause" instead of raising."""
         if not is_valid_id(profile_id):
             raise ProfilePilotError(f"Invalid profile id: {profile_id!r}")
-        return self._parse(profile_id, self._read(profile_id))
+        return self._parse(profile_id, self._read(profile_id, strict=strict))
 
     def paused(self, ref: str) -> PauseInfo | None:
         """The pause that applies to the AI (the user's own, or an open help request), else None."""
@@ -298,7 +356,7 @@ class ControlStore:
         for entry in root.iterdir():
             if not entry.is_dir() or not is_valid_id(entry.name) or not (entry / CONTROL_FILE).exists():
                 continue
-            state = self._parse(entry.name, self._read(entry.name))
+            state = self._parse(entry.name, self._read(entry.name, strict=False))
             out.extend(state.open)
             if not open_only:
                 out.extend(state.resolved)
@@ -440,10 +498,20 @@ def control_status_lines(control: ControlStore, profile_id: str, *, now: datetim
 
 _CARDISH = re.compile(r"(?<![\d.])(?:\d[ -]?){12,18}\d(?![\d.])")
 _SSN = re.compile(r"(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)")
-_SECRET_QUERY = re.compile(
-    r"(?i)([?&#](?:access_token|refresh_token|id_token|token|api[_-]?key|apikey|key|secret|password|passwd|pwd|pass|"
-    r"auth|code|session|sessionid|sid|sig|signature|otp|t)=)[^&#\s'\"]+"
+_SECRET_NAME = (
+    r"[\w.\-\[\]]*(?:token|secret|passw(?:or)?d|pwd|passcode|api[_-]?key|apikey|access[_-]?key|private[_-]?key|"
+    r"key|code|auth|session|sessid|ticket|sig|otp|jwt|credential|nonce|hash)[\w.\-\[\]]*"
 )
+"""Names of URL parameters / JSON fields whose values are masked (any name *containing* one of the words)."""
+_SECRET_QUERY = re.compile(rf"(?i)([?&#;](?:{_SECRET_NAME}|sid|pass|pw|t|k)=)[^&#\s'\"<>]+")
+_SECRET_FIELD = re.compile(rf"(?i)([\"'](?:{_SECRET_NAME})[\"']\s*:\s*[\"']?)([^\"'\s,;}}\]]+)")
+_KNOWN_KEYS = re.compile(
+    r"\b(?:(?:AKIA|ASIA|AGPA|AIDA|AROA)[0-9A-Z]{16}|AIza[0-9A-Za-z_\-]{30,}|gh[pousr]_[A-Za-z0-9]{20,}|"
+    r"github_pat_[A-Za-z0-9_]{20,}|xox[abposr]-[A-Za-z0-9\-]{10,}|(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{8,}|"
+    r"sk-[A-Za-z0-9_\-]{20,})\b"
+)
+"""Well-known API key shapes (AWS access key ids, Google, GitHub, Slack, Stripe, OpenAI-style)."""
+_PATH_SEGMENT = re.compile(r"(?<=/)[A-Za-z0-9_\-]{16,}(?=[/?#&\s'\"<>]|$)")
 _LONG_TOKEN = re.compile(r"(?<![A-Za-z0-9_\-])[A-Za-z0-9_\-]{32,}(?![A-Za-z0-9_\-])")
 
 
@@ -452,6 +520,24 @@ def _opaque(word: str) -> bool:
     digits = sum(ch.isdigit() for ch in word)
     letters = sum(ch.isalpha() for ch in word)
     return digits >= 6 and letters >= 6 and word.count("-") < 4
+
+
+def _random_looking(word: str) -> bool:
+    """A URL path segment that looks like a token (a magic-link or reset code), not a slug or an id
+    like ``how-to-bake-a-cake`` / ``2024-10-09-article``: letters and digits alternate a lot."""
+    if len(word) < 16:
+        return False
+    chars = [ch for ch in word if ch not in "-_"]
+    digits = sum(ch.isdigit() for ch in chars)
+    letters = sum(ch.isalpha() for ch in chars)
+    if digits < 2 or letters < 4:
+        return False
+
+    def kind(ch: str) -> int:
+        return 0 if ch.isdigit() else 1 if ch.islower() else 2
+
+    switches = sum(1 for a, b in zip(chars, chars[1:]) if kind(a) != kind(b))
+    return switches >= 6
 
 
 def _luhn(digits: str) -> bool:
@@ -469,8 +555,10 @@ def _luhn(digits: str) -> bool:
 def scrub_text(text: Any, *, extra: Iterable[str] = (), redact: Callable[[str], str] | None = None,
                limit: int = SUMMARY_MAX) -> str:
     """One line of ``text``, safe to store and show: proxy credentials, bearer tokens, JWTs, secret
-    URL parameters, long opaque tokens, card numbers and SSNs are masked, as are the ``extra``
-    strings (e.g. values a sensitive autofill typed) and whatever ``redact`` replaces."""
+    URL parameters (any name containing token, secret, key, code, password, auth, sig, session,
+    ticket ...), JSON fields with such names, well-known API key shapes, token-like URL path segments,
+    long opaque tokens, card numbers and SSNs are masked, as are the ``extra`` strings (e.g. values a
+    sensitive autofill typed) and whatever ``redact`` replaces."""
     raw = "" if text is None else str(text)
     line = ""
     for candidate in raw.splitlines():
@@ -494,6 +582,8 @@ def scrub_text(text: Any, *, extra: Iterable[str] = (), redact: Callable[[str], 
     except Exception:  # pragma: no cover - keep a minimal fallback
         line = re.sub(r"://[^\s/@]*@", "://***@", line)
     line = _SECRET_QUERY.sub(r"\1***", line)
+    line = _SECRET_FIELD.sub(r"\1***", line)
+    line = _KNOWN_KEYS.sub("***", line)
 
     def card(m: re.Match[str]) -> str:
         digits = re.sub(r"\D", "", m.group(0))
@@ -501,6 +591,7 @@ def scrub_text(text: Any, *, extra: Iterable[str] = (), redact: Callable[[str], 
 
     line = _CARDISH.sub(card, line)
     line = _SSN.sub("[redacted]", line)
+    line = _PATH_SEGMENT.sub(lambda m: "***" if _random_looking(m.group(0)) else m.group(0), line)
     line = _LONG_TOKEN.sub(lambda m: "***" if _opaque(m.group(0)) else m.group(0), line)
     line = "".join(ch if ch.isprintable() else " " for ch in line)
     line = " ".join(line.split())
@@ -521,6 +612,8 @@ class ActivityEvent(_Model):
     summary: str = ""
     ok: bool = True
     ms: int = 0
+    blocked: bool = False
+    """The call was refused because the user controls the profile (or it waits for the user's help)."""
 
     @field_validator("summary", mode="before")
     @classmethod
@@ -724,6 +817,7 @@ __all__ = [
     "ActivityEvent",
     "ActivityLog",
     "ControlState",
+    "ControlStateError",
     "ControlStore",
     "HelpKind",
     "HelpRequest",

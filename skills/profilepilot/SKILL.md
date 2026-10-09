@@ -79,6 +79,10 @@ opens, selects and closes tabs. New popups become the active tab.
   limits it to one form. Then take a `browser_snapshot` to check the result. Nothing is submitted:
   confirm with the user before you submit. Fields reported as "not visible" are covered or hidden:
   close the dialog or banner over the form, never try to fill hidden fields another way.
+- **The user's browser-saved addresses** work too: `autofill_sources` lists them (name and city
+  only), and `form_autofill(profile, identity="chrome")` fills from the active Chrome profile's most
+  used address (`identity="chrome:edge"`, `address=2` pick others). A profile with no linked
+  identity uses them by itself. They never contain cards, passwords or ID numbers.
 - **Card number, expiry, CVV, SSN and password** are filled only by `form_autofill_sensitive`. The
   user approves every call, and it works only on sites the user allow-listed for that identity. If
   it says the site is not allowed, or that a value is missing, show the user the exact

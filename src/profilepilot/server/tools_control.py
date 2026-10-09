@@ -3,49 +3,67 @@
 ``register(server)`` adds the tool. The hooks are used by :func:`profilepilot.server.app.tool_guard`
 (see docs/design/WIRE-IN.md, "Manager & control"):
 
-* :func:`enforce_pause` refuses every browser, form, cookie and http tool (and ``profile_stop`` /
-  ``profile_set_proxy``, which would pull the window or the exit IP out from under the user) on a
-  profile the user controls or that waits for the user's help;
+* :func:`enforce_pause` refuses every browser, form, cookie and http tool (and the profile tools that
+  would pull the window, its settings, its data or its exit IP out from under the user: stop, start,
+  update, set_proxy, clone, delete, and ``proxy_remove(force=True)`` of a proxy such a profile uses) on
+  a profile the user controls or that waits for the user's help. It fails closed: when the pause
+  state cannot be read, the tool is refused too;
+* :func:`run_unless_paused` cancels a running page tool as soon as its profile gets paused (the user
+  took control mid-call), so e.g. humanized typing never continues into the user's window;
 * :func:`log_activity` appends one scrubbed :class:`~profilepilot.control.ActivityEvent` per tool call,
   which ProfilePilot Manager shows live;
 * :func:`control_lines` gives ``profile_status`` the pause and help-request state.
 
-None of these hooks may break a tool call: they log and swallow their own failures (except the
-deliberate :class:`~profilepilot.control.ProfilePausedError`).
+None of these hooks may break a tool call: they log and swallow their own failures, except the
+deliberate refusals of :func:`enforce_pause` (:class:`~profilepilot.control.ProfilePausedError` and
+:class:`~profilepilot.control.ControlStateError`).
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Awaitable, Callable, Literal, TypeVar
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
 from pydantic import Field
 
 from ..control import (
+    CONTROL_FILE,
     KIND_LABELS,
     ActivityEvent,
     ActivityLog,
+    ControlStateError,
     ControlStore,
     ProfilePausedError,
+    clock,
     control_status_lines,
     manager_info,
+    refusal_message,
 )
-from ..errors import NotFoundError, ProfilePilotError
+from ..errors import AmbiguousError, NotFoundError, ProfilePilotError
 from .app import ProfileArg, add_tool, get_state, run_sync
 
 log = logging.getLogger("profilepilot.server.control")
+
+T = TypeVar("T")
 
 SHARDX_PREFIX = "shardx:"
 
 GUARDED_PREFIXES: tuple[str, ...] = ("browser_", "form_", "cookies_", "http_")
 """Tools refused on a paused profile: everything that touches its pages, cookies or network."""
-GUARDED_TOOLS: frozenset[str] = frozenset({"profile_stop", "profile_set_proxy"})
-"""Profile management tools that would disrupt the user's work in the window (closing it, or
-switching the exit IP mid-login). Everything else (profile_status, profile_list, profile_update,
-proxy_*, identity_*, profile_request_help) stays allowed."""
+GUARDED_TOOLS: frozenset[str] = frozenset({
+    "profile_stop", "profile_start", "profile_set_proxy", "profile_update", "profile_clone", "profile_delete",
+})
+"""Profile management tools that would disrupt the user's work in the window: closing or (re)starting
+it, switching its exit IP or settings mid-login, copying its logged-in data, or deleting it.
+``proxy_remove(force=True)`` is checked separately (:func:`enforce_pause`). Everything else
+(profile_status, profile_list, proxy_list/add/test, identity_*, profile_request_help) stays allowed."""
+PAUSE_POLL_S = 0.4
+"""While a page tool (:data:`GUARDED_PREFIXES`) runs, how often its profile's pause is re-checked: a pause
+that starts mid-call stops the call (see :func:`run_unless_paused`)."""
 
 HelpKindArg = Annotated[
     Literal["captcha", "login", "verification", "payment", "other"],
@@ -130,23 +148,131 @@ def _state_of(ctx: Any) -> Any:
 async def enforce_pause(ctx: Any, tool: str, kwargs: dict[str, Any]) -> None:
     """Raise :class:`ProfilePausedError` when ``tool`` would act on a paused profile.
 
-    Unknown profiles pass (the tool reports them itself); any other failure here is logged and
-    ignored so that the pause check can never break a tool."""
-    if not is_guarded_tool(tool):
+    Unknown or ambiguous profiles pass (the tool reports them itself). Everything else fails closed:
+    when the profile's pause state cannot be read, :class:`ControlStateError` refuses the tool."""
+    guarded = is_guarded_tool(tool)
+    if not guarded and not (tool == "proxy_remove" and kwargs.get("force") is True):
+        return
+    state = _state_of(ctx if ctx is not None else kwargs.get("ctx"))
+    if state is None:
+        return
+    if not guarded:
+        await _enforce_proxy_users(state, kwargs.get("proxy"))
         return
     ref = _profile_ref(kwargs)
-    state = _state_of(ctx if ctx is not None else kwargs.get("ctx"))
-    if ref is None or state is None:
+    if ref is None:
         return
     control = ControlStore(state.store)
     try:
         await run_sync(control.check_not_paused, ref)
-    except ProfilePausedError:
+    except (ProfilePausedError, ControlStateError):
         raise
-    except (NotFoundError, ProfilePilotError):
+    except (NotFoundError, AmbiguousError):
         return
-    except Exception as exc:  # pragma: no cover - defensive
-        log.debug("pause check failed for %s: %s", tool, exc)
+    except Exception as exc:
+        log.warning("pause check failed for %s: %s", tool, exc)
+        raise ControlStateError(
+            f"Could not check whether the user controls profile '{ref}' right now, so {tool} was not run. "
+            "Try again in a moment."
+        ) from None
+
+
+async def _enforce_proxy_users(state: Any, proxy_ref: Any) -> None:
+    """``proxy_remove(force=True)``: refuse while a profile that uses the proxy is paused (removing it
+    would switch that profile to a direct connection under the user)."""
+    if not isinstance(proxy_ref, str) or not proxy_ref.strip():
+        return
+    store = state.store
+
+    def check() -> None:
+        try:
+            record = store.get_proxy(proxy_ref.strip())
+        except (NotFoundError, AmbiguousError):
+            return  # proxy_remove reports it
+        control = ControlStore(store)
+        for profile in store.list_profiles():
+            if profile.proxy_id != record.id:
+                continue
+            pause = control.state_by_id(profile.id).effective
+            if pause is not None:
+                who = "waits for the user's help" if pause.by == "help" else "is controlled by the user"
+                raise ProfilePausedError(
+                    f"Proxy '{record.name}' is used by profile '{profile.name}', which {who} right now "
+                    f"(since {clock(pause.since)}). Don't remove it now: wait and check profile_status, or ask the user.",
+                    profile_id=profile.id, pause=pause,
+                )
+
+    try:
+        await run_sync(check)
+    except (ProfilePausedError, ControlStateError):
+        raise
+    except Exception as exc:
+        log.warning("pause check for proxy_remove failed: %s", exc)
+        raise ControlStateError(
+            "Could not check whether the user controls a profile that uses this proxy, so proxy_remove was not "
+            "run. Try again in a moment."
+        ) from None
+
+
+def stopped_message(profile_name: str, tool: str, pause: Any) -> str:
+    """The error of a page tool that was cancelled because a pause started while it ran."""
+    return f"{tool} was stopped before it finished. " + refusal_message(profile_name, pause)
+
+
+async def run_unless_paused(ctx: Any, tool: str, kwargs: dict[str, Any], call: Callable[[], Awaitable[T]]) -> T:
+    """Run a tool body (``call()``), cancelling it the moment its profile gets paused.
+
+    :func:`enforce_pause` only checks *before* a call. A page tool can run for seconds (humanized
+    typing, waits, long navigations); if the user takes control meanwhile (or a help request pauses the
+    profile), the call is cancelled at once - so typing never continues into whatever field the user
+    has focused - and :class:`ProfilePausedError` reports it. Only page tools (:data:`GUARDED_PREFIXES`)
+    are watched; the check is a ``stat`` of ``control.json`` every :data:`PAUSE_POLL_S` seconds, and the
+    file is only read when it changed."""
+    if not tool.startswith(GUARDED_PREFIXES):
+        return await call()
+    state = _state_of(ctx if ctx is not None else kwargs.get("ctx"))
+    ref = _profile_ref(kwargs)
+    if state is None or ref is None:
+        return await call()
+    try:
+        profile = await run_sync(state.store.get_profile, ref)
+    except Exception:  # unknown / ambiguous: the tool reports it
+        return await call()
+    control = ControlStore(state.store)
+    path = state.store.profile_dir(profile.id) / CONTROL_FILE
+
+    def stamp() -> tuple[int, int] | None:
+        try:
+            st = path.stat()
+        except OSError:
+            return None
+        return st.st_mtime_ns, st.st_size
+
+    seen = stamp()
+    task = asyncio.ensure_future(call())
+    try:
+        while True:
+            done, _pending = await asyncio.wait({task}, timeout=PAUSE_POLL_S)
+            if done:
+                return task.result()
+            now = stamp()
+            if now == seen:
+                continue
+            seen = now
+            try:
+                pause = await run_sync(lambda: control.state_by_id(profile.id, strict=False).effective)
+            except Exception as exc:  # pragma: no cover - a display-grade read; enforce_pause guards the next call
+                log.debug("in-flight pause check failed for %s: %s", tool, exc)
+                continue
+            if pause is None:
+                continue
+            task.cancel()
+            await asyncio.wait({task}, timeout=5)
+            log.info("%s on profile %s was stopped: the profile was paused while it ran", tool, profile.id)
+            raise ProfilePausedError(stopped_message(profile.name, tool, pause), profile_id=profile.id, pause=pause)
+    finally:
+        if not task.done():
+            task.cancel()
 
 
 def client_name(ctx: Any) -> str:
@@ -181,11 +307,13 @@ def result_text(result: Any) -> str:
 
 
 async def log_activity(ctx: Any, tool: str, kwargs: dict[str, Any], *, ok: bool, result: Any = None,
-                       started: float | None = None, source: str | None = None) -> None:
+                       started: float | None = None, source: str | None = None, blocked: bool = False) -> None:
     """Append an :class:`ActivityEvent` for one tool call (never raises).
 
     ``result`` is the tool's return value, or the error (message) for a failed call; only its first
-    line is kept, scrubbed of credentials and of values ``form_autofill_sensitive`` filled."""
+    line is kept, scrubbed of credentials and of values ``form_autofill_sensitive`` filled.
+    ``blocked`` marks a call refused because the user controls the profile (the Manager shows it as
+    "Blocked - you were in control", not as an error)."""
     try:
         state = _state_of(ctx if ctx is not None else kwargs.get("ctx"))
         if state is None:
@@ -217,7 +345,8 @@ async def log_activity(ctx: Any, tool: str, kwargs: dict[str, Any], *, ok: bool,
                 except Exception:
                     pass
             event = ActivityEvent(profile_id=profile_id, profile_name=profile_name, source=src,
-                                  client=client or None, tool=tool, summary=summary, ok=ok, ms=ms)
+                                  client=client or None, tool=tool, summary=summary, ok=ok, ms=ms,
+                                  blocked=bool(blocked))
             ActivityLog(state.store.root).append(event)
 
         await run_sync(write)
@@ -234,10 +363,19 @@ def control_lines(store: Any, profile_id: str) -> list[str]:
         return []
 
 
+def is_pause_refusal(exc: BaseException) -> bool:
+    """Was ``exc`` raised because the user controls the profile (``enforce_pause``'s refusal)?"""
+    return isinstance(exc, ProfilePausedError)
+
+
 __all__ = [
     "GUARDED_PREFIXES",
     "GUARDED_TOOLS",
+    "PAUSE_POLL_S",
     "client_name",
+    "is_pause_refusal",
+    "run_unless_paused",
+    "stopped_message",
     "control_lines",
     "enforce_pause",
     "is_guarded_tool",

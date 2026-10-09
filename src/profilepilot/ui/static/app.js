@@ -2,11 +2,11 @@
 
 import { connectEvents, onUnauthorized } from "./api.js";
 import { h, icon, isTyping, replace } from "./dom.js";
-import { assistantName, notifyHelp, renderHelpBanners } from "./help-banner.js";
+import { notifyHelp, renderHelpBanners } from "./help-banner.js";
 import { closeProfileDrawer, openProfileDrawer } from "./profile-drawer.js";
 import {
-  loadChatGPT, loadIdentities, loadMeta, loadOverview, loadProxies, loadSettings, loadTrash, markAiActive, notify, removeProfile,
-  setLive, state, subscribe, upsertProfile,
+  loadChatGPT, loadIdentities, loadMeta, loadOverview, loadProxies, loadSettings, loadTrash, markAiActive, notify,
+  proxyTestStarted, removeProfile, setLive, state, subscribe, upsertProfile,
 } from "./store.js";
 import { applyTheme, currentTheme, onThemeChange } from "./theme-switch.js";
 import { closeMenu, openDialog, toast } from "./ui.js";
@@ -25,12 +25,14 @@ const NAV = [
   { key: "connections", label: "Connections", icon: "connections", hotkey: "c" },
   { key: "settings", label: "Settings", icon: "settings", hotkey: "s" },
 ];
+const THEMES = [["system", "monitor", "System theme"], ["light", "sun", "Light theme"], ["dark", "moon", "Dark theme"]];
 
 const views = {};
 let currentKey = null;
 const navLinks = {};
 const counts = {};
 let mainHost;
+let mainEl;
 let bannerHost;
 let offlineBanner;
 let runningPill;
@@ -61,28 +63,47 @@ function buildShell() {
   for (const item of NAV) {
     const count = h("span.count");
     counts[item.key] = count;
-    const link = h("a.nav-item", { href: `#/${item.key}`, attrs: { title: `${item.label} (g then ${item.hotkey})` } }, icon(item.icon, "lg"), h("span.label", item.label), count);
+    const link = h("a.nav-item", { href: `#/${item.key}`, attrs: { title: `${item.label} (G then ${item.hotkey.toUpperCase()})` } }, icon(item.icon, "lg"), h("span.label", item.label), count);
     navLinks[item.key] = link;
     nav.append(link);
   }
   runningPill = h("div.running-pill", { attrs: { title: "Profiles running now" } }, h("span.dot.stopped"), h("span.label", "No profiles running"));
-  const themeButtons = [
-    ["system", "monitor", "Use the system theme"], ["light", "sun", "Light theme"], ["dark", "moon", "Dark theme"],
-  ].map(([value, iconName, label]) => h("button", { attrs: { type: "button", "aria-label": label, title: label, "aria-pressed": String(currentTheme() === value) }, onclick: () => applyTheme(value) }, icon(iconName)));
-  onThemeChange((value) => themeButtons.forEach((b, i) => b.setAttribute("aria-pressed", String(["system", "light", "dark"][i] === value))));
+  const themeButtons = THEMES.map(([value, iconName, label]) => h("button", { attrs: { type: "button", "aria-label": label, title: label, "aria-pressed": String(currentTheme() === value) }, onclick: () => applyTheme(value) }, icon(iconName)));
+  // Narrow sidebar: one button that cycles System -> Light -> Dark.
+  const themeCycle = h("button.btn.ghost.xs.icon-only.theme-cycle", { attrs: { type: "button" }, onclick: () => {
+    const i = THEMES.findIndex(([v]) => v === currentTheme());
+    applyTheme(THEMES[(i + 1) % THEMES.length][0]);
+  } });
+  const syncTheme = (value) => {
+    themeButtons.forEach((b, i) => b.setAttribute("aria-pressed", String(THEMES[i][0] === value)));
+    const [, iconName, label] = THEMES.find(([v]) => v === value) || THEMES[0];
+    replace(themeCycle, icon(iconName));
+    themeCycle.setAttribute("aria-label", `${label} (click to change)`);
+    themeCycle.title = `${label} (click to change)`;
+  };
+  syncTheme(currentTheme());
+  onThemeChange(syncTheme);
   versionLabel = h("span.version", "");
-  const helpBtn = h("button.btn.ghost.xs.icon-only", { attrs: { "aria-label": "Keyboard shortcuts", title: "Keyboard shortcuts (?)" }, onclick: () => shortcutsDialog() }, icon("keyboard"));
+  const helpBtn = h("button.btn.ghost.xs.icon-only", { attrs: { type: "button", "aria-label": "Keyboard shortcuts", title: "Keyboard shortcuts (?)" }, onclick: () => shortcutsDialog() }, icon("keyboard"));
   const sidebar = h("aside.sidebar", { attrs: { "aria-label": "Main navigation" } },
     h("div.brand", h("img", { src: "/static/logo.svg", alt: "", width: 28, height: 28 }), h("div.brand-text", h("span.brand-name", "ProfilePilot"), h("span.brand-sub", "Manager"))),
     nav,
     h("div.sidebar-footer", runningPill,
-      h("div.sidebar-meta", h("div.theme-switch", { attrs: { role: "group", "aria-label": "Theme" } }, themeButtons), helpBtn, versionLabel)));
-  bannerHost = h("div.banners", { attrs: { "aria-live": "polite" } });
+      h("div.sidebar-meta", h("div.theme-switch", { attrs: { role: "group", "aria-label": "Theme" } }, themeButtons), themeCycle, helpBtn, versionLabel)));
+  bannerHost = h("div.banners");
   offlineBanner = h("div.offline-banner.hidden", { attrs: { role: "status" } }, icon("alert"), "Lost the connection to ProfilePilot Manager. Retrying…");
   mainHost = h("div.view-host.view");
-  const main = h("main.main", { id: "main" }, offlineBanner, bannerHost, mainHost);
-  replace(app, sidebar, main);
+  mainEl = h("main.main", { id: "main", attrs: { tabindex: "-1" } }, offlineBanner, bannerHost, mainHost);
+  const skip = h("a.skip-link", { href: "#main", onclick: (event) => { event.preventDefault(); focusMain(); } }, "Skip to content");
+  replace(app, skip, sidebar, mainEl);
   app.removeAttribute("aria-busy");
+}
+
+/** Move the keyboard to the current view's first control (the skip link). */
+function focusMain() {
+  const target = mainHost.querySelector(".view-body button, .view-body a[href], .view-body input, .view-body [tabindex='0'], .view-header button")
+    || mainEl;
+  target.focus();
 }
 
 function renderChrome() {
@@ -91,16 +112,18 @@ function renderChrome() {
   const help = state.help.length;
   counts.profiles.classList.toggle("alert", help > 0);
   counts.profiles.title = help ? `${help} waiting for you` : "";
-  replace(counts.profiles, ...(help ? [h("span.dot.help", { attrs: { "aria-hidden": "true" } }), ` ${help}`] : [profiles.length ? String(profiles.length) : ""]));
+  replace(counts.profiles, ...(help ? [h("span.dot.help", { attrs: { "aria-hidden": "true" } }), h("span", String(help))] : [profiles.length ? String(profiles.length) : ""]));
   counts.proxies.textContent = state.proxies.length ? String(state.proxies.length) : "";
   counts.identities.textContent = state.identities.length ? String(state.identities.length) : "";
   replace(counts.activity, state.live ? h("span.dot.running", { attrs: { title: "Live" } }) : "");
   const clients = state.clients || [];
   const connected = clients.filter((c) => c.registered === true).length + (state.chatgpt && state.chatgpt.running ? 1 : 0);
   counts.connections.textContent = connected ? String(connected) : "";
+  for (const el of Object.values(counts)) el.classList.toggle("empty", !el.textContent && !el.firstElementChild);
   replace(runningPill, h("span.dot", { class: running ? "running pulse" : "stopped" }),
+    h("span.pill-count", { attrs: { "aria-hidden": "true" } }, running ? String(running) : ""),
     h("span.label", running ? h("span", h("strong", String(running)), ` ${running === 1 ? "profile" : "profiles"} running`) : "No profiles running"));
-  runningPill.title = running ? `${running} running` : "No profiles running";
+  runningPill.title = running ? `${running} ${running === 1 ? "profile" : "profiles"} running` : "No profiles running";
   versionLabel.textContent = state.version ? `v${state.version}` : "";
   document.title = help ? `(${help}) ProfilePilot Manager` : "ProfilePilot Manager";
   renderHelpBanners(bannerHost);
@@ -146,23 +169,29 @@ function startEvents() {
     profile(view) { upsertProfile(view); },
     "profile-removed"(data) { removeProfile(data.id); },
     help(req) {
+      // The banner above every view shows it; a desktop notification only when this window is in the background.
       notifyHelp(req, () => openProfileDrawer(req.profile_id));
-      toast(req.message, { kind: "warn", title: `${assistantName(req)} needs you in ${req.profile_name}`, timeout: 10000,
-        action: { label: "Open", onClick: () => openProfileDrawer(req.profile_id) } });
     },
     proxies() { loadProxies().catch(() => {}); },
     identities() { loadIdentities().catch(() => {}); },
     settings() { loadSettings().catch(() => {}); },
     trash() { if (state.trash) loadTrash().catch(() => {}); },
     chatgpt() { loadChatGPT().catch(() => {}); },
+    clients(data) { if (data && data.clients) { state.clients = data.clients; notify("clients"); } },
     "proxy-test"(data) {
-      state.proxyTest = { job: data.job, done: data.done, total: data.total, finished: !!data.finished };
+      if (data.started) { proxyTestStarted(data); return; }
+      state.proxyTest = { job: data.job, done: data.done, total: data.total, finished: !!data.finished, cancelled: !!data.cancelled };
+      const id = data.proxy_id || (data.proxy && data.proxy.id);
+      if (id) state.proxyTesting.delete(id);
       if (data.proxy) {
         const i = state.proxies.findIndex((p) => p.id === data.proxy.id);
         if (i >= 0) state.proxies[i] = { ...state.proxies[i], ...data.proxy, used_by: state.proxies[i].used_by };
-        if (views.proxies) views.proxies.markTested(data.proxy.id);
       }
-      if (data.finished) toast(`${data.ok} of ${data.total} working.`, { kind: data.ok === data.total ? "success" : "warn", title: "Proxy test finished" });
+      if (data.finished) {
+        state.proxyTesting.clear();
+        if (data.cancelled) toast(`Stopped after ${data.done} of ${data.total}.`, { kind: "info", title: "Proxy test stopped" });
+        else toast(`${data.ok} of ${data.total} working.`, { kind: data.ok === data.total ? "success" : "warn", title: "Proxy test finished" });
+      }
       notify("proxy-test", "proxies");
     },
   }, (live) => {
@@ -199,21 +228,19 @@ function onKey(event) {
 }
 
 function shortcutsDialog() {
+  const then = (a, b) => [h("kbd", a), h("span.faint", " then "), h("kbd", b)];
   const rows = [
-    ["Search the current list", ["/"]],
-    ["New profile / proxy / identity", ["N"]],
-    ["Go to a section", ["1", "–", "6"]],
-    ["Go to Profiles, Proxies, Identities", ["G", "P"], ["G", "X"], ["G", "I"]],
-    ["Go to Activity, Connections, Settings", ["G", "A"], ["G", "C"], ["G", "S"]],
-    ["Close a dialog or drawer", ["Esc"]],
-    ["Show this list", ["?"]],
+    ["Search the current list", [h("kbd", "/")]],
+    ["New profile, proxy or identity", [h("kbd", "N")]],
+    ["Go to a section by number", [h("kbd", "1"), h("span.faint", " – "), h("kbd", "6")]],
+    ...NAV.map((n) => [`Go to ${n.label}`, then("G", n.hotkey.toUpperCase())]),
+    ["Move between profiles", [h("kbd", "←"), h("kbd", "→"), h("kbd", "↑"), h("kbd", "↓")]],
+    ["Close a dialog, menu or drawer", [h("kbd", "Esc")]],
+    ["Show this list", [h("kbd", "?")]],
   ];
   openDialog({
     title: "Keyboard shortcuts", size: "narrow",
-    body: h("div.kbd-list", rows.flatMap(([label, ...combos]) => [
-      h("span", label),
-      h("div.row", combos.map((combo, i) => [i ? h("span.faint", "·") : null, ...combo.map((k) => (k === "–" ? h("span.faint", "–") : h("kbd", k)))])),
-    ])),
+    body: h("div.kbd-list", rows.flatMap(([label, keys]) => [h("span", label), h("div.row.kbd-keys", keys)])),
   });
 }
 

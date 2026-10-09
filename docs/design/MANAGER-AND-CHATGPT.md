@@ -57,7 +57,7 @@ These are registered during the wire-in phase.
 
 ### Security (it controls logged-in browsers and secrets)
 
-- **Auth:** a random 32-byte token is required. The launcher opens `/?t=<token>` once; the server sets an `HttpOnly; SameSite=Strict` cookie and redirects to `/`. Every API call needs the cookie or the `X-ProfilePilot-Token` header.
+- **Auth:** a random 32-byte token is required. The launcher mints a single-use, two-minute launch code with the token (`POST /api/launch-code`) and opens `/?t=<code>` once; the master token itself is never accepted in a URL. The server sets an `HttpOnly; SameSite=Strict` cookie and redirects to `/`. Every API call needs the cookie or the `X-ProfilePilot-Token` header.
 - **Requests:**
   - The Host header must be `127.0.0.1:<port>` or `localhost:<port>` (DNS rebinding).
   - Unsafe methods need an `Origin` that matches (CSRF).

@@ -25,7 +25,15 @@ from profilepilot.control import ControlStore
 from profilepilot.models import RuntimeInfo
 from profilepilot.safety import UrlPolicy
 from profilepilot.server.app import AppState
-from profilepilot.server.apps_ui import DASHBOARD_HTML, DASHBOARD_URI, META_KEY, build_apps, dashboard_text
+from profilepilot.server import apps_ui
+from profilepilot.server.apps_ui import (
+    DASHBOARD_HTML,
+    DASHBOARD_URI,
+    META_KEY,
+    DashboardApps,
+    build_apps,
+    dashboard_text,
+)
 from profilepilot.store import Store
 
 SECRET = "Pr0xy-S3cret-pw"
@@ -89,13 +97,17 @@ def seeded(store):
     return {"shop": shop, "research": research, "proxy": proxy}
 
 
-def make_server(store: Store, runtime: FakeRuntime, **kw: Any) -> tuple[MCPServer, Any]:
+def make_server(store: Store, runtime: FakeRuntime, apps: Any = None, **kw: Any) -> tuple[MCPServer, Any]:
     @asynccontextmanager
     async def lifespan(_server):
         yield AppState(store=store, runtime=runtime, browsers=FakeBrowsers(), policy=UrlPolicy())
 
-    apps = build_apps(**kw)
+    apps = apps or build_apps(**kw)
     return MCPServer("pp-apps-test", lifespan=lifespan, extensions=[apps]), apps
+
+
+def token_of(result: Any) -> str:
+    return result.meta[META_KEY]["token"]
 
 
 # ---------------------------------------------------------------------- resource
@@ -115,8 +127,11 @@ def test_dashboard_html_is_self_contained_and_csp_friendly():
         assert forbidden not in html, forbidden
     for method in ("ui/initialize", "ui/notifications/initialized", "ui/notifications/tool-result", "tools/call",
                    "ui/notifications/size-changed", "ui/resource-teardown", "ui/notifications/host-context-changed",
-                   "ui/update-model-context", "ui/message", "ui/request-display-mode"):
+                   "ui/update-model-context", "ui/request-display-mode"):
         assert f'"{method}"' in html, method
+    # the panel never hands a profile back or closes a help request (that lifts the user's pause)
+    for action in ("hand_back", "help_done", "help_dismiss"):
+        assert action not in html, action
     assert '"2026-01-26"' in html  # MCP Apps protocol version
     assert "event.source !== window.parent" in html  # only the host may talk to the panel
 
@@ -149,7 +164,8 @@ async def test_resource_and_tool_metadata(store, seeded):
         for key in ("openai/toolInvocation/invoking", "openai/toolInvocation/invoked"):
             assert 0 < len(tool.meta[key]) <= 64
         assert tool.description and len(tool.description) > 40
-    assert set(action.input_schema["properties"]) == {"action", "profile", "request_id", "token"}
+    assert set(action.input_schema["properties"]) == {"action", "profile", "token"}
+    assert set(action.input_schema["properties"]["action"]["enum"]) == {"start", "stop", "take_control"}
 
 
 # ---------------------------------------------------------------------- tool results
@@ -173,13 +189,14 @@ async def test_text_fallback_and_structured_content(store, seeded):
     assert data["features"] == {"control": True}
     shop = next(p for p in data["profiles"] if p["name"] == "shop-us")
     assert shop["state"] == "running" and shop["proxy"]["name"] == "US-1" and shop["tags"] == ["shopping"]
-    assert result.meta[META_KEY]["token"] == apps.action_token
+    assert not (result.meta or {}).get(META_KEY)  # no panel here: no action token for the model to see
     blob = json.dumps(result.model_dump(mode="json"))
     assert SECRET not in blob and "alice" not in blob  # no proxy credentials anywhere
 
     async with Client(server, extensions=[APPS_CLIENT]) as client:
-        text = text_of(await client.call_tool("profiles_dashboard", {}))
-    assert "ProfilePilot panel above" in text
+        result = await client.call_tool("profiles_dashboard", {})
+    assert "ProfilePilot panel above" in text_of(result)
+    assert apps.token_valid(token_of(result))
 
 
 @pytest.mark.asyncio
@@ -189,48 +206,104 @@ async def test_panel_actions(store, seeded):
     control = ControlStore(store)
     shop = seeded["shop"]
     async with Client(server, extensions=[APPS_CLIENT]) as client:
-        async def act(action: str, token: str | None = None, **kw: Any) -> Any:
-            args = {"action": action, "profile": shop.id, "token": apps.action_token if token is None else token, **kw}
+        token = token_of(await client.call_tool("profiles_dashboard", {}))
+
+        async def act(action: str, token_value: str | None = None, **kw: Any) -> Any:
+            args = {"action": action, "profile": shop.id, "token": token if token_value is None else token_value, **kw}
             return await client.call_tool("dashboard_action", args)
 
         # without (or with a wrong) token the model cannot use the panel's tool
-        for token in ("", "wrong-token"):
-            refused = await act("hand_back", token=token)
+        for bad in ("", "wrong-token"):
+            refused = await act("take_control", token_value=bad)
             assert refused.is_error and "only works from the buttons" in text_of(refused)
-        assert runtime.calls == []
+        assert runtime.calls == [] and control.state_by_id(shop.id).pause is None
 
         started = await act("start")
         assert not started.is_error and runtime.calls == [("start", shop.id)]
         assert started.structured_content["message"] == "Started 'shop-us'."
-        assert started.meta[META_KEY]["token"] == apps.action_token
+        assert apps.token_valid(token_of(started)) and token_of(started) != token  # a fresh token per result
 
         taken = await act("take_control")
         assert control.state_by_id(shop.id).pause is not None
         row = next(p for p in taken.structured_content["profiles"] if p["id"] == shop.id)
         assert row["paused"] is True and row["paused_note"]
-        assert "the user has taken control" in text_of(taken)
+        assert "the user has taken control" in text_of(taken) and "ProfilePilot Manager" in text_of(taken)
 
-        back = await act("hand_back")
-        assert control.state_by_id(shop.id).pause is None
-        assert "Handed 'shop-us' back to the AI." in text_of(back)
+        # the panel cannot lift the pause: no hand back, no stopping the user's window
+        for action in ("hand_back", "help_done", "help_dismiss"):
+            refused = await act(action)
+            assert refused.is_error, action
+        stop = await act("stop")
+        assert stop.is_error and "in your hands" in text_of(stop)
+        start = await act("start")  # like profile_start: the panel does not (re)start the user's profile either
+        assert start.is_error and "does not start it" in text_of(start)
+        assert runtime.calls == [("start", shop.id)] and control.state_by_id(shop.id).pause is not None
 
-        # help requests from the AI show up and can be resolved from the panel
+        # help requests from the AI show up (to be resolved in ProfilePilot Manager)
+        control.resume(shop.id)
         req = control.request_help(shop.id, "Solve the CAPTCHA", "captcha")
         listed = await client.call_tool("profiles_dashboard", {})
         assert listed.structured_content["help"][0]["message"] == "Solve the CAPTCHA"
         assert listed.structured_content["help"][0]["kind_label"] == "CAPTCHA"
         assert "Waiting for the user in 'shop-us' (CAPTCHA): 'Solve the CAPTCHA'." in text_of(listed)
-        done = await act("help_done", request_id=req.id)
-        assert not done.is_error and done.structured_content["help"] == []
-        assert control.state_by_id(shop.id).effective is None
-        missing = await act("help_dismiss", request_id="nope")
-        assert missing.is_error and "no longer exists" in text_of(missing)
+        refused = await act("stop")  # the AI waits for the user in that window
+        assert refused.is_error and control.state_by_id(shop.id).effective is not None
+        control.resolve_help(shop.id, req.id)
 
         stopped = await act("stop")
         assert not stopped.is_error and runtime.calls[-1] == ("stop", shop.id)
-        bad = await client.call_tool("dashboard_action", {"action": "explode", "profile": shop.id,
-                                                          "token": apps.action_token})
+        bad = await client.call_tool("dashboard_action", {"action": "explode", "profile": shop.id, "token": token})
         assert bad.is_error
+
+
+@pytest.mark.asyncio
+async def test_action_tokens_expire(store, seeded):
+    now = [1000.0]
+    apps = DashboardApps(clock=lambda: now[0])
+    server, _ = make_server(store, FakeRuntime(store), apps=apps)
+    async with Client(server, extensions=[APPS_CLIENT]) as client:
+        token = token_of(await client.call_tool("profiles_dashboard", {}))
+        now[0] += apps_ui.TOKEN_TTL + 1
+        refused = await client.call_tool("dashboard_action", {"action": "start", "profile": seeded["shop"].id,
+                                                              "token": token})
+        assert refused.is_error and "out of date" in text_of(refused)
+    for _ in range(apps_ui.MAX_TOKENS + 50):
+        apps.issue_token()
+    assert len(apps._tokens) <= apps_ui.MAX_TOKENS
+
+
+@pytest.mark.asyncio
+async def test_ai_cannot_lift_the_users_pause(tmp_path):
+    """Finding 1 (the security review's PoC): the real server, a client without MCP Apps (the model
+    sees everything it gets) and one with them: neither can hand the profile back or close the help
+    request that pauses the AI."""
+    from profilepilot.server.app import create_server
+
+    home = Store(tmp_path / "real-home")
+    bank = home.create_profile("bank")
+    control = ControlStore(home)
+    control.pause(bank.id, "logging in to my bank")
+    server = create_server(store=home, remote=True)
+    async with Client(server) as client:  # e.g. a CLI agent: no panel
+        tools = {t.name for t in (await client.list_tools()).tools}
+        dash = await client.call_tool("profiles_dashboard", {})
+        assert not (dash.meta or {}).get(META_KEY)
+        if "dashboard_action" in tools:
+            for token in ("", "guess"):
+                back = await client.call_tool("dashboard_action", {"action": "take_control", "profile": bank.id,
+                                                                   "token": token})
+                assert back.is_error and "no MCP Apps support" in text_of(back)
+    async with Client(server, extensions=[APPS_CLIENT]) as client:
+        token = token_of(await client.call_tool("profiles_dashboard", {}))
+        for action in ("hand_back", "help_done", "help_dismiss"):
+            result = await client.call_tool("dashboard_action", {"action": action, "profile": bank.id,
+                                                                 "token": token})
+            assert result.is_error
+        assert control.state_by_id(bank.id).pause is not None
+        req = control.request_help(bank.id, "Enter the SMS code", "verification")
+        result = await client.call_tool("dashboard_action", {"action": "help_done", "profile": bank.id,
+                                                             "token": token, "request_id": req.id})
+        assert result.is_error and control.state_by_id(bank.id).effective is not None
 
 
 @pytest.mark.asyncio
@@ -239,11 +312,11 @@ async def test_panel_without_control_layer(store, seeded):
         raise ImportError("no control layer")
 
     server, apps = make_server(store, FakeRuntime(store), control_factory=broken)
-    async with Client(server) as client:
+    async with Client(server, extensions=[APPS_CLIENT]) as client:
         result = await client.call_tool("profiles_dashboard", {})
         assert result.structured_content["features"] == {"control": False}
         refused = await client.call_tool("dashboard_action", {"action": "take_control", "profile": seeded["shop"].id,
-                                                              "token": apps.action_token})
+                                                              "token": token_of(result)})
         assert refused.is_error and "control layer" in text_of(refused)
 
 
@@ -302,8 +375,9 @@ async def test_panel_bridge_in_real_browser(tmp_path, store, seeded):
     async with Client(server, extensions=[APPS_CLIENT]) as client:
         first = (await client.call_tool("profiles_dashboard", {})).model_dump(mode="json", by_alias=True,
                                                                               exclude_none=True)
+        panel_token = first["_meta"][META_KEY]["token"]
         after = (await client.call_tool("dashboard_action", {"action": "take_control", "profile": seeded["shop"].id,
-                                                             "token": apps.action_token}))
+                                                             "token": panel_token}))
         after = after.model_dump(mode="json", by_alias=True, exclude_none=True)
 
     shots = os.environ.get("PROFILEPILOT_SHOTS")  # optional: where to save screenshots for a UX review
@@ -339,7 +413,9 @@ async def test_panel_bridge_in_real_browser(tmp_path, store, seeded):
                     calls = await page.evaluate("window.__calls", **main)
                     assert calls[-1]["name"] == "dashboard_action"
                     assert calls[-1]["arguments"]["action"] == "take_control"
-                    assert calls[-1]["arguments"]["token"] == apps.action_token
+                    assert calls[-1]["arguments"]["token"] == panel_token
+                    hint = await view.locator(".row .hint").first.inner_text()
+                    assert "ProfilePilot Manager" in hint  # no "Hand back" button in the panel
                     log = await page.evaluate("window.__log", **main)
                     methods = [m.get("method") for m in log]
                     assert methods[0] == "ui/initialize" and "ui/notifications/initialized" in methods

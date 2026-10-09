@@ -1,17 +1,34 @@
-// Profiles: a live card grid with thumbnails, status and quick actions.
+// Profiles: a live card grid (or a compact list) with thumbnails, status and quick actions.
 
 import { api, enc } from "./api.js";
-import { avatar, clear, copyText, fmt, h, hue, icon, replace } from "./dom.js";
+import { avatar, fmt, h, hue, icon, replace } from "./dom.js";
 import { BROWSER_LABELS, cloneDialog, confirmDelete, newProfileDialog } from "./profile-dialogs.js";
 import { openProfileDrawer } from "./profile-drawer.js";
-import { actions, aiActivity, displayStatus, loadClients, loadProfiles, profileList, state, upsertProfile } from "./store.js";
+import {
+  actions, aiActivity, displayStatus, loadClients, loadProfiles, profileList, profilesByPriority, proxyLabel, state, upsertProfile,
+} from "./store.js";
 import { attachThumb } from "./thumbs.js";
-import { busy, chipInput, confirmDialog, countryBadge, emptyState, field, openDialog, openMenu, segmented, select, skeletonCards, statusDot, toast } from "./ui.js";
+import {
+  busy, chipInput, confirmDialog, countryBadge, emptyState, field, openDialog, openMenu, segmented, select, skeletonCards, statusDot, toast,
+} from "./ui.js";
+
+const DENSITY_KEY = "pp-profiles-density";
+
+function savedDensity() {
+  try { return localStorage.getItem(DENSITY_KEY) === "list" ? "list" : "cards"; } catch (err) { return "cards"; }
+}
+
+/** Does the profile have a problem worth a look (crash, deleted or failing proxy)? */
+function hasProblem(p) {
+  return p.state === "crashed" || !!(p.proxy && (p.proxy.missing || p.proxy.ok === false));
+}
 
 export function createProfilesView() {
   const filters = { q: "", tag: "", status: "all" };
   const cards = new Map();
   const selection = { on: false, ids: new Set() };
+  let activeId = null; // the card that holds the grid's single tab stop
+  let density = savedDensity();
   const sel = {
     active: () => selection.on,
     has: (id) => selection.ids.has(id),
@@ -24,11 +41,19 @@ export function createProfilesView() {
   const tagSelect = h("select.select.sm", { attrs: { "aria-label": "Filter by tag" }, style: { width: "auto", minWidth: "120px" } });
   tagSelect.addEventListener("change", () => { filters.tag = tagSelect.value; render(); });
   const statusSeg = segmented([
-    { value: "all", label: "All" }, { value: "running", label: "Running" }, { value: "attention", label: "Needs you" }, { value: "stopped", label: "Stopped" },
+    { value: "all", label: "All" }, { value: "running", label: "Running" }, { value: "attention", label: "Needs you", title: "The AI asked you for help" },
+    { value: "problems", label: "Problems", title: "Crashed, or the proxy is failing or gone" }, { value: "stopped", label: "Stopped" },
   ], "all", (v) => { filters.status = v; render(); }, { label: "Filter by status" });
+  const densitySeg = segmented([
+    { value: "cards", label: "Cards", title: "Cards with live previews" }, { value: "list", label: "List", title: "One compact row per profile" },
+  ], density, (v) => {
+    density = v;
+    try { localStorage.setItem(DENSITY_KEY, v); } catch (err) { /* storage blocked */ }
+    render();
+  }, { label: "Layout" });
 
-  const newBtn = h("button.btn.primary", { onclick: () => newProfileDialog({ onCreated: (p) => openProfileDrawer(p.id) }), attrs: { title: "New profile (N)" } }, icon("plus"), "New profile");
-  const stopAll = h("button.btn.ghost.hidden", { attrs: { title: "Close every running profile's browser" }, onclick: async () => {
+  const newBtn = h("button.btn.primary", { onclick: () => newProfileDialog({ onCreated: (p) => openProfileDrawer(p.id) }), attrs: { type: "button", title: "New profile (N)" } }, icon("plus"), "New profile");
+  const stopAll = h("button.btn.ghost.hidden", { attrs: { type: "button", title: "Close every running profile's browser" }, onclick: async () => {
     const running = profileList().filter((p) => p.state === "running").length;
     const yes = await confirmDialog({ title: `Stop ${fmt.plural(running, "running profile")}?`, message: "Their browsers close; tabs and logins are kept for the next start.", confirmLabel: "Stop all" });
     if (!yes) return;
@@ -42,23 +67,28 @@ export function createProfilesView() {
   const header = h("header.view-header",
     h("div.view-title", h("h1", "Profiles"), subtitle),
     h("div.view-actions", stopAll, newBtn));
-  const selectBtn = h("button.btn.sm", { attrs: { "aria-pressed": "false", title: "Select several profiles for bulk actions" },
+  const selectBtn = h("button.btn.sm", { attrs: { type: "button", "aria-pressed": "false", title: "Select several profiles for bulk actions" },
     onclick: () => setSelecting(!selection.on) }, icon("check"), "Select");
   const toolbar = h("div.toolbar",
     h("div.search", icon("search"), searchInput, h("kbd", "/")),
-    tagSelect, statusSeg, h("span.spacer"), selectBtn);
+    tagSelect, statusSeg, h("span.spacer"), densitySeg, selectBtn);
   const bulkCount = h("strong");
   const bulkBar = h("div.bulk-bar.hidden", { attrs: { role: "toolbar", "aria-label": "Bulk actions" } },
     bulkCount,
-    h("button.btn.sm.ghost", { onclick: () => selectAllShown() }, "Select all"),
+    h("button.btn.sm.ghost", { attrs: { type: "button" }, onclick: () => selectAllShown() }, "Select all"),
     h("span.bulk-sep"),
-    h("button.btn.sm", { onclick: (e) => busy(e.currentTarget, () => bulkRun("start")) }, icon("play"), "Start"),
-    h("button.btn.sm", { onclick: (e) => busy(e.currentTarget, () => bulkRun("stop")) }, icon("stop"), "Stop"),
-    h("button.btn.sm", { onclick: () => bulkProxyDialog() }, icon("proxies"), "Proxies…"),
-    h("button.btn.sm", { onclick: () => bulkTagDialog() }, icon("filter"), "Tags…"),
-    h("button.btn.sm.danger", { onclick: () => bulkDelete() }, icon("trash"), "Delete…"),
-    h("button.btn.sm.ghost.icon-only", { attrs: { "aria-label": "Done selecting", title: "Done (Esc)" }, onclick: () => setSelecting(false) }, icon("x")));
-  const grid = h("div.grid-cards", { attrs: { role: "list", "aria-label": "Profiles" } });
+    h("button.btn.sm", { attrs: { type: "button" }, onclick: (e) => busy(e.currentTarget, () => bulkRun("start")) }, icon("play"), "Start"),
+    h("button.btn.sm", { attrs: { type: "button" }, onclick: (e) => busy(e.currentTarget, () => bulkRun("stop")) }, icon("stop"), "Stop"),
+    h("button.btn.sm", { attrs: { type: "button" }, onclick: () => bulkProxyDialog() }, icon("proxies"), "Proxies…"),
+    h("button.btn.sm", { attrs: { type: "button" }, onclick: () => bulkTagDialog() }, icon("tag"), "Tags…"),
+    h("button.btn.sm.danger", { attrs: { type: "button" }, onclick: () => bulkDelete() }, icon("trash"), "Delete…"),
+    h("button.btn.sm.ghost.icon-only", { attrs: { type: "button", "aria-label": "Done selecting", title: "Done (Esc)" }, onclick: () => setSelecting(false) }, icon("x")));
+  const grid = h("div.grid-cards", { attrs: { role: "list", "aria-label": "Profiles (arrow keys move between them)" } });
+  grid.addEventListener("keydown", onGridKey);
+  grid.addEventListener("focusin", (event) => {
+    const card = event.target.closest(".profile-card");
+    if (card && card.dataset.id !== activeId) { activeId = card.dataset.id; updateRoving(); }
+  });
   const body = h("div.view-body", skeletonCards(6));
   const el = h("section.view", { attrs: { "aria-label": "Profiles" } }, header, toolbar, body, bulkBar);
 
@@ -76,7 +106,11 @@ export function createProfilesView() {
     document.body.classList.toggle("bulk-open", selection.on && el.isConnected);
     bulkBar.classList.toggle("hidden", !selection.on);
     bulkCount.textContent = selection.ids.size ? `${selection.ids.size} selected` : "Select profiles";
-    for (const [id, card] of cards) card.el.classList.toggle("is-selected", selection.ids.has(id));
+    for (const [id, card] of cards) {
+      card.el.classList.toggle("is-selected", selection.ids.has(id));
+      if (selection.on) card.el.setAttribute("aria-selected", String(selection.ids.has(id)));
+      else card.el.removeAttribute("aria-selected");
+    }
     for (const btn of bulkBar.querySelectorAll("button:not(.ghost)")) btn.disabled = !selection.ids.size;
   }
 
@@ -87,6 +121,43 @@ export function createProfilesView() {
 
   function selected() {
     return [...selection.ids].map((id) => state.profiles.get(id)).filter(Boolean);
+  }
+
+  // ---------------------------------------------------------------- keyboard: one tab stop for the grid
+
+  function shownCards() {
+    return [...grid.children].filter((c) => c.classList.contains("profile-card"));
+  }
+
+  /** Only the active card (and its buttons) is in the tab order; arrow keys move between cards. */
+  function updateRoving() {
+    const list = shownCards();
+    if (!list.length) return;
+    if (!activeId || !list.some((c) => c.dataset.id === activeId)) activeId = list[0].dataset.id;
+    for (const card of list) {
+      const active = card.dataset.id === activeId;
+      card.tabIndex = active ? 0 : -1;
+      for (const btn of card.querySelectorAll("button, a[href]")) btn.tabIndex = active ? 0 : -1;
+    }
+  }
+
+  function onGridKey(event) {
+    const card = event.target.closest(".profile-card");
+    if (!card || event.target !== card) return;
+    const list = shownCards();
+    const i = list.indexOf(card);
+    let perRow = 1;
+    if (density === "cards" && list.length > 1) {
+      const top = list[0].offsetTop;
+      perRow = Math.max(1, list.filter((c) => c.offsetTop === top).length);
+    }
+    const moves = { ArrowRight: 1, ArrowLeft: -1, ArrowDown: perRow, ArrowUp: -perRow, Home: -i, End: list.length - 1 - i };
+    if (!(event.key in moves)) return;
+    event.preventDefault();
+    const next = list[Math.max(0, Math.min(list.length - 1, i + moves[event.key]))];
+    activeId = next.dataset.id;
+    updateRoving();
+    next.focus();
   }
 
   async function pool(items, worker, size = 3) {
@@ -130,7 +201,7 @@ export function createProfilesView() {
     const tags = [...new Set(state.proxies.flatMap((x) => x.tags))].sort();
     const poolTag = select([{ value: "", label: "Any saved proxy" }, ...tags.map((t) => ({ value: t, label: `Tagged "${t}"` }))], "", {});
     const onlyWorking = h("input", { type: "checkbox", checked: true });
-    const one = select(state.proxies.map((x) => ({ value: x.id, label: `${x.name} (${x.scheme}://${x.host}:${x.port})` })), state.proxies[0] ? state.proxies[0].id : "", {});
+    const one = select(state.proxies.map((x) => ({ value: x.id, label: `${proxyLabel(x)} (${x.scheme}://${x.host}:${x.port})` })), state.proxies[0] ? state.proxies[0].id : "", {});
     const box = h("div.stack");
     const show = (v) => {
       if (v === "each") {
@@ -144,11 +215,11 @@ export function createProfilesView() {
       }
     };
     show("each");
-    const apply = h("button.btn.primary", "Apply");
+    const apply = h("button.btn.primary", { attrs: { type: "button" } }, "Apply");
     const dlg = openDialog({
       title: `Proxies for ${fmt.plural(targets.length, "profile")}`, size: "narrow",
       body: h("div.form", mode, box),
-      footer: [h("span.spacer"), h("button.btn", { onclick: () => dlg.close() }, "Cancel"), apply],
+      footer: [h("span.spacer"), h("button.btn", { attrs: { type: "button" }, onclick: () => dlg.forceClose() }, "Cancel"), apply],
     });
     apply.addEventListener("click", () => busy(apply, async () => {
       let plan = [];
@@ -169,7 +240,7 @@ export function createProfilesView() {
         const result = await api.patch(`/api/profiles/${enc(p.id)}`, { proxy_id: proxyId });
         upsertProfile(result.profile);
       });
-      dlg.close();
+      dlg.forceClose();
       toast(errors.length ? errors.join("\n") : `Updated ${fmt.plural(plan.length, "profile")}.`, { kind: errors.length ? "error" : "success" });
     }));
   }
@@ -179,11 +250,12 @@ export function createProfilesView() {
     if (!targets.length) return;
     const add = chipInput([], { placeholder: "Tags to add" });
     const remove = chipInput([], { placeholder: "Tags to remove" });
-    const apply = h("button.btn.primary", "Apply");
+    const apply = h("button.btn.primary", { attrs: { type: "button" } }, "Apply");
     const dlg = openDialog({
       title: `Tags for ${fmt.plural(targets.length, "profile")}`, size: "narrow",
       body: h("div.form", field("Add", add), field("Remove", remove)),
-      footer: [h("span.spacer"), h("button.btn", { onclick: () => dlg.close() }, "Cancel"), apply],
+      isDirty: () => !!(add.pending || remove.pending),
+      footer: [h("span.spacer"), h("button.btn", { attrs: { type: "button" }, onclick: () => dlg.forceClose() }, "Cancel"), apply],
     });
     apply.addEventListener("click", () => busy(apply, async () => {
       const plus = add.values;
@@ -194,7 +266,7 @@ export function createProfilesView() {
         const result = await api.patch(`/api/profiles/${enc(p.id)}`, { tags });
         upsertProfile(result.profile);
       });
-      dlg.close();
+      dlg.forceClose();
       toast(errors.length ? errors.join("\n") : `Updated ${fmt.plural(targets.length, "profile")}.`, { kind: errors.length ? "error" : "success" });
     }));
   }
@@ -210,10 +282,14 @@ export function createProfilesView() {
     });
     if (!yes) return;
     const stopped = targets.filter((p) => !running.includes(p));
-    const errors = await pool(stopped, async (p) => { await api.del(`/api/profiles/${enc(p.id)}`); });
+    const trashIds = [];
+    const errors = await pool(stopped, async (p) => { trashIds.push((await api.del(`/api/profiles/${enc(p.id)}`)).trash_id); });
     await loadProfiles();
     setSelecting(false);
-    toast(errors.length ? errors.join("\n") : `Moved ${fmt.plural(stopped.length, "profile")} to the trash.`, { kind: errors.length ? "error" : "success" });
+    toast(errors.length ? errors.join("\n") : `Moved ${fmt.plural(stopped.length, "profile")} to the trash.`, {
+      kind: errors.length ? "error" : "success", timeout: 6000,
+      action: trashIds.length ? { label: "Undo", onClick: () => Promise.all(trashIds.map((t) => actions.restore(t))).catch(() => {}) } : null,
+    });
   }
 
   function matches(p) {
@@ -221,9 +297,10 @@ export function createProfilesView() {
     const st = displayStatus(p);
     if (filters.status === "running" && !["running", "starting"].includes(st.runtime)) return false;
     if (filters.status === "stopped" && !["stopped", "crashed"].includes(st.runtime)) return false;
-    if (filters.status === "attention" && !["help", "paused", "crashed"].includes(st.key)) return false;
+    if (filters.status === "attention" && st.key !== "help") return false;
+    if (filters.status === "problems" && !hasProblem(p)) return false;
     if (!filters.q) return true;
-    const hay = [p.name, p.notes, ...p.tags, p.proxy && p.proxy.name, p.identity && p.identity.name, p.id].filter(Boolean).join(" ").toLowerCase();
+    const hay = [p.name, p.notes, ...p.tags, p.proxy && p.proxy.name, p.proxy && proxyLabel(p.proxy), p.identity && p.identity.name, p.id].filter(Boolean).join(" ").toLowerCase();
     return hay.includes(filters.q);
   }
 
@@ -238,7 +315,7 @@ export function createProfilesView() {
 
   function render() {
     if (!state.ready) return;
-    const all = profileList();
+    const all = profilesByPriority();
     renderTags(all);
     const running = all.filter((p) => p.state === "running").length;
     stopAll.classList.toggle("hidden", running < 2);
@@ -249,14 +326,17 @@ export function createProfilesView() {
     if (!all.length) {
       replace(body, gettingStarted());
       toolbar.classList.add("hidden");
+      newBtn.classList.add("hidden"); // the welcome steps have their own "New profile" button
       return;
     }
+    newBtn.classList.remove("hidden");
     toolbar.classList.remove("hidden");
+    grid.classList.toggle("list", density === "list");
     const shown = all.filter(matches);
     if (!shown.length) {
       replace(body, emptyState({
         icon: "search", title: "No profiles match", text: "Try another search or clear the filters.",
-        actions: [h("button.btn", { onclick: () => { filters.q = ""; filters.tag = ""; filters.status = "all"; searchInput.value = ""; statusSeg.value = "all"; render(); } }, "Clear filters")],
+        actions: [h("button.btn", { attrs: { type: "button" }, onclick: () => { filters.q = ""; filters.tag = ""; filters.status = "all"; searchInput.value = ""; statusSeg.value = "all"; render(); } }, "Clear filters")],
       }));
       return;
     }
@@ -272,7 +352,11 @@ export function createProfilesView() {
         card.update(p);
       }
       card.el.classList.toggle("is-selected", selection.ids.has(p.id));
-      if (grid.children[index] !== card.el) grid.insertBefore(card.el, grid.children[index] || null);
+      if (grid.children[index] !== card.el) {
+        const hadFocus = card.el.contains(document.activeElement);
+        grid.insertBefore(card.el, grid.children[index] || null);
+        if (hadFocus) card.el.focus();
+      }
     });
     for (const [id, card] of cards) {
       if (!seen.has(id)) {
@@ -280,6 +364,7 @@ export function createProfilesView() {
         if (!state.profiles.has(id)) { card.destroy(); cards.delete(id); }
       }
     }
+    updateRoving();
   }
 
   return {
@@ -293,7 +378,7 @@ export function createProfilesView() {
     onHide() { document.body.classList.remove("bulk-open"); },
     onEscape() { if (selection.on) { setSelecting(false); return true; } return false; },
     focusSearch() { searchInput.focus(); searchInput.select(); },
-    newItem() { newBtn.click(); },
+    newItem() { newProfileDialog({ onCreated: (p) => openProfileDrawer(p.id) }); },
   };
 }
 
@@ -324,7 +409,7 @@ function gettingStarted() {
     {
       done: false, title: "Create your first profile", icon: "profiles",
       text: "A separate, real Chrome with its own cookies, logins and history. The AI browses with it; you can take over at any time.",
-      action: h("button.btn.sm.primary", { onclick: () => newProfileDialog() }, icon("plus"), "New profile"),
+      action: h("button.btn.sm.primary", { attrs: { type: "button", title: "New profile (N)" }, onclick: () => newProfileDialog({ onCreated: (p) => openProfileDrawer(p.id) }) }, icon("plus"), "New profile"),
     },
   ];
   return h("div.onboarding",
@@ -354,7 +439,8 @@ function profileCard(p0, sel) {
   const body = h("div.pc-body");
   const actionsRow = h("div.pc-actions");
   const el = h("article.card.profile-card", {
-    attrs: { role: "listitem", tabindex: "0", "aria-label": p.name },
+    dataset: { id: p.id },
+    attrs: { role: "listitem", tabindex: "-1", "aria-label": p.name },
     onclick: (event) => {
       if (sel.active()) { event.preventDefault(); sel.toggle(p.id); return; }
       if (event.target.closest("button, a")) return;
@@ -384,12 +470,13 @@ function profileCard(p0, sel) {
     let stateLine;
     if (running) {
       stateLine = thumbState === "minimized" ? h("div.thumb-state", icon("tab"), "Window is minimized")
-        : p.window === "headless" ? h("div.thumb-state", icon("eye"), "Headless: no window")
-          : h("div.thumb-state", h("span.spinner.sm"), "Loading preview…");
+        : thumbState === "page-error" ? h("div.thumb-state.warn", icon("alert"), p.proxy ? "Page couldn't load – check the proxy" : "Page couldn't load")
+          : p.window === "headless" ? h("div.thumb-state", icon("eye"), "Headless: no window")
+            : h("div.thumb-state", h("span.spinner.sm"), "Loading preview…");
     } else if (st.runtime === "starting" || st.runtime === "stopping") {
       stateLine = h("div.thumb-state", h("span.spinner.sm"), st.runtime === "starting" ? "Starting Chrome…" : "Closing…");
     } else if (p.state === "crashed") {
-      stateLine = h("div.thumb-state", statusDot("crashed"), "Crashed");
+      stateLine = h("div.thumb-state", statusDot("crashed"), "Chrome closed unexpectedly");
     } else {
       stateLine = h("div.thumb-state", statusDot("stopped"), "Stopped");
     }
@@ -415,9 +502,14 @@ function profileCard(p0, sel) {
     const chips = [];
     if (p.proxy) {
       const pr = p.proxy;
-      const title = pr.missing ? "This proxy was deleted" : [pr.ip, pr.city, pr.checked_at ? `checked ${fmt.ago(pr.checked_at)}` : "not tested yet"].filter(Boolean).join(" · ");
-      chips.push(h("span.chip", { class: pr.missing || pr.ok === false ? "warn" : "", attrs: { title } },
-        icon("proxies"), pr.country_code ? countryBadge(pr.country_code) : null, h("span.chip-text", pr.name)));
+      if (pr.missing) {
+        chips.push(h("span.chip.warn", { attrs: { title: "This proxy was deleted: the profile connects directly" } }, icon("proxies"), h("span.chip-text", "Proxy deleted")));
+      } else if (pr.ok === false) {
+        chips.push(h("span.chip.warn", { attrs: { title: `${proxyLabel(pr)}: ${pr.reason || "the last check failed"}` } }, icon("proxies"), h("span.chip-text", "Proxy not reachable")));
+      } else {
+        const title = [`${pr.host}:${pr.port}`, pr.ip, pr.city, pr.checked_at ? `checked ${fmt.ago(pr.checked_at)}` : "not tested yet"].filter(Boolean).join(" · ");
+        chips.push(h("span.chip", { attrs: { title } }, icon("proxies"), pr.country_code ? countryBadge(pr.country_code) : null, h("span.chip-text", proxyLabel(pr))));
+      }
     } else {
       chips.push(h("span.chip", { attrs: { title: "No proxy: the browser uses this computer's own IP" } }, icon("proxies"), h("span.chip-text", "Direct")));
     }
@@ -425,7 +517,7 @@ function profileCard(p0, sel) {
     const version = p.runtime && p.runtime.browser_version ? ` ${p.runtime.browser_version.split(".")[0]}` : "";
     chips.push(h("span.chip", { attrs: { title: `${browserName}${version}` } }, icon("tab"), h("span.chip-text", p.browser === "auto" ? `Chrome${version}` : `${browserName.replace("Google ", "").replace("Microsoft ", "")}${version}`)));
     if (p.identity) chips.push(h("span.chip", { class: p.identity.missing ? "warn" : "", attrs: { title: "Identity for form autofill" } }, icon("user"), h("span.chip-text", p.identity.name)));
-    replace(body, 
+    replace(body,
       h("div.pc-title", statusDot(st.key), h("span.pc-name", { attrs: { title: p.name } }, p.name),
         h("span.pc-status", st.label)),
       h("div.pc-chips", chips),
@@ -434,6 +526,7 @@ function profileCard(p0, sel) {
     el.setAttribute("aria-label", `${p.name}, ${st.label}`);
     el.classList.toggle("is-help", st.key === "help");
     el.classList.toggle("is-paused", st.key === "paused");
+    el.classList.toggle("is-stopped", !["running", "starting", "stopping"].includes(st.runtime));
   }
 
   function renderActions() {
@@ -441,30 +534,35 @@ function profileCard(p0, sel) {
     const control = p.control || {};
     const running = st.runtime === "running";
     const pending = state.pending.get(p.id) || (st.runtime === "starting" || st.runtime === "stopping" ? st.runtime : null);
+    const help = control.help && control.help.length ? control.help[0] : null;
     const items = [];
     if (pending) {
       items.push(h("button.btn.sm", { disabled: true }, h("span.spinner"), pending === "stopping" ? "Stopping…" : "Starting…"));
+    } else if (help && p.window !== "headless") {
+      items.push(h("button.btn.sm", { attrs: { type: "button", title: running ? "Bring the window to the front" : "Start the profile in a normal window" },
+        onclick: (e) => busy(e.currentTarget, () => actions.openWindow(p.id).catch(() => {})) }, icon(running ? "focus" : "play"), running ? "Show window" : "Open window"));
     } else if (!running) {
-      items.push(h("button.btn.sm", { class: control.paused ? "" : "primary", onclick: () => actions.start(p.id).catch(() => {}) }, icon("play"), "Start"));
+      items.push(h("button.btn.sm", { class: control.paused ? "" : "primary", attrs: { type: "button" }, onclick: () => actions.start(p.id).catch(() => {}) }, icon("play"), "Start"));
     } else if (p.window !== "headless") {
-      items.push(h("button.btn.sm", { onclick: (e) => busy(e.currentTarget, () => actions.focus(p.id).catch(() => {})), attrs: { title: "Bring the window to the front" } }, icon("focus"), "Focus"));
+      items.push(h("button.btn.sm", { attrs: { type: "button", title: "Bring the window to the front" }, onclick: (e) => busy(e.currentTarget, () => actions.focus(p.id).catch(() => {})) }, icon("focus"), "Show"));
     }
-    if (control.help && control.help.length) {
-      const req = control.help[0];
-      items.push(h("button.btn.sm.primary", { onclick: (e) => busy(e.currentTarget, () => actions.resolveHelp(p.id, req.id, "done").catch(() => {})), attrs: { title: "I did it: hand the profile back to the AI" } }, icon("check"), "Done"));
+    if (help) {
+      items.push(h("button.btn.sm.primary", { attrs: { type: "button", title: "I did it: hand the profile back to the AI" }, onclick: (e) => busy(e.currentTarget, () => actions.resolveHelp(p.id, help.id, "done").catch(() => {})) }, icon("check"), "I'm done"));
     } else if (control.paused) {
-      items.push(h("button.btn.sm.primary", { onclick: (e) => busy(e.currentTarget, () => actions.handBack(p.id).catch(() => {})), attrs: { title: "Let the AI use this profile again" } }, icon("sparkles"), "Hand back"));
+      items.push(h("button.btn.sm.primary", { attrs: { type: "button", title: "Let the AI use this profile again" }, onclick: (e) => busy(e.currentTarget, () => actions.handBack(p.id).catch(() => {})) }, icon("sparkles"), "Hand back"));
     } else if (running || !pending) {
-      items.push(h("button.btn.sm", { class: running ? "" : "ghost", onclick: (e) => busy(e.currentTarget, () => actions.takeControl(p.id).catch(() => {})), attrs: { title: "Pause the AI on this profile and work in it yourself" } }, icon("hand"), "Take control"));
+      items.push(h("button.btn.sm", { class: running ? "" : "ghost", attrs: { type: "button", title: "Pause the AI on this profile and work in it yourself" }, onclick: (e) => busy(e.currentTarget, () => actions.takeControl(p.id).catch(() => {})) }, icon("hand"), "Take control"));
     }
     items.push(h("span.spacer"));
     if (running && !pending) {
-      items.push(h("button.btn.sm.ghost.icon-only", { onclick: () => actions.stop(p.id).catch(() => {}), attrs: { "aria-label": `Stop ${p.name}`, title: "Stop" } }, icon("stop")));
+      items.push(h("button.btn.sm.ghost.icon-only", { onclick: () => actions.stop(p.id).catch(() => {}), attrs: { type: "button", "aria-label": `Stop ${p.name}`, title: "Stop" } }, icon("stop")));
     }
-    const more = h("button.btn.sm.ghost.icon-only", { attrs: { "aria-label": `More actions for ${p.name}`, title: "More", "aria-haspopup": "menu" } }, icon("more"));
+    const more = h("button.btn.sm.ghost.icon-only", { attrs: { type: "button", "aria-label": `More actions for ${p.name}`, title: "More", "aria-haspopup": "menu" } }, icon("more"));
     more.addEventListener("click", (event) => { event.stopPropagation(); profileMenu(p, more); });
     items.push(more);
+    const active = el.tabIndex === 0;
     replace(actionsRow, ...items);
+    for (const btn of actionsRow.querySelectorAll("button")) btn.tabIndex = active ? 0 : -1;
   }
 
   function update(next) {
@@ -487,11 +585,9 @@ export function profileMenu(p, anchor) {
     { label: "Edit settings", icon: "edit", onClick: () => openProfileDrawer(p.id, "settings") },
     running ? { label: "Open tabs", icon: "tab", onClick: () => openProfileDrawer(p.id, "tabs") } : null,
     !running ? { label: "Start off-screen", icon: "play", onClick: () => actions.start(p.id, "offscreen").catch(() => {}) } : null,
-    running && p.runtime && p.runtime.cdp_http_url ? { label: "Copy DevTools URL", icon: "copy", onClick: () => copyText(p.runtime.cdp_http_url).then(() => toast("DevTools URL copied.", { kind: "success" })) } : null,
     { label: "Open data folder", icon: "folder", onClick: () => api.post("/api/reveal", { what: "profile", id: p.id }).catch((e) => toast(e.message, { kind: "error" })) },
     { label: "Clone…", icon: "clone", onClick: () => cloneDialog(p) },
     "-",
-    running ? { label: "Stop", icon: "stop", onClick: () => actions.stop(p.id).catch(() => {}) } : null,
     { label: "Delete…", icon: "trash", danger: true, onClick: () => confirmDelete(p).catch(() => {}) },
   ]);
 }

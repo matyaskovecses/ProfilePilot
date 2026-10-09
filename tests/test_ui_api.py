@@ -95,13 +95,15 @@ def env(tmp_path: Path):
     runtime = FakeRuntime(store)
     focused: list[Any] = []
     opened: list[Path] = []
+    terminals: list[tuple[list[str], dict[str, str]]] = []
     locations = Locations(home=tmp_path / "userhome", appdata=tmp_path / "appdata", localappdata=tmp_path / "local",
                           platform="win32", claude_cli=None)
     app = create_app(store, token=TOKEN, port=PORT, runtime=runtime, locations=locations,
                      checks=Checks(proxy=fake_check, relay=fake_check), focuser=lambda pid: focused.append(pid) or True,
-                     opener=opened.append, poll_interval=0.1)
+                     opener=opened.append, terminal=lambda argv, extra: terminals.append((argv, extra)),
+                     poll_interval=0.1)
     return {"store": store, "app": app, "runtime": runtime, "focused": focused, "opened": opened, "tmp": tmp_path,
-            "locations": locations}
+            "locations": locations, "terminals": terminals}
 
 
 def client(app: Any, *, token: bool = True, **kw: Any) -> httpx.AsyncClient:
@@ -158,10 +160,13 @@ async def test_auth_host_and_origin_checks(env) -> None:
         assert icon.status_code == 200 and icon.content[1:4] == b"PNG" and icon.headers["content-type"] == "image/png"
         assert (await anon.get("/icon-33.png")).status_code == 404
 
-        # Token exchange: a bad code gets the "expired" page; the token (or a launch code) a cookie.
+        # Token exchange: a bad code gets the "expired" page; so does the master token itself (it never
+        # travels in a URL); a launch code minted with the token header gets a cookie.
         bad = await anon.get("/?t=nope")
         assert bad.status_code == 401 and "expired" in bad.text
-        ok = await anon.get(f"/?t={TOKEN}")
+        assert (await anon.get(f"/?t={TOKEN}")).status_code == 401
+        code = (await anon.post("/api/launch-code", headers={TOKEN_HEADER: TOKEN})).json()["code"]
+        ok = await anon.get(f"/?t={code}")
         assert ok.status_code == 303 and ok.headers["location"] == "/"
         cookie = ok.headers["set-cookie"]
         assert "httponly" in cookie.lower() and "samesite=strict" in cookie.lower() and f"pp_session_{PORT}" in cookie
@@ -203,6 +208,7 @@ def test_auth_class() -> None:
     sid = auth.redeem(auth.new_code())
     assert sid and auth.check_session(sid) and not auth.check_session(sid + "x") and not auth.check_session(None)
     assert auth.check_token("x" * 40) and not auth.check_token("y" * 40) and not auth.check_token(None)
+    assert auth.redeem("x" * 40) is None  # the master token is not a launch code
     with pytest.raises(ValueError):
         Auth("short")
 
@@ -222,7 +228,8 @@ async def test_profile_crud_and_trash(env) -> None:
         assert r.status_code == 201, r.text
         p = r.json()
         assert p["name"] == "shop-us" and p["state"] == "stopped" and p["tags"] == ["shop", "us"]
-        assert p["proxy"]["name"] == "shop-us" and p["proxy"]["host"] == "proxy.example.net"
+        # A pasted proxy is named after its address (not after the profile), or as the user names it.
+        assert p["proxy"]["name"] == "proxy.example.net:1080" and p["proxy"]["host"] == "proxy.example.net"
         assert p["launch"]["start_url"] == "https://example.com/start" and p["launch"]["lang"] == "en-US"
         assert store.proxy_endpoint(p["proxy_id"]).password == PROXY_PASSWORD
 
@@ -570,9 +577,17 @@ async def test_clients_use_injected_locations(env) -> None:
         assert config["mcpServers"]["profilepilot"]["args"] == ["-m", "profilepilot", "serve"]
         assert not config["mcpServers"]["profilepilot"]["command"].lower().endswith("pythonw.exe")
         assert {x["client"]: x for x in r.json()["clients"]}["claude-desktop"]["registered"] is True
+        assert r.json()["ok"] is True and r.json()["summary"].startswith("Added to Claude Desktop.")
+        # Without the claude CLI nothing is registered: never a success, but the command to run.
         r = await c.post("/api/clients/claude-code/register")
-        assert r.status_code == 200 and "claude mcp add" in r.json()["report"]
+        body = r.json()
+        assert r.status_code == 200 and body["ok"] is False and body["manual"] is True
+        assert "claude mcp add" in body["command"] and "profilepilot" in body["command"] and "report" not in body
+        assert {x["client"]: x for x in body["clients"]}["claude-code"]["registered"] is None
+        last = ActivityLog(env["store"].root).tail(1)[0]
+        assert last.summary == "Claude Code: setup command shown (CLI not found)." and not last.ok
         r = await c.post("/api/clients/cursor/register")
+        assert r.json()["summary"] == "Added to Cursor. Restart Cursor to use it." and "mcp.json" in r.json()["report"]
         assert (tmp / "userhome" / ".cursor" / "mcp.json").exists()
         r = await c.post("/api/clients/claude-desktop/unregister")
         assert {x["client"]: x for x in r.json()["clients"]}["claude-desktop"]["registered"] is False
@@ -607,6 +622,335 @@ async def test_chatgpt_status_and_overview(env) -> None:
         keys = {f["key"]: f for f in meta["fields"]}
         assert keys["card_number"]["sensitive"] and keys["card_number"]["group"] == "card"
         assert keys["ssn"]["group"] == "sensitive" and keys["email"]["group"] == "personal"
+
+
+# ---------------------------------------------------------------------- UX review regressions
+
+
+def _drain(queue: asyncio.Queue) -> list[tuple[str, Any]]:
+    out = []
+    while not queue.empty():
+        item = queue.get_nowait()
+        if item is not None:
+            out.append(item)
+    return out
+
+
+@pytest.mark.parametrize(("error", "reason"), [
+    ("upstream proxy <upstream proxy> failed: ProxyTimeoutError: Proxy connection timed out: 8.0. Details: every "
+     "IP-check service failed - ipwho.is: timed out after 8s", "The proxy didn't answer within 8 s."),
+    ("upstream proxy http://jp.proxy.example.net:3128 failed: ProxyConnectionError: Couldn't connect to proxy "
+     "<upstream proxy> [Errno 11001] getaddrinfo failed. Details: ipwho.is: proxy error (502 Bad Gateway)",
+     "Can't find the server jp.proxy.example.net – check the address."),
+    ("ipwho.is: proxy error (407 Proxy Authentication Required)", "Wrong proxy username or password."),
+    ("upstream proxy jp.proxy.example.net:3128 refused the connection", "The proxy refused the connection."),
+    ("every IP-check service failed - ipwho.is: HTTP 503; ipapi.co: HTTP 429",
+     "Couldn't reach the internet through this proxy."),
+])
+def test_friendly_proxy_errors(error: str, reason: str) -> None:
+    from profilepilot.ui.api import check_view, friendly_proxy_error
+
+    assert friendly_proxy_error(error, "jp.proxy.example.net") == reason
+    view = check_view(ProxyCheck(ok=False, error=error), host="jp.proxy.example.net")
+    assert view["reason"] == reason and view["error"].startswith(error[:20])  # the raw text stays as details
+    assert check_view(ProxyCheck(ok=True, ip="203.0.113.1"))["reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_proxy_test_jobs_announce_their_rows_and_can_be_cancelled(env) -> None:
+    store: Store = env["store"]
+    for i in range(3):
+        store.add_proxy(f"203.0.113.{i + 1}:8080")
+    release = asyncio.Event()
+
+    async def slow_check(_endpoint: Any) -> ProxyCheck:
+        await release.wait()
+        return ProxyCheck(ok=False, error="upstream proxy <upstream proxy> failed: ProxyTimeoutError: Proxy connection "
+                                          "timed out: 8.0")
+
+    api = env["app"].api
+    api.checks = Checks(proxy=slow_check, relay=fake_check)
+    queue = api.hub.subscribe()
+    try:
+        async with client(env["app"]) as c:
+            r = await c.post("/api/proxies/test", json={})
+            job = r.json()
+            assert r.status_code == 202 and sorted(job["ids"]) == sorted(p.id for p in store.list_proxies())
+            started = [d for n, d in _drain(queue) if n == "proxy-test"]
+            assert started and started[0]["started"] is True and started[0]["ids"] == job["ids"]
+            again = (await c.post("/api/proxies/test", json={})).json()
+            assert again["already_running"] is True and again["ids"] == job["ids"]
+            # Cancel: the run stops and every window is told (so the "Testing" rows clear).
+            r = await c.delete("/api/proxies/test")
+            assert r.status_code == 200 and r.json()["cancelled"] is True
+            finished = [d for n, d in _drain(queue) if n == "proxy-test" and d.get("finished")]
+            assert finished and finished[-1]["cancelled"] is True
+            assert (await c.delete("/api/proxies/test")).json()["cancelled"] is False
+            assert ActivityLog(store.root).tail(1)[0].summary.startswith("Stopped the proxy test after 0 of 3 proxies")
+            # A finished run reports per proxy, with a plain-language reason and the raw details.
+            release.set()
+            r = await c.post("/api/proxies/test", json={"ids": [job["ids"][0]]})
+            assert r.json()["ids"] == [job["ids"][0]]
+            for _ in range(100):
+                if any(n == "proxy-test" and d.get("finished") for n, d in _drain(queue)):
+                    break
+                await asyncio.sleep(0.05)
+            tested = next(p for p in (await c.get("/api/proxies")).json()["proxies"] if p["id"] == job["ids"][0])
+            assert tested["last_check"]["reason"] == "The proxy didn't answer within 8 s."
+            assert "ProxyTimeoutError" in tested["last_check"]["error"]
+            assert ActivityLog(store.root).tail(1)[0].summary == "Tested 1 proxy: 0 working, 1 failed."
+    finally:
+        api.hub.unsubscribe(queue)
+        await api.aclose()
+
+
+@pytest.mark.asyncio
+async def test_sensitive_autofill_sites_must_be_https(env) -> None:
+    store: Store = env["store"]
+    ident = IdentityStore(store).create("Alex", {"first_name": "Alex"})
+    IdentityStore(store).allow_origin(ident.id, "http://legacy.example.com")  # e.g. added with an older version
+    async with client(env["app"]) as c:
+        r = await c.post(f"/api/identities/{ident.id}/origins", json={"origin": "http://shop.example.com"})
+        assert r.status_code == 400 and r.json()["code"] == "insecure_origin"
+        assert "https://" in r.json()["error"]
+        r = await c.post(f"/api/identities/{ident.id}/origins", json={"origin": "http://localhost:8000"})
+        assert r.status_code == 200
+        r = await c.post(f"/api/identities/{ident.id}/origins", json={"origin": "shop.example.com"})
+        view = r.json()
+        assert "https://shop.example.com" in view["allowed_origins"]
+        assert view["insecure_origins"] == ["http://legacy.example.com"]  # shown as "Not secure"
+        r = await c.request("DELETE", f"/api/identities/{ident.id}/origins", json={"origin": "http://legacy.example.com"})
+        assert r.status_code == 200 and r.json()["insecure_origins"] == []
+
+
+@pytest.mark.asyncio
+async def test_overview_detects_clients_in_the_background(env) -> None:
+    api = env["app"].api
+    queue = api.hub.subscribe()
+    try:
+        async with client(env["app"]) as c:
+            first = (await c.get("/api/overview")).json()
+            assert first["clients"] is None  # never blocks the first paint
+            for _ in range(100):
+                events = [d for n, d in _drain(queue) if n == "clients"]
+                if events:
+                    break
+                await asyncio.sleep(0.05)
+            assert {x["client"] for x in events[0]["clients"]} == {"claude-desktop", "claude-code", "codex", "cursor"}
+            assert (await c.get("/api/overview")).json()["clients"] is not None
+    finally:
+        api.hub.unsubscribe(queue)
+        await api.aclose()
+
+
+@pytest.mark.asyncio
+async def test_start_connection_opens_a_terminal_and_reveal_log(env) -> None:
+    store: Store = env["store"]
+    p = store.create_profile("logged")
+    (store.profile_dir(p.id) / "host.log").write_text("host log", encoding="utf-8")
+    async with client(env["app"]) as c:
+        r = await c.post("/api/chatgpt/start")
+        assert r.status_code == 200 and r.json()["started"] is True
+        argv, extra = env["terminals"][-1]
+        assert argv[1:] == ["-m", "profilepilot", "connect", "chatgpt"] and extra == {"PROFILEPILOT_HOME": str(store.root)}
+        r = await c.post("/api/reveal", json={"what": "log", "id": p.id})
+        assert r.status_code == 200 and env["opened"][-1] == store.profile_dir(p.id) / "host.log"
+
+    def no_terminal(argv: list[str], extra: dict[str, str]) -> None:
+        raise OSError("none")
+
+    env["app"].api.terminal = no_terminal
+    async with client(env["app"]) as c:
+        r = await c.post("/api/chatgpt/start")
+        assert r.status_code == 501 and "profilepilot connect chatgpt" in r.json()["error"]
+
+
+@pytest.mark.asyncio
+async def test_starting_on_an_untested_proxy_checks_it_and_error_pages_are_named(env, monkeypatch) -> None:
+    from profilepilot.ui import cdp
+
+    store: Store = env["store"]
+    rec = store.add_proxy("socks5://de.proxy.example.net:1080")
+    p = store.create_profile("fresh", proxy_id=rec.id)
+    async with client(env["app"]) as c:
+        assert (await c.post(f"/api/profiles/{p.id}/start", json={})).status_code == 200
+        for _ in range(100):
+            if store.get_proxy(rec.id).last_check is not None:
+                break
+            await asyncio.sleep(0.05)
+        assert store.get_proxy(rec.id).last_check.ok is True  # tested in the background (fake check)
+
+        async def error_page(_port: int) -> list[dict[str, Any]]:
+            return [{"id": "T1", "url": "chrome-error://chromewebdata/", "title": "de.proxy.example.net"}]
+
+        monkeypatch.setattr(cdp, "page_targets", error_page)
+        env["app"].api._thumbs.clear()
+        r = await c.get(f"/api/profiles/{p.id}/screenshot")
+        assert r.status_code == 204 and r.headers["x-thumb-state"] == "page-error"
+    await env["app"].api.aclose()
+
+
+# ---------------------------------------------------------------------- identities linked to browser-saved addresses
+
+# Chromium FieldType numbers (see profilepilot.chrome_autofill.FIELD_TYPES).
+NAME_FIRST, NAME_LAST, EMAIL, PHONE, STREET, CITY, STATE, ZIP, COUNTRY = 3, 5, 9, 14, 77, 33, 34, 35, 36
+GUID_HOME = "0a1b2c3d-0000-4000-8000-000000000001"
+GUID_WORK = "0a1b2c3d-0000-4000-8000-000000000002"
+HOME_STREET, HOME_EMAIL, HOME_PHONE = "1 Example Street", "alex.home@example.com", "+1 555 0100"
+WORK_STREET, WORK_EMAIL = "200 Office Park", "alex.work@example.com"
+
+
+def make_web_data(root: Path) -> Path:
+    """A fake Chrome "User Data" folder: profile Default ("Me", last used) with two saved addresses and a
+    credit_cards table that must never be read. Returns the User Data folder."""
+    import sqlite3
+
+    udd = root / "User Data"
+    folder = udd / "Default"
+    folder.mkdir(parents=True)
+    con = sqlite3.connect(folder / "Web Data")
+    con.execute("CREATE TABLE addresses(guid TEXT PRIMARY KEY, use_count INTEGER, use_date INTEGER, "
+                "date_modified INTEGER, language_code TEXT, label TEXT, initial_creator_id INTEGER, record_type INTEGER)")
+    con.execute("CREATE TABLE address_type_tokens(guid TEXT, type INTEGER, value TEXT, verification_status INTEGER, "
+                "observations BLOB)")
+    con.execute("CREATE TABLE credit_cards(guid TEXT, name_on_card TEXT, card_number_encrypted BLOB)")
+    con.execute("INSERT INTO credit_cards VALUES ('c1', 'Alex Sample', ?)", (CARD.encode(),))
+    rows = {
+        GUID_HOME: (9, {NAME_FIRST: "Alex", NAME_LAST: "Sample", EMAIL: HOME_EMAIL, PHONE: HOME_PHONE,
+                        STREET: HOME_STREET, CITY: "Springfield", STATE: "IL", ZIP: "62701", COUNTRY: "US"}),
+        GUID_WORK: (2, {NAME_FIRST: "Alex", NAME_LAST: "Sample", EMAIL: WORK_EMAIL, STREET: WORK_STREET,
+                        CITY: "Chicago", STATE: "IL", COUNTRY: "US"}),
+    }
+    for guid, (uses, fields) in rows.items():
+        con.execute("INSERT INTO addresses VALUES (?, ?, ?, 0, 'en', '', 0, 0)", (guid, uses, 1_700_000_000 + uses))
+        for kind, value in fields.items():
+            con.execute("INSERT INTO address_type_tokens VALUES (?, ?, ?, 0, NULL)", (guid, kind, value))
+    con.commit()
+    con.close()
+    (udd / "Local State").write_text(json.dumps({"profile": {"info_cache": {"Default": {"name": "Me"}},
+                                                             "last_used": "Default"}}), encoding="utf-8")
+    return udd
+
+
+@pytest.fixture
+def browser_data(tmp_path: Path, monkeypatch) -> Path:
+    """Point browser discovery at the fake User Data folder (never at the user's real browsers)."""
+    from profilepilot import chrome_autofill
+
+    udd = make_web_data(tmp_path / "browser")
+    monkeypatch.setattr(chrome_autofill, "_user_data_dirs", lambda: {"chrome": udd})
+    return udd
+
+
+@pytest.mark.asyncio
+async def test_autofill_sources_list_summaries_only(env, browser_data) -> None:
+    async with client(env["app"]) as c:
+        call = Recorder(c)
+        r = await call("GET", "/api/autofill/sources")
+        assert r.status_code == 200
+        (source,) = r.json()["sources"]
+        assert source["ref"] == "chrome:chrome/Default" and source["active"] is True and source["profile_name"] == "Me"
+        assert source["label"] == "Google Chrome profile 'Me' (active)" and source["error"] is None
+        assert [(a["number"], a["id"], a["summary"]) for a in source["addresses"]] == [
+            (1, GUID_HOME, "Alex Sample - Springfield, IL, US"), (2, GUID_WORK, "Alex Sample - Chicago, IL, US")]
+        # Name and city only: no street, email, phone - and never a card.
+        call.assert_never(HOME_STREET, HOME_EMAIL, HOME_PHONE, WORK_STREET, WORK_EMAIL, CARD)
+
+        # An unreadable profile is listed with its reason instead of breaking the list.
+        (browser_data / "Default" / "Web Data").write_bytes(b"this is not a database" * 64)
+        (source,) = (await c.get("/api/autofill/sources")).json()["sources"]
+        assert source["addresses"] == [] and "Could not read the saved addresses" in source["error"]
+
+
+@pytest.mark.asyncio
+async def test_identity_connect_to_browser_and_disconnect(env, browser_data) -> None:
+    store: Store = env["store"]
+    ids = IdentityStore(store)
+    ident = ids.create("Personal", {})
+    async with client(env["app"]) as c:
+        call = Recorder(c)
+        # Default: the user's active Chrome profile, its most used address; kept symbolic ("chrome").
+        r = await call("POST", f"/api/identities/{ident.id}/chrome", json={"source": "chrome"})
+        assert r.status_code == 200, r.text
+        link = r.json()["chrome"]
+        assert link["source"] == "chrome" and link["ok"] is True and link["pinned"] is False
+        assert link["label"] == "Google Chrome profile 'Me' (active)"
+        assert link["address"] == "Alex Sample - Springfield, IL, US"
+        assert {"first_name", "last_name", "email", "phone", "street", "city", "state", "postal_code",
+                "country_code"} <= set(link["fields_from_chrome"])
+        assert r.json()["values"] == {}  # the browser's values are read at fill time, never copied in
+        assert ids.get(ident.id).chrome_source == "chrome"
+        # The identity's own values win (an own e-mail: the browser's is not used).
+        r = await call("PATCH", f"/api/identities/{ident.id}", json={"values": {"email": "me@example.org"}})
+        assert "email" not in r.json()["chrome"]["fields_from_chrome"]
+        # A specific address: remembered by its id in that one browser profile.
+        r = await call("POST", f"/api/identities/{ident.id}/chrome", json={"source": "chrome", "address": GUID_WORK})
+        link = r.json()["chrome"]
+        assert link["pinned"] is True and link["source"] == "chrome:chrome/Default"
+        assert link["address"] == "Alex Sample - Chicago, IL, US"
+        assert ids.get(ident.id).chrome_address == GUID_WORK
+        r = await call("POST", f"/api/identities/{ident.id}/chrome", json={"source": "chrome:chrome/Default", "address": 1})
+        assert r.json()["chrome"]["address"] == "Alex Sample - Springfield, IL, US"
+        # The list carries the link too.
+        listed = {i["id"]: i for i in (await call("GET", "/api/identities")).json()["identities"]}
+        assert listed[ident.id]["chrome"]["ok"] is True
+        # Bad requests.
+        assert (await call("POST", f"/api/identities/{ident.id}/chrome", json={"address": 7})).status_code == 404
+        assert (await call("POST", f"/api/identities/{ident.id}/chrome", json={"source": "profile"})).status_code == 400
+        assert (await call("POST", f"/api/identities/{ident.id}/chrome", json={"source": "C:/Users"})).status_code == 400
+        assert (await call("POST", f"/api/identities/{ident.id}/chrome", json={"address": True})).status_code == 400
+        r = await call("POST", f"/api/identities/{ident.id}/chrome", json={"source": "chrome:edge"})
+        assert r.status_code == 404 and "edge" in r.json()["error"]
+        assert (await call("POST", "/api/identities/nope/chrome", json={})).status_code == 404
+        # A browser profile that went away: the identity says so instead of failing the list.
+        (browser_data / "Default" / "Web Data").unlink()
+        link = (await call("GET", f"/api/identities/{ident.id}")).json()["chrome"]
+        assert link["ok"] is False and link["error"]
+        # Disconnect.
+        r = await call("DELETE", f"/api/identities/{ident.id}/chrome")
+        assert r.status_code == 200 and r.json()["chrome"] is None
+        assert ids.get(ident.id).chrome_source is None and ids.get(ident.id).chrome_address is None
+        call.assert_never(HOME_STREET, HOME_EMAIL, HOME_PHONE, WORK_STREET, WORK_EMAIL, CARD)
+    summaries = [e.summary for e in ActivityLog(store.root).tail(10) if e.tool == "identity browser link"]
+    assert summaries[0] == ("Identity 'Personal' now takes its details from Google Chrome profile 'Me' (active) "
+                            "(the most used saved address).")
+    assert summaries[-1] == "Identity 'Personal' no longer takes details from a browser."
+
+
+@pytest.mark.asyncio
+async def test_browser_link_endpoints_keep_the_csrf_checks(env, browser_data) -> None:
+    ident = IdentityStore(env["store"]).create("Personal", {})
+    code = env["app"].auth.new_code()
+    async with client(env["app"], token=False) as anon:
+        assert (await anon.get("/api/autofill/sources")).status_code == 401
+        assert (await anon.post(f"/api/identities/{ident.id}/chrome", json={})).status_code == 401
+        sid = (await anon.get(f"/?t={code}")).headers["set-cookie"].split(";")[0].split("=", 1)[1]
+    async with client(env["app"], token=False, cookies={f"pp_session_{PORT}": sid}) as browser:
+        assert (await browser.get("/api/autofill/sources")).status_code == 200
+        assert (await browser.get("/api/autofill/sources", headers={"Sec-Fetch-Site": "cross-site"})).status_code == 403
+        url = f"/api/identities/{ident.id}/chrome"
+        assert (await browser.post(url, json={})).status_code == 403  # no Origin
+        assert (await browser.post(url, json={}, headers={"Origin": "http://evil.test"})).status_code == 403
+        assert (await browser.delete(url, headers={"Origin": "http://evil.test"})).status_code == 403
+        assert IdentityStore(env["store"]).get(ident.id).chrome_source is None
+        r = await browser.post(url, json={}, headers=ORIGIN)
+        assert r.status_code == 200 and r.json()["chrome"]["ok"] is True
+        assert (await browser.delete(url, headers=ORIGIN)).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_settings_toggle_autofill_from_browser(env) -> None:
+    store: Store = env["store"]
+    async with client(env["app"]) as c:
+        assert (await c.get("/api/settings")).json()["autofill_from_browser"] is True
+        r = await c.patch("/api/settings", json={"autofill_from_browser": False})
+        assert r.status_code == 200 and r.json()["autofill_from_browser"] is False
+        assert store.load_config().autofill_from_browser is False
+        assert (await c.patch("/api/settings", json={"autofill_from_browser": "yes"})).status_code == 400
+        assert (await c.patch("/api/settings", json={"autofill_from_browser": None})).status_code == 400
+        r = await c.patch("/api/settings", json={"autofill_from_browser": True})
+        assert store.load_config().autofill_from_browser is True
+        assert (await c.get("/api/overview")).json()["settings"]["autofill_from_browser"] is True
 
 
 # ---------------------------------------------------------------------- shortcut icon, launcher

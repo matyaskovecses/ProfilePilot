@@ -1,11 +1,13 @@
-// Proxies: table with exit-IP checks, latency history, bulk import and editing.
+// Proxies: table with IP-address checks, latency history, bulk import and editing.
 
 import { api, enc } from "./api.js";
-import { clear, debounce, fmt, h, icon, replace, sparkline } from "./dom.js";
+import { debounce, fmt, h, icon, replace, sparkline } from "./dom.js";
 import { newProfileDialog } from "./profile-dialogs.js";
 import { openProfileDrawer } from "./profile-drawer.js";
-import { loadProfiles, loadProxies, notify, state } from "./store.js";
-import { busy, chipInput, confirmDialog, countryBadge, emptyState, field, openDialog, openMenu, select, toast } from "./ui.js";
+import {
+  cancelProxyTest, isAddressName, loadProfiles, loadProxies, notify, proxyLabel, proxyPlace, secretPlace, startProxyTest, state,
+} from "./store.js";
+import { busy, changeTracker, chipInput, confirmDialog, countryBadge, emptyState, field, openDialog, openMenu, select, toast } from "./ui.js";
 
 const SCHEMES = [
   { value: "http", label: "HTTP" }, { value: "https", label: "HTTPS" },
@@ -15,55 +17,52 @@ const SCHEMES = [
 export function createProxiesView() {
   const filters = { q: "", tag: "" };
   const sort = { key: "name", dir: 1 };
-  const testing = new Set();
   const subtitle = h("p");
   const searchInput = h("input.input", { type: "search", attrs: { placeholder: "Search proxies", "aria-label": "Search proxies", autocomplete: "off" } });
   searchInput.addEventListener("input", () => { filters.q = searchInput.value.trim().toLowerCase(); render(); });
   const tagSelect = h("select.select.sm", { attrs: { "aria-label": "Filter by tag" }, style: { width: "auto", minWidth: "120px" } });
   tagSelect.addEventListener("change", () => { filters.tag = tagSelect.value; render(); });
 
-  const progress = h("div.progress", h("div"));
-  const progressText = h("span.small.muted");
-  const progressBox = h("div.row.hidden", { style: { gap: "10px", minWidth: "220px" } }, h("div.grow", progress), progressText);
-  const testAll = h("button.btn", { onclick: () => runTestAll() }, icon("zap"), "Test all");
-  const importBtn = h("button.btn.primary", { onclick: () => importDialog(), attrs: { title: "Add proxies (N)" } }, icon("plus"), "Add proxies");
-  const moreBtn = h("button.btn.icon-only", { attrs: { "aria-label": "More proxy actions", title: "More", "aria-haspopup": "menu" } }, icon("more"));
+  const progress = h("div.progress", { attrs: { role: "progressbar", "aria-label": "Proxy test progress", "aria-valuemin": "0" } }, h("div"));
+  const progressText = h("span.small");
+  const cancelBtn = h("button.btn.xs", { attrs: { type: "button" }, onclick: (e) => busy(e.currentTarget, () => cancelProxyTest().catch((err) => toast(err.message, { kind: "error" }))) }, "Cancel");
+  const progressBox = h("div.test-progress.hidden", { attrs: { role: "status" } }, h("span.spinner.sm"), progressText, h("div.grow", progress), cancelBtn);
+  const testAll = h("button.btn", { attrs: { type: "button", title: "Check the IP address and speed of every proxy" }, onclick: () => runTestAll() }, icon("zap"), "Test all");
+  const importBtn = h("button.btn.primary", { onclick: () => importDialog(), attrs: { type: "button", title: "Add proxies (N)" } }, icon("plus"), "Add proxies");
+  const moreBtn = h("button.btn.icon-only", { attrs: { type: "button", "aria-label": "More proxy actions", title: "More", "aria-haspopup": "menu" } }, icon("more"));
   moreBtn.addEventListener("click", () => openMenu(moreBtn, [
     { label: "Remove failing proxies…", icon: "trash", danger: true, onClick: () => removeFailing() },
   ]));
   const header = h("header.view-header",
     h("div.view-title", h("h1", "Proxies"), subtitle),
-    h("div.view-actions", progressBox, testAll, moreBtn, importBtn));
+    h("div.view-actions", testAll, moreBtn, importBtn));
   const toolbar = h("div.toolbar", h("div.search", icon("search"), searchInput, h("kbd", "/")), tagSelect);
   const body = h("div.view-body");
-  const el = h("section.view", { attrs: { "aria-label": "Proxies" } }, header, toolbar, body);
+  const el = h("section.view", { attrs: { "aria-label": "Proxies" } }, header, toolbar, progressBox, body);
 
   async function runTestAll() {
     if (!state.proxies.length) return;
     try {
-      const job = await api.post("/api/proxies/test", {});
-      state.proxyTest = { job: job.job, done: job.done || 0, total: job.total, finished: false };
-      state.proxies.forEach((p) => testing.add(p.id));
-      notify("proxy-test");
+      await startProxyTest();
     } catch (err) {
       toast(err.message, { kind: "error" });
     }
   }
 
   async function testOne(p, button) {
-    testing.add(p.id);
+    state.proxyTesting.add(p.id);
     render();
     await busy(button, async () => {
       try {
         const result = await api.post(`/api/proxies/${enc(p.id)}/test`);
         replaceProxy(result.proxy);
         const c = result.proxy.last_check || {};
-        toast(c.ok ? `${c.ip}${c.country ? ` · ${c.country}` : ""}${c.city ? `, ${c.city}` : ""} · ${fmt.ms(c.latency_ms)}` : (c.error || "No answer"),
-          { kind: c.ok ? "success" : "error", title: c.ok ? `${p.name} works` : `${p.name} failed` });
+        toast(c.ok ? `${c.ip}${c.country ? ` · ${c.country}` : ""}${c.city ? `, ${c.city}` : ""} · ${fmt.ms(c.latency_ms)}` : (c.reason || "No answer"),
+          { kind: c.ok ? "success" : "error", title: c.ok ? `${proxyLabel(p)} works` : `${proxyLabel(p)} failed`, details: c.ok ? null : c.error });
       } catch (err) {
         toast(err.message, { kind: "error" });
       } finally {
-        testing.delete(p.id);
+        state.proxyTesting.delete(p.id);
         render();
       }
     });
@@ -85,15 +84,18 @@ export function createProxiesView() {
     }
     progressBox.classList.remove("hidden");
     testAll.disabled = true;
-    progress.firstChild.style.width = `${t.total ? Math.round((t.done / t.total) * 100) : 100}%`;
-    progressText.textContent = `${t.done} / ${t.total}`;
+    const pct = t.total ? Math.round((t.done / t.total) * 100) : 100;
+    progress.firstChild.style.width = `${pct}%`;
+    progress.setAttribute("aria-valuemax", String(t.total || 0));
+    progress.setAttribute("aria-valuenow", String(t.done || 0));
+    progressText.textContent = `Testing proxies… ${t.done} of ${t.total} done`;
   }
 
   function matches(p) {
     if (filters.tag && !p.tags.some((t) => t.toLowerCase() === filters.tag.toLowerCase())) return false;
     if (!filters.q) return true;
     const c = p.last_check || {};
-    return [p.name, p.host, String(p.port), p.scheme, ...p.tags, c.ip, c.country, c.city, c.country_code, ...p.used_by.map((u) => u.name)]
+    return [p.name, proxyLabel(p), p.host, String(p.port), p.scheme, ...p.tags, c.ip, c.country, c.city, c.country_code, ...p.used_by.map((u) => u.name)]
       .filter(Boolean).join(" ").toLowerCase().includes(filters.q);
   }
 
@@ -104,7 +106,7 @@ export function createProxiesView() {
     const failed = all.filter((p) => p.last_check && !p.last_check.ok).length;
     subtitle.textContent = all.length
       ? [fmt.plural(all.length, "proxy", "proxies"), okCount ? `${okCount} working` : null, failed ? `${failed} failing` : null].filter(Boolean).join(" · ")
-      : "Upstream proxies give each profile its own exit IP.";
+      : "Upstream proxies give each profile its own IP address.";
     const tags = [...new Set(all.flatMap((p) => p.tags))].sort();
     replace(tagSelect, h("option", { value: "" }, "All tags"), ...tags.map((t) => h("option", { value: t }, t)));
     tagSelect.value = tags.includes(filters.tag) ? filters.tag : "";
@@ -117,7 +119,7 @@ export function createProxiesView() {
       replace(body, emptyState({
         icon: "proxies", title: "No proxies yet",
         text: "Paste one or many proxies (HTTP, HTTPS, SOCKS4 or SOCKS5, with or without a password). Each profile can use its own proxy, so every profile gets its own IP address.",
-        actions: [h("button.btn.primary", { onclick: () => importDialog() }, icon("plus"), "Add proxies")],
+        actions: [h("button.btn.primary", { attrs: { type: "button" }, onclick: () => importDialog() }, icon("plus"), "Add proxies")],
       }));
       return;
     }
@@ -128,9 +130,9 @@ export function createProxiesView() {
       return;
     }
     const rows = sortProxies(shown).map((p) => proxyRow(p));
-    replace(body, h("div.table-wrap", h("table.table",
+    replace(body, h("div.table-wrap", h("table.table.proxies-table",
       h("thead", h("tr",
-        sortable("name", "Name"), h("th", "Type"), h("th", "Address"), sortable("location", "Location"), h("th", "Exit IP"),
+        sortable("name", "Name"), h("th.col-type", "Type"), h("th", "Address"), sortable("location", "Location"), h("th", "IP address"),
         sortable("latency", "Latency", "num"), sortable("used", "Used by"), h("th.actions", h("span.sr-only", "Actions")))),
       h("tbody", rows))));
   }
@@ -150,9 +152,9 @@ export function createProxiesView() {
     const value = (p) => {
       const c = p.last_check || {};
       if (sort.key === "latency") return c.ok && c.latency_ms != null ? c.latency_ms : Number.MAX_SAFE_INTEGER;
-      if (sort.key === "location") return `${c.ok ? (c.country || "") : "~"} ${c.city || ""}`.toLowerCase();
+      if (sort.key === "location") return `${c.ok ? (c.country_code || "") : "~"} ${proxyPlace(c)}`.toLowerCase();
       if (sort.key === "used") return -p.used_by.length;
-      return p.name.toLowerCase();
+      return proxyLabel(p).toLowerCase();
     };
     return [...list].sort((a, b) => {
       const va = value(a);
@@ -173,7 +175,7 @@ export function createProxiesView() {
       title: `Remove ${fmt.plural(failing.length, "failing proxy", "failing proxies")}?`,
       message: `These proxies failed their last test.${used.length ? ` ${fmt.plural(used.length, "of them is", "of them are")} used by profiles, which will connect directly from their next start.` : ""}`,
       details: h("div.list", { style: { maxHeight: "200px", overflow: "auto" } }, failing.map((p) => h("div.list-item", h("span.scheme", p.scheme),
-        h("span.grow.ellipsis", p.name), p.used_by.length ? h("span.badge.amber", `used by ${p.used_by.length}`) : null))),
+        h("span.grow.ellipsis", proxyLabel(p)), p.used_by.length ? h("span.badge.amber", `used by ${p.used_by.length}`) : null))),
       confirmLabel: "Remove", danger: true,
     });
     if (!yes) return;
@@ -188,35 +190,45 @@ export function createProxiesView() {
     await Promise.all([loadProxies(), loadProfiles()]);
   }
 
+  function statusCell(p) {
+    const c = p.last_check;
+    if (state.proxyTesting.has(p.id)) return h("div.cell-main", h("span.badge.violet", h("span.spinner.sm"), "Testing"));
+    if (!c) return h("div.cell-main", h("span.badge", "Not tested"));
+    if (c.ok) return h("div.cell-main", h("span.mono", c.ip), h("span.cell-sub", fmt.ago(c.checked_at)));
+    return h("div.cell-main",
+      h("span.badge.red", icon("alert"), "Failed"),
+      h("span.cell-sub.reason", c.reason || "No answer"),
+      c.error ? h("details.raw-details", h("summary", "Details"), h("code.raw", c.error)) : null,
+      h("span.cell-sub", fmt.ago(c.checked_at)));
+  }
+
   function proxyRow(p) {
     const c = p.last_check;
-    let status;
-    if (testing.has(p.id)) status = h("span.badge.violet", h("span.spinner.sm"), "Testing");
-    else if (!c) status = h("span.badge", "Not tested");
-    else if (c.ok) status = h("span.badge.green", icon("check"), "Working");
-    else status = h("span.badge.red", { attrs: { title: c.error || "" } }, icon("alert"), "Failed");
+    const testing = state.proxyTesting.has(p.id);
     const latencyClass = !c || c.latency_ms == null ? "" : c.latency_ms < 400 ? "good" : c.latency_ms < 1200 ? "ok" : "slow";
-    const testBtn = h("button.btn.xs.ghost.icon-only", { attrs: { "aria-label": `Test ${p.name}`, title: "Test exit IP" } }, icon("zap"));
+    const testBtn = h("button.btn.xs.ghost.icon-only", { attrs: { type: "button", "aria-label": `Check the IP address of ${proxyLabel(p)}`, title: "Check IP address" } }, icon("zap"));
     testBtn.addEventListener("click", () => testOne(p, testBtn));
-    const more = h("button.btn.xs.ghost.icon-only", { attrs: { "aria-label": `More actions for ${p.name}`, title: "More", "aria-haspopup": "menu" } }, icon("more"));
+    const more = h("button.btn.xs.ghost.icon-only", { attrs: { type: "button", "aria-label": `More actions for ${proxyLabel(p)}`, title: "More", "aria-haspopup": "menu" } }, icon("more"));
     more.addEventListener("click", () => openMenu(more, [
       { label: "Edit…", icon: "edit", onClick: () => editDialog(p) },
-      { label: "New profile with this proxy…", icon: "plus", onClick: () => newProfileDialog({ proxyId: p.id, name: p.name }) },
-      { label: "Test exit IP", icon: "zap", onClick: () => testOne(p, testBtn) },
+      { label: "New profile with this proxy…", icon: "plus", onClick: () => newProfileDialog({ proxyId: p.id, name: isAddressName(p) ? "" : p.name }) },
+      { label: "Check IP address", icon: "zap", onClick: () => testOne(p, testBtn) },
       "-",
       { label: "Delete…", icon: "trash", danger: true, onClick: () => deleteProxy(p) },
     ]));
-    return h("tr", { class: testing.has(p.id) ? "testing" : "" },
+    const unnamed = isAddressName(p);
+    const place = proxyPlace(c);
+    return h("tr", { class: testing ? "testing" : "" },
       h("td", h("div.cell-main",
-        h("span", { style: { fontWeight: "550" } }, p.name),
+        h("span", { class: unnamed ? "muted" : "", style: { fontWeight: unnamed ? "450" : "550" }, attrs: { title: unnamed ? "Not named yet (Edit to name it)" : p.name } }, proxyLabel(p)),
         p.tags.length ? h("div.row.wrap", { style: { gap: "4px" } }, p.tags.map((t) => h("span.tag", t))) : null)),
-      h("td", h("span.scheme", p.scheme)),
+      h("td.col-type", h("span.scheme", p.scheme)),
       h("td", h("div.cell-main",
-        h("span.mono", `${p.host}:${p.port}`),
+        h("span.mono.addr", h("span.scheme.inline-scheme", p.scheme), `${p.host}:${p.port}`),
         h("span.cell-sub", p.has_username ? `user ${p.username}${p.has_password ? " · password saved" : ""}` : "no login"))),
       h("td.loc", c && c.ok ? h("div.row", { attrs: { title: [c.city, c.region, c.country].filter(Boolean).join(", ") } }, countryBadge(c.country_code),
-        h("span.ellipsis", [c.city, c.country_code === "US" || c.country_code === "GB" ? c.country_code : c.country].filter(Boolean).join(", ") || "—")) : h("span.faint", "—")),
-      h("td", h("div.cell-main", c && c.ok ? h("span.mono", c.ip) : status, c && c.ok ? h("span.cell-sub", fmt.ago(c.checked_at)) : (c ? h("span.cell-sub", fmt.ago(c.checked_at)) : null))),
+        h("span.ellipsis", place || "—")) : h("span.faint", "—")),
+      h("td", statusCell(p)),
       h("td.num", h("div.latency", sparkline(p.history, 54, 20), h("span.ms", { class: latencyClass }, c && c.ok && c.latency_ms != null ? fmt.ms(c.latency_ms) : "—"))),
       h("td", p.used_by.length ? h("div.row.wrap", { style: { gap: "4px" } }, p.used_by.slice(0, 3).map((u) => h("button.chip", { attrs: { type: "button" }, onclick: () => openProfileDrawer(u.id) }, h("span.chip-text", u.name))),
         p.used_by.length > 3 ? h("span.tag", `+${p.used_by.length - 3}`) : null) : h("span.faint", "—")),
@@ -227,7 +239,7 @@ export function createProxiesView() {
   async function deleteProxy(p) {
     const used = p.used_by.length;
     const yes = await confirmDialog({
-      title: `Delete "${p.name}"?`,
+      title: `Delete "${proxyLabel(p)}"?`,
       message: used ? `It is used by ${p.used_by.map((u) => u.name).join(", ")}. Those profiles will connect directly (no proxy) from their next start.`
         : "The proxy and its saved password are removed.",
       confirmLabel: "Delete proxy", danger: true,
@@ -235,7 +247,7 @@ export function createProxiesView() {
     if (!yes) return;
     try {
       await api.del(`/api/proxies/${enc(p.id)}${used ? "?force=1" : ""}`);
-      toast(`Deleted "${p.name}".`, { kind: "success" });
+      toast(`Deleted "${proxyLabel(p)}".`, { kind: "success" });
       await Promise.all([loadProxies(), loadProfiles()]);
     } catch (err) {
       toast(err.message, { kind: "error" });
@@ -246,18 +258,11 @@ export function createProxiesView() {
     el,
     title: "Proxies",
     update(topics) {
-      if (topics.has("proxy-test")) {
-        const t = state.proxyTest;
-        if (t && t.finished) testing.clear();
-        render();
-        return;
-      }
-      if (topics.has("proxies") || topics.has("profiles") || topics.has("ready")) render();
+      if (topics.has("proxy-test") || topics.has("proxies") || topics.has("profiles") || topics.has("ready")) render();
     },
     onShow() { render(); },
     focusSearch() { searchInput.focus(); },
     newItem() { importDialog(); },
-    markTested(id) { testing.delete(id); },
   };
 }
 
@@ -269,8 +274,9 @@ export function importDialog() {
   });
   const scheme = select(SCHEMES, "http", {});
   const tags = chipInput([], { placeholder: "Tags for all of them, e.g. residential, de" });
-  const preview = h("div.stack");
-  const add = h("button.btn.primary", { disabled: true }, "Add proxies");
+  const testAfter = h("input", { type: "checkbox", checked: true });
+  const preview = h("div.stack", { attrs: { "aria-live": "polite" } });
+  const add = h("button.btn.primary", { disabled: true, attrs: { type: "button" } }, "Add proxies");
   const runPreview = debounce(async () => {
     const value = text.value;
     if (!value.trim()) {
@@ -284,13 +290,13 @@ export function importDialog() {
       add.disabled = result.valid === 0;
       add.textContent = result.valid ? `Add ${fmt.plural(result.valid, "proxy", "proxies")}` : "Add proxies";
       const list = h("div.list", { style: { maxHeight: "220px", overflow: "auto" } }, result.lines.slice(0, 200).map((line) => h("div.list-item",
-        line.ok ? h("span.badge.green", icon("check")) : h("span.badge.red", icon("x")),
+        line.ok ? h("span.badge.green", { attrs: { "aria-label": "Readable" } }, icon("check")) : h("span.badge.red", { attrs: { "aria-label": "Can't be read" } }, icon("x")),
         h("span.faint.small.mono", { style: { width: "42px" } }, `#${line.line}`),
         line.ok ? h("span.scheme", line.scheme) : null,
         line.ok ? h("span.grow.ellipsis.mono.small", `${line.host}:${line.port}${line.username ? `  ·  ${line.username}${line.has_password ? " / ••••" : ""}` : ""}`)
           : h("span.grow.ellipsis.small", { style: { color: "var(--red)" } }, "Can't read this line"),
         line.name ? h("span.tag", line.name) : null)));
-      replace(preview, 
+      replace(preview,
         h("div.row.small", h("strong", `${result.valid} valid`), result.invalid ? h("span.badge.red", `${result.invalid} can't be read`) : null),
         list,
         result.total > 200 ? h("div.hint.small.faint", `Showing the first 200 of ${result.total} lines.`) : null);
@@ -302,26 +308,38 @@ export function importDialog() {
   scheme.addEventListener("change", runPreview);
   runPreview();
 
+  const changes = changeTracker(() => JSON.stringify([text.value.trim(), tags.pending]));
   const dlg = openDialog({
     title: "Add proxies", size: "wide",
-    description: "Formats: scheme://user:pass@host:port, user:pass@host:port, host:port or host:port:user:pass. Passwords go to your OS keychain and are never shown again.",
+    description: `Formats: scheme://user:pass@host:port, user:pass@host:port, host:port or host:port:user:pass. Passwords go to ${secretPlace()} and are never shown again.`,
     body: h("div.form",
       field("Proxies", text),
       h("div.field-row", field("Type for lines without a scheme", scheme), field("Tags", tags)),
       h("div.field", h("span.field-label", "Preview"), preview)),
-    footer: [h("span.spacer"), h("button.btn", { onclick: () => dlg.close() }, "Cancel"), add],
+    isDirty: () => changes.dirty(),
+    footer: [h("label.checkbox", testAfter, h("span", "Test them after adding")), h("span.spacer"),
+      h("button.btn", { attrs: { type: "button" }, onclick: () => dlg.close() }, "Cancel"), add],
   });
   add.addEventListener("click", () => busy(add, async () => {
     try {
       const result = await api.post("/api/proxies", { text: text.value, scheme: scheme.value, tags: tags.values });
       text.value = "";
-      dlg.close();
+      dlg.forceClose();
       const parts = [`${result.created} new`];
       if (result.existing) parts.push(`${result.existing} already saved`);
       if (result.errors.length) parts.push(`${result.errors.length} skipped`);
-      toast(parts.join(" · "), { kind: result.errors.length ? "warn" : "success", title: "Proxies added",
-        action: result.created ? { label: "Test them", onClick: () => api.post("/api/proxies/test", { ids: result.added.map((p) => p.id) }).then((job) => { state.proxyTest = { job: job.job, done: 0, total: job.total, finished: false }; notify("proxy-test"); }) } : null });
+      const ids = result.added.map((p) => p.id);
+      const test = () => startProxyTest(ids).catch((err) => toast(err.message, { kind: "error" }));
       await loadProxies();
+      if (testAfter.checked && ids.length) {
+        test();
+        toast(`${parts.join(" · ")}. Testing them now.`, { kind: result.errors.length ? "warn" : "success", title: "Proxies added",
+          details: result.errors.length ? result.errors.join("\n") : null });
+      } else {
+        toast(parts.join(" · "), { kind: result.errors.length ? "warn" : "success", title: "Proxies added",
+          details: result.errors.length ? result.errors.join("\n") : null,
+          action: ids.length ? { label: "Test them", onClick: test } : null });
+      }
     } catch (err) {
       toast(err.message, { kind: "error", title: "Nothing was added" });
     }
@@ -329,7 +347,7 @@ export function importDialog() {
 }
 
 export function editDialog(p) {
-  const name = h("input.input", { value: p.name, attrs: { maxlength: "64" } });
+  const name = h("input.input", { value: isAddressName(p) ? "" : p.name, attrs: { maxlength: "64", placeholder: `${p.host}:${p.port}` } });
   const scheme = select(SCHEMES, p.scheme, {});
   const host = h("input.input.mono", { value: p.host, attrs: { autocomplete: "off", spellcheck: "false" } });
   const port = h("input.input.mono", { value: String(p.port), type: "number", attrs: { min: "1", max: "65535" } });
@@ -338,20 +356,24 @@ export function editDialog(p) {
   const clearPw = h("input", { type: "checkbox" });
   const tags = chipInput(p.tags);
   const notes = h("textarea.textarea", { value: p.notes || "", attrs: { rows: "2" } });
-  const save = h("button.btn.primary", "Save");
+  const save = h("button.btn.primary", { attrs: { type: "button" } }, "Save");
+  const changes = changeTracker(() => JSON.stringify([name.value.trim(), scheme.value, host.value.trim(), port.value, username.value, password.value,
+    clearPw.checked, tags.pending, notes.value]));
   const dlg = openDialog({
-    title: `Edit "${p.name}"`,
+    title: `Edit "${proxyLabel(p)}"`,
     body: h("form.form", { onsubmit: (event) => { event.preventDefault(); save.click(); } },
-      field("Name", name),
+      field("Name", name, { hint: isAddressName(p) ? "Leave empty to keep using the address as its name." : null }),
       h("div.field-row.addr", field("Type", scheme), field("Host", host), field("Port", port)),
       h("div.field-row", field("Username", username), field("Password", password)),
       p.has_password ? h("label.checkbox", clearPw, h("span", "Remove the saved password")) : null,
-      h("div.hint.small.faint", "The saved username and password are never shown. Leave the fields empty to keep them."),
+      h("div.hint.small.faint", `The saved username and password are never shown. Leave the fields empty to keep them. Passwords go to ${secretPlace()}.`),
       field("Tags", tags), field("Notes", notes)),
-    footer: [h("span.spacer"), h("button.btn", { onclick: () => dlg.close() }, "Cancel"), save],
+    isDirty: () => changes.dirty(),
+    footer: [h("span.spacer"), h("button.btn", { attrs: { type: "button" }, onclick: () => dlg.close() }, "Cancel"), save],
   });
   save.addEventListener("click", () => busy(save, async () => {
-    const payload = { name: name.value.trim(), tags: tags.values, notes: notes.value };
+    const payload = { tags: tags.values, notes: notes.value };
+    if (name.value.trim()) payload.name = name.value.trim();
     const endpointChanged = scheme.value !== p.scheme || host.value.trim() !== p.host || Number(port.value) !== p.port
       || username.value.trim() || password.value || clearPw.checked;
     if (endpointChanged) {
@@ -363,7 +385,7 @@ export function editDialog(p) {
     try {
       const result = await api.patch(`/api/proxies/${enc(p.id)}`, payload);
       password.value = "";
-      dlg.close();
+      dlg.forceClose();
       toast(result.notes && result.notes.length ? result.notes.join(" ") : "Proxy saved.", { kind: "success" });
       await loadProxies();
     } catch (err) {

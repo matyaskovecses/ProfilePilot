@@ -78,6 +78,21 @@ CLIENT_INFO: dict[str, tuple[str, str]] = {
     "codex": ("Codex", "OpenAI's Codex CLI and IDE extension (also read by the ChatGPT desktop app)."),
     "cursor": ("Cursor", "The agent in the Cursor editor."),
 }
+CLIENT_DONE: dict[str, dict[str, str]] = {
+    "register": {
+        "claude-desktop": "Added to Claude Desktop. Quit Claude Desktop completely and start it again to use it.",
+        "claude-code": "Added to Claude Code. Start a new Claude Code session to use it.",
+        "codex": "Added to Codex. Restart Codex (or the ChatGPT desktop app) to use it.",
+        "cursor": "Added to Cursor. Restart Cursor to use it.",
+    },
+    "unregister": {
+        "claude-desktop": "Removed from Claude Desktop. Restart it to apply.",
+        "claude-code": "Removed from Claude Code.",
+        "codex": "Removed from Codex. Restart it to apply.",
+        "cursor": "Removed from Cursor. Restart it to apply.",
+    },
+}
+"""Short toast texts after a successful (un)registration (the full report goes under "Details")."""
 THUMB_INTERVAL = 2.0
 """At most one capture per profile in this many seconds (later requests get the cached image)."""
 HISTORY_FILE = "proxy_history.json"
@@ -216,14 +231,77 @@ def mask_username(username: str | None) -> str | None:
     return (username[:2] if len(username) > 3 else username[:1]) + "•••"
 
 
-def check_view(check: ProxyCheck | None) -> dict[str, Any] | None:
+LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1", "[::1]")
+
+
+def origin_is_secure(origin: str) -> bool:
+    """https://, or http:// on this computer (local development servers)."""
+    parts = urlsplit(origin)
+    host = (parts.hostname or "").lower()
+    if parts.scheme == "https":
+        return True
+    return parts.scheme == "http" and (host in LOCAL_HOSTS or host.endswith(".localhost"))
+
+
+def plural(n: int, one: str, many: str | None = None) -> str:
+    """``1 proxy`` / ``3 proxies``."""
+    return f"{n} {one if n == 1 else (many or one + 's')}"
+
+
+_AUTH_FAILED = re.compile(
+    r"\b407\b|proxy authentication required|authentication (?:failed|required|error)|"
+    r"invalid (?:username|user name|password|credentials)|wrong (?:username|password)|"
+    r"username and password|auth(?:entication)? method", re.I)
+_DNS_FAILED = re.compile(
+    r"getaddrinfo|errno 1100[14]|errno -[235]\b|name or service not known|nodename nor servname|"
+    r"temporary failure in name resolution|no address associated|could not resolve|name resolution|"
+    r"no such host", re.I)
+_REFUSED = re.compile(
+    r"refused the connection|connection refused|actively refused|refused to connect|errno 111\b|10061|"
+    r"connect call failed|winerror 1225", re.I)
+_UNREACHABLE = re.compile(r"unreachable|errno 1005[01]|10065|no route to host", re.I)
+_RESET = re.compile(r"connection reset|reset by peer|10054|server disconnected|closed the connection|"
+                    r"connection was closed|unexpectedly closed", re.I)
+_TIMEOUT = re.compile(r"timed out(?: after)?:?\s*(\d+(?:\.\d+)?)|timeout", re.I)
+_TLS = re.compile(r"\bssl\b|certificate|\btls\b", re.I)
+
+
+def friendly_proxy_error(error: str | None, host: str | None = None) -> str | None:
+    """A short, plain-language reason for a failed proxy / route check (the raw text stays available
+    as "details"): "The proxy didn't answer within 8 s.", "Wrong proxy username or password." ..."""
+    if not error:
+        return None
+    text = str(error)
+    if _AUTH_FAILED.search(text):
+        return "Wrong proxy username or password."
+    if _DNS_FAILED.search(text):
+        return f"Can't find the server {host} – check the address." if host else \
+            "Can't find the proxy's server – check the address."
+    if _REFUSED.search(text):
+        return "The proxy refused the connection."
+    if _UNREACHABLE.search(text):
+        return "The proxy's network can't be reached from this computer."
+    if _RESET.search(text):
+        return "The proxy closed the connection."
+    match = _TIMEOUT.search(text)
+    if match:
+        seconds = round(float(match.group(1))) if match.group(1) else 8
+        return f"The proxy didn't answer within {seconds} s."
+    if _TLS.search(text):
+        return "The secure (TLS) connection through the proxy failed."
+    return "Couldn't reach the internet through this proxy."
+
+
+def check_view(check: ProxyCheck | None, *, host: str | None = None) -> dict[str, Any] | None:
     if check is None:
         return None
+    error = _scrub(check.error)[:300] if check.error else None
     return {
         "ok": check.ok, "ip": check.ip, "country": check.country, "country_code": check.country_code,
         "region": check.region, "city": check.city, "isp": check.isp, "timezone": check.timezone,
         "latency_ms": check.latency_ms, "provider": check.provider,
-        "error": _scrub(check.error)[:300] if check.error else None, "checked_at": _iso(check.checked_at),
+        "error": error, "reason": None if check.ok else friendly_proxy_error(error or "no answer", host),
+        "checked_at": _iso(check.checked_at),
     }
 
 
@@ -270,8 +348,14 @@ class _Thumb:
 class _TestJob:
     id: str
     total: int
+    ids: list[str] = field(default_factory=list)
     done: int = 0
+    cancelled: bool = False
     task: asyncio.Task | None = field(default=None, repr=False)
+
+    @property
+    def running(self) -> bool:
+        return self.task is not None and not self.task.done()
 
 
 def record_proxy_history(store: Store, proxy_id: str, check: ProxyCheck) -> None:
@@ -350,6 +434,7 @@ class ManagerAPI:
         checks: Checks | None = None,
         focuser: Callable[[int | None], bool] | None = None,
         opener: Callable[[Path], None] | None = None,
+        terminal: Callable[[list[str], dict[str, str]], None] | None = None,
         port: int = 0,
         poll_interval: float = 1.0,
     ) -> None:
@@ -363,6 +448,7 @@ class ManagerAPI:
         self.checks = checks or Checks()
         self.focuser = focuser or cdp.focus_native_window
         self.opener = opener or _open_path
+        self.terminal = terminal or _open_terminal
         self.port = port
         self.control = ControlStore(store)
         self.identities = IdentityStore(store)
@@ -374,6 +460,7 @@ class ManagerAPI:
         self._thumb_locks: dict[str, asyncio.Lock] = {}
         self._test_job: _TestJob | None = None
         self._clients_cache: tuple[float, list[dict[str, Any]]] | None = None
+        self._clients_refresh: asyncio.Task | None = None
         self._browsers_cache: tuple[float, list[dict[str, Any]]] | None = None
         self._bg: set[asyncio.Task] = set()
 
@@ -390,7 +477,7 @@ class ManagerAPI:
         proxies = self._proxies_by_id() if proxies is None else proxies
         identities = self._identity_names() if identities is None else identities
         state, info, crash = runtime_state(self.store, p.id)
-        control = self.control.state_by_id(p.id)
+        control = self.control.state_by_id(p.id, strict=False)
         proxy: dict[str, Any] | None = None
         if p.proxy_id:
             rec = proxies.get(p.proxy_id)
@@ -432,6 +519,7 @@ class ManagerAPI:
             "country_code": c.country_code if c else None, "city": c.city if c else None,
             "ip": c.ip if c else None, "ok": c.ok if c else None, "latency_ms": c.latency_ms if c else None,
             "checked_at": _iso(c.checked_at) if c else None,
+            "reason": friendly_proxy_error(c.error, rec.host) if c and not c.ok else None,
         }
 
     def proxy_view(self, rec: ProxyRecord, *, used_by: list[dict[str, str]] | None = None,
@@ -442,7 +530,7 @@ class ManagerAPI:
             "has_password": rec.has_password, "tags": rec.tags, "notes": rec.notes, "created_at": _iso(rec.created_at),
             "url": rec.redacted_url().replace(f"{rec.username}:***@", f"{mask_username(rec.username)}:***@")
             if rec.username else rec.redacted_url(),
-            "last_check": check_view(rec.last_check), "history": history or [], "used_by": used_by or [],
+            "last_check": check_view(rec.last_check, host=rec.host), "history": history or [], "used_by": used_by or [],
         }
 
     def proxies_view(self) -> list[dict[str, Any]]:
@@ -468,8 +556,65 @@ class ManagerAPI:
         return {
             "id": ident.id, "name": ident.name, "notes": ident.notes, "values": dict(sorted(ident.values.items())),
             "sensitive": sensitive, "card": card, "allowed_origins": list(ident.allowed_origins),
+            "insecure_origins": [o for o in ident.allowed_origins if not origin_is_secure(o)],
+            "chrome": self._chrome_link_view(ident),
             "created_at": _iso(ident.created_at), "updated_at": _iso(ident.updated_at), "used_by": used_by or [],
         }
+
+    @staticmethod
+    def _chrome_link_view(ident: Any) -> dict[str, Any] | None:
+        """The identity's live link to a browser's saved addresses, as the page may see it: the source,
+        the address's one-line summary (name and city/state/country only) and *which* fields come from
+        the browser - never the browser's values themselves (they are read at fill time)."""
+        source_ref = getattr(ident, "chrome_source", None)
+        if not source_ref:
+            return None
+        from ..chrome_autofill import source_values
+        from ..identity import merge_live
+
+        address_id = getattr(ident, "chrome_address", None)
+        view: dict[str, Any] = {"source": source_ref, "pinned": bool(address_id), "address_id": address_id,
+                                "label": None, "address": None, "fields_from_chrome": [], "ok": False, "error": None}
+        try:
+            live, source, chosen = source_values(source_ref, address=ident.chrome_address)
+        except ProfilePilotError as exc:
+            view["error"] = _scrub(str(exc))[:300]
+            return view
+        except Exception as exc:  # noqa: BLE001 - a display path: never break the identities list
+            log.debug("reading the browser link of %s failed: %s", ident.id, exc)
+            view["error"] = f"The browser's saved addresses could not be read ({type(exc).__name__})."
+            return view
+        merged = merge_live(ident.values, live)
+        view.update(ok=True, label=source.label, address=chosen.summary(),
+                    fields_from_chrome=sorted(k for k in merged if k not in ident.values))
+        return view
+
+    @staticmethod
+    def autofill_sources_view() -> list[dict[str, Any]]:
+        """Browser profiles on this computer with saved addresses, each address as its one-line summary
+        (name and city/state/country: no street, email or phone) - what the "Connect to browser" dialog
+        lists. ``id`` is Chrome's GUID of the address (an opaque handle for picking it)."""
+        from ..chrome_autofill import discover_sources, read_addresses
+
+        out: list[dict[str, Any]] = []
+        for src in discover_sources():
+            entry: dict[str, Any] = {"ref": src.ref, "label": src.label, "browser": src.browser,
+                                     "browser_label": BROWSER_LABELS.get(src.browser, src.browser),
+                                     "profile_name": src.profile_name, "active": src.active, "addresses": [],
+                                     "error": None}
+            try:
+                addresses = read_addresses(src)
+            except ProfilePilotError as exc:
+                entry["error"] = _scrub(str(exc))[:300]
+            except Exception as exc:  # noqa: BLE001 - one unreadable profile must not hide the others
+                log.debug("reading the saved addresses of %s failed: %s", src.ref, exc)
+                entry["error"] = f"The saved addresses could not be read ({type(exc).__name__})."
+            else:
+                entry["addresses"] = [{"number": n, "id": a.guid, "summary": a.summary(), "uses": a.use_count}
+                                      for n, a in enumerate(addresses[:50], 1)]
+                entry["total"] = len(addresses)
+            out.append(entry)
+        return out
 
     def identities_view(self) -> list[dict[str, Any]]:
         users: dict[str, list[dict[str, str]]] = {}
@@ -496,6 +641,7 @@ class ManagerAPI:
         return {
             "default_window": cfg.default_window, "max_running": cfg.max_running, "browser_path": cfg.browser_path,
             "escape_client_job": cfg.escape_client_job,
+            "autofill_from_browser": bool(getattr(cfg, "autofill_from_browser", True)),
             "shardx": {"enabled": cfg.shardx.enabled, "base_url": cfg.shardx.base_url,
                        "token_source": cfg.shardx.token_source,
                        "token_set": bool(self.store.secrets.get(TOKEN_KEY))},
@@ -592,7 +738,25 @@ class ManagerAPI:
                 "manager": {"pid": os.getpid(), "port": self.port},
             }
 
-        return ok(await run(collect))
+        data = await run(collect)
+        if data["clients"] is None:
+            self._refresh_clients_soon()  # the Connections count arrives with a "clients" event
+        return ok(data)
+
+    def _refresh_clients_soon(self) -> None:
+        """Detect the AI apps in the background (``claude mcp get`` can take a second) and publish them."""
+        if self._clients_refresh is not None and not self._clients_refresh.done():
+            return
+
+        async def refresh() -> None:
+            try:
+                clients = await run(self.clients_view)
+            except Exception as exc:  # pragma: no cover - detection must never break the Manager
+                log.debug("client detection failed: %s", exc)
+                return
+            self.hub.publish("clients", {"clients": clients})
+
+        self._clients_refresh = self._spawn(refresh())
 
     @endpoint
     async def meta(self, request: Request) -> Response:
@@ -666,8 +830,9 @@ class ManagerAPI:
             if scheme not in SCHEMES:
                 raise ApiError(400, "proxy_scheme must be http, https, socks4 or socks5.", "invalid")
             endpoint = parse_proxy(text.strip(), scheme)
+            label = (name_hint or "").strip() or None  # default: named after its address (host:port)
             try:
-                rec = self.store.add_proxy(endpoint, name_hint, default_scheme=scheme)
+                rec = self.store.add_proxy(endpoint, label, default_scheme=scheme)
             except ConflictError:
                 rec = self.store.add_proxy(endpoint, None, default_scheme=scheme)
             return True, rec.id
@@ -691,7 +856,7 @@ class ManagerAPI:
             launch = self._launch_patch(data)
             launch.setdefault("window", self.store.load_config().default_window)
             identity = _str(data, "identity_id", limit=64)
-            _given, proxy_id = self._proxy_from(data, name)
+            _given, proxy_id = self._proxy_from(data, _str(data, "proxy_name", limit=64))
             return self.store.create_profile(
                 name, notes=_str(data, "notes", limit=4000) or "", tags=_tags(data) or (), proxy_id=proxy_id,
                 browser=self._browser_kind(data) or "auto", launch=launch, color=_str(data, "color", limit=16),
@@ -721,7 +886,7 @@ class ManagerAPI:
             kind = self._browser_kind(data)
             if kind is not None:
                 changes["browser"] = kind
-            given, proxy_id = self._proxy_from(data, current.name)
+            given, proxy_id = self._proxy_from(data, _str(data, "proxy_name", limit=64))
             if given:
                 changes["proxy_id"] = proxy_id
             launch = self._launch_patch(data)
@@ -788,7 +953,31 @@ class ManagerAPI:
             raise
         await run(self._log, "start", f"Started '{profile.name}'" + (f" ({window} window)." if window else "."),
                   profile=profile, ms=int((time.perf_counter() - started) * 1000))
+        await self._check_untested_proxy(profile)
         return ok(await self._publish_profile(profile.id))
+
+    async def _check_untested_proxy(self, profile: Profile) -> None:
+        """A profile started on a proxy that was never tested: test it in the background, so a broken
+        proxy shows up as "Proxy not reachable" instead of a blank page with no explanation."""
+        if not profile.proxy_id:
+            return
+        try:
+            rec = await run(self.store.get_proxy, profile.proxy_id)
+        except ProfilePilotError:
+            return
+        if rec.last_check is not None:
+            return
+
+        async def test() -> None:
+            try:
+                await self._test_one(rec)
+            except Exception as exc:  # a deleted proxy etc.
+                log.debug("background test of %s failed: %s", rec.id, exc)
+                return
+            self.hub.publish("proxies", {})
+            await self._publish_profile(profile.id)
+
+        self._spawn(test())
 
     @endpoint
     async def stop_profile(self, request: Request) -> Response:
@@ -816,7 +1005,7 @@ class ManagerAPI:
         profile = await run(self._resolve, request.path_params["pid"])
         closed = await run(self.control.resume, profile.id)
         await run(self._log, "hand back", f"Handed '{profile.name}' back to the AI"
-                  + (f" (closed {len(closed)} help request(s))." if closed else "."), profile=profile)
+                  + (f" (closed {plural(len(closed), 'help request')})." if closed else "."), profile=profile)
         view = await self._publish_profile(profile.id)
         return ok({"resolved": [r.model_dump(mode="json") for r in closed], "profile": view})
 
@@ -873,7 +1062,7 @@ class ManagerAPI:
     async def stop_all(self, request: Request) -> Response:
         stopped = await run(self.runtime.stop_all)
         self._thumbs.clear()
-        await run(self._log, "stop all", f"Stopped {len(stopped)} profile(s).")
+        await run(self._log, "stop all", f"Stopped {plural(len(stopped), 'profile')}.")
         for p in await run(self.store.list_profiles):
             await self._publish_profile(p.id)
         return ok({"stopped": stopped})
@@ -883,6 +1072,10 @@ class ManagerAPI:
         profile = await run(self._resolve, request.path_params["pid"])
         state, info, _ = await run(runtime_state, self.store, profile.id)
         started = time.perf_counter()
+        host: str | None = None
+        if profile.proxy_id:
+            with contextlib.suppress(ProfilePilotError):
+                host = (await run(self.store.get_proxy, profile.proxy_id)).host
         if state == "running" and info is not None and info.relay_port:
             result = await self.checks.check_relay(info.http_proxy_url)
             route = f"live relay ({info.upstream or 'direct'})"
@@ -897,11 +1090,12 @@ class ManagerAPI:
         else:
             result = await self.checks.check_proxy(None)
             route = "direct connection"
+        view = check_view(result, host=host) or {}
         summary = (f"Exit IP {result.ip} {result.country_code or ''} via {route}" if result.ok
-                   else f"Route check failed via {route}: {result.error}")
+                   else f"Couldn't reach the internet via {route}: {view.get('reason')}")
         await run(self._log, "check route", summary, profile=profile, ok=result.ok,
                   ms=int((time.perf_counter() - started) * 1000))
-        return ok({"route": route, "check": check_view(result)})
+        return ok({"route": route, "check": view})
 
     @endpoint
     async def screenshot(self, request: Request) -> Response:
@@ -928,6 +1122,10 @@ class ManagerAPI:
             targets = await cdp.page_targets(info.cdp_port)
             if not targets:
                 return _Thumb(time.monotonic(), None, "no-page")
+            if str(targets[0].get("url") or "").startswith("chrome-error://"):
+                # Chrome's own error page (usually a proxy that does not answer): say so instead of
+                # showing a dark, unexplained thumbnail.
+                return _Thumb(time.monotonic(), None, "page-error")
             data = await cdp.capture_thumbnail(info.cdp_ws_url, targets[0]["id"])
             return _Thumb(time.monotonic(), data, None)
         except cdp.ThumbnailUnavailable as exc:
@@ -1041,7 +1239,7 @@ class ManagerAPI:
 
         result = await run(add_all)
         if result["created"]:
-            await run(self._log, "add proxies", f"Added {result['created']} proxy(ies).")
+            await run(self._log, "add proxies", f"Added {plural(result['created'], 'proxy', 'proxies')}.")
         self.hub.publish("proxies", {})
         return ok(result, 201)
 
@@ -1132,24 +1330,28 @@ class ManagerAPI:
         check = view["last_check"] or {}
         await run(self._log, "test proxy", (f"'{rec.name}': exit IP {check.get('ip')} {check.get('country_code') or ''} "
                                             f"{check.get('latency_ms')} ms") if check.get("ok")
-                  else f"'{rec.name}' failed: {check.get('error')}", ok=bool(check.get("ok")),
+                  else f"'{rec.name}' failed: {check.get('reason')}", ok=bool(check.get("ok")),
                   ms=int(check.get("latency_ms") or 0))
         self.hub.publish("proxies", {})
         return ok({"proxy": view})
 
+    def _job_view(self, job: _TestJob, **extra: Any) -> dict[str, Any]:
+        return {"job": job.id, "total": job.total, "done": job.done, "ids": list(job.ids), **extra}
+
     @endpoint
     async def test_all_proxies(self, request: Request) -> Response:
-        if self._test_job is not None and self._test_job.task is not None and not self._test_job.task.done():
-            return ok({"job": self._test_job.id, "total": self._test_job.total, "done": self._test_job.done,
-                       "already_running": True})
+        if self._test_job is not None and self._test_job.running:
+            return ok(self._job_view(self._test_job, already_running=True))
         data = await read_body(request)
         ids = data.get("ids")
         records = await run(self.store.list_proxies)
         if isinstance(ids, list) and ids:
             wanted = {str(i) for i in ids}
             records = [r for r in records if r.id in wanted]
-        job = _TestJob(id=secrets.token_hex(4), total=len(records))
+        job = _TestJob(id=secrets.token_hex(4), total=len(records), ids=[r.id for r in records])
         self._test_job = job
+        # Every open Manager window marks these rows "Testing" (also when the job came from a toast).
+        self.hub.publish("proxy-test", self._job_view(job, started=True))
 
         async def run_all() -> None:
             sem = asyncio.Semaphore(TEST_CONCURRENCY)
@@ -1166,17 +1368,40 @@ class ManagerAPI:
                 job.done += 1
                 if view and (view.get("last_check") or {}).get("ok"):
                     ok_count += 1
-                self.hub.publish("proxy-test", {"job": job.id, "proxy": view, "done": job.done, "total": job.total})
+                self.hub.publish("proxy-test", {"job": job.id, "proxy": view, "proxy_id": rec.id, "done": job.done,
+                                                "total": job.total})
 
-            await asyncio.gather(*(one(r) for r in records))
+            try:
+                await asyncio.gather(*(one(r) for r in records))
+            except asyncio.CancelledError:
+                if not job.cancelled:
+                    raise  # the Manager is shutting down
+                return  # cancel_proxy_test reports it
             self.hub.publish("proxy-test", {"job": job.id, "done": job.done, "total": job.total, "finished": True,
                                             "ok": ok_count})
             self.hub.publish("proxies", {})
-            await run(self._log, "test all proxies", f"Tested {job.total} proxy(ies): {ok_count} OK, "
-                                                     f"{job.total - ok_count} failed.", ok=ok_count == job.total)
+            await run(self._log, "test all proxies", f"Tested {plural(job.total, 'proxy', 'proxies')}: {ok_count} "
+                                                     f"working, {job.total - ok_count} failed.", ok=ok_count == job.total)
 
         job.task = self._spawn(run_all())
-        return ok({"job": job.id, "total": job.total, "done": 0}, 202)
+        return ok(self._job_view(job), 202)
+
+    @endpoint
+    async def cancel_proxy_test(self, request: Request) -> Response:
+        job = self._test_job
+        if job is None or not job.running:
+            return ok({"cancelled": False})
+        job.cancelled = True
+        assert job.task is not None
+        job.task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await asyncio.wait_for(asyncio.shield(job.task), 5)
+        self.hub.publish("proxy-test", {"job": job.id, "done": job.done, "total": job.total, "finished": True,
+                                        "cancelled": True})
+        self.hub.publish("proxies", {})
+        await run(self._log, "test all proxies", f"Stopped the proxy test after {job.done} of "
+                                                 f"{plural(job.total, 'proxy', 'proxies')}.")
+        return ok({"cancelled": True, "done": job.done, "total": job.total})
 
     # ------------------------------------------------------------------ identities
 
@@ -1274,9 +1499,51 @@ class ManagerAPI:
         if request.method == "DELETE":
             ident = await run(self.identities.disallow_origin, request.path_params["iid"], origin)
         else:
+            from ..identity import normalize_origin
+
+            if not origin_is_secure(normalize_origin(origin)):
+                raise ApiError(400, "Use an https:// address – card details are never filled on insecure pages.",
+                               "insecure_origin")
             ident = await run(self.identities.allow_origin, request.path_params["iid"], origin)
         self.hub.publish("identities", {})
         return ok(await run(self.identity_view, ident))
+
+    @endpoint
+    async def autofill_sources(self, request: Request) -> Response:
+        """Browser profiles with saved addresses (summaries only) for the "Connect to browser" dialog."""
+        return ok({"sources": await run(self.autofill_sources_view)})
+
+    @endpoint
+    async def identity_chrome(self, request: Request) -> Response:
+        """POST ``{source, address}``: take the identity's name, email, phone and address live from a
+        browser profile's saved addresses (``address``: its number in the list, its id, or empty for the
+        most used one). DELETE: unlink. Cards, passwords and IDs are never read from the browser."""
+        from ..chrome_autofill import PROFILE_SOURCE, is_source_ref
+
+        iid = request.path_params["iid"]
+        if request.method == "DELETE":
+            ident = await run(self.identities.disconnect_chrome, iid)
+            await run(self._log, "identity browser link", f"Identity '{ident.name}' no longer takes details from a browser.")
+            self.hub.publish("identities", {})
+            return ok(await run(self.identity_view, ident))
+        data = await read_body(request)
+        source = (_str(data, "source", limit=200) or "chrome").strip()
+        if not is_source_ref(source) or source.lower() == PROFILE_SOURCE:
+            raise ApiError(400, "Pick one of your browser profiles (chrome, chrome:edge or chrome:chrome/Default).",
+                           "invalid")
+        address = data.get("address")
+        if address is not None and (isinstance(address, bool) or not isinstance(address, (int, str))):
+            raise ApiError(400, "'address' must be the number of an address in the list, or its id.", "invalid")
+        if isinstance(address, str):
+            address = address.strip()[:64] or None
+        ident = await run(self.identities.connect_chrome, iid, source, address)
+        view = await run(self.identity_view, ident)
+        link = view.get("chrome") or {}
+        which = "a chosen saved address" if link.get("pinned") else "the most used saved address"
+        await run(self._log, "identity browser link",
+                  f"Identity '{ident.name}' now takes its details from {link.get('label') or source} ({which}).")
+        self.hub.publish("identities", {})
+        return ok(view)
 
     # ------------------------------------------------------------------ help
 
@@ -1377,7 +1644,7 @@ class ManagerAPI:
     @endpoint
     async def empty_trash(self, request: Request) -> Response:
         removed = await run(partial(self.store.purge_trash, 0))
-        await run(self._log, "empty trash", f"Permanently deleted {removed} profile(s) from the trash.")
+        await run(self._log, "empty trash", f"Permanently deleted {plural(removed, 'profile')} from the trash.")
         self.hub.publish("trash", {})
         return ok({"removed": removed})
 
@@ -1405,6 +1672,11 @@ class ManagerAPI:
                     cfg["max_running"] = value
                 if "escape_client_job" in data:
                     cfg["escape_client_job"] = bool(_bool(data, "escape_client_job"))
+                if "autofill_from_browser" in data:
+                    value = _bool(data, "autofill_from_browser")
+                    if value is None:
+                        raise ApiError(400, "'autofill_from_browser' must be true or false.", "invalid")
+                    cfg["autofill_from_browser"] = value
                 if "browser_path" in data:
                     value = data["browser_path"]
                     if value in (None, ""):
@@ -1460,13 +1732,15 @@ class ManagerAPI:
         what = data.get("what") or "data"
         if what == "data":
             path = self.store.root
-        elif what in ("profile", "downloads"):
+        elif what in ("profile", "downloads", "log"):
             profile = await run(self._resolve, str(data.get("id") or ""))
             path = self.store.profile_dir(profile.id)
             if what == "downloads":
                 path = await run(self.store.downloads_dir, profile.id)
+            elif what == "log" and (path / "host.log").is_file():
+                path = path / "host.log"
         else:
-            raise ApiError(400, "what must be data, profile or downloads.", "invalid")
+            raise ApiError(400, "what must be data, profile, downloads or log.", "invalid")
         await run(self.opener, path)
         return ok({"path": str(path)})
 
@@ -1512,16 +1786,46 @@ class ManagerAPI:
         client, action = request.path_params["client"], request.path_params["action"]
         if client not in install.CLIENTS:
             raise ApiError(404, f"Unknown client '{client}'.", "not_found")
-        if action == "register":
-            report = await run(partial(install.register, client, python=_registered_python(),  # type: ignore[arg-type]
-                                       locations=self.locations))
-        elif action == "unregister":
-            report = await run(partial(install.unregister, client, locations=self.locations))  # type: ignore[arg-type]
-        else:
+        if action not in ("register", "unregister"):
             raise ApiError(404, "Unknown action.", "not_found")
-        await run(self._log, f"{action} client", f"{action.capitalize()}ed {CLIENT_INFO.get(client, (client,))[0]}.")
+        label = CLIENT_INFO.get(client, (client,))[0]
+        python = _registered_python()
+        locations = self.locations if self.locations is not None else await run(install.Locations.detect)
+        if client == "claude-code" and locations.claude_cli is None:
+            # Without the claude CLI nothing can be registered from here: never report success. The
+            # user gets the exact command to run (and a "check again" button).
+            command = (install.snippets(python, platform=locations.platform)["claude-code"] if action == "register"
+                       else install.format_command(["claude", "mcp", "remove", "--scope", "user", "profilepilot"],
+                                                   locations.platform))
+            await run(self._log, f"{action} client", "Claude Code: setup command shown (CLI not found).", ok=False)
+            clients = await run(partial(self.clients_view, refresh=True))
+            return ok({"ok": False, "manual": True, "command": command, "clients": clients,
+                       "summary": "The claude command was not found on this computer. Run this in a terminal:"})
+        try:
+            if action == "register":
+                report = await run(partial(install.register, client, python=python,  # type: ignore[arg-type]
+                                           locations=locations))
+            else:
+                report = await run(partial(install.unregister, client, locations=locations))  # type: ignore[arg-type]
+        except install.InstallError as exc:
+            if client != "claude-code":
+                raise
+            text = _scrub(str(exc))
+            command = text.rsplit("\n", 1)[-1] if "\n" in text else install.snippets(python)["claude-code"]
+            await run(self._log, f"{action} client", f"Claude Code: {text.splitlines()[0]}", ok=False)
+            clients = await run(partial(self.clients_view, refresh=True))
+            return ok({"ok": False, "manual": True, "command": command, "clients": clients,
+                       "summary": text.splitlines()[0]})
+        if client == "claude-code" and "Run this yourself" in report:  # e.g. a batch-file CLI it cannot run safely
+            lines = _scrub(report).splitlines()
+            await run(self._log, f"{action} client", "Claude Code: setup command shown.", ok=False)
+            clients = await run(partial(self.clients_view, refresh=True))
+            return ok({"ok": False, "manual": True, "command": lines[-1], "summary": lines[0], "clients": clients})
+        await run(self._log, f"{action} client", f"{'Added ProfilePilot to' if action == 'register' else 'Removed ProfilePilot from'} "
+                                                 f"{label}.")
         clients = await run(partial(self.clients_view, refresh=True))
-        return ok({"report": _scrub(report), "clients": clients})
+        return ok({"ok": True, "report": _scrub(report), "summary": CLIENT_DONE[action].get(client, "Done."),
+                   "clients": clients})
 
     # ------------------------------------------------------------------ ChatGPT
 
@@ -1580,6 +1884,25 @@ class ManagerAPI:
         return ok(await run(self.chatgpt_status))
 
     @endpoint
+    async def chatgpt_start(self, request: Request) -> Response:
+        """Open a terminal window that runs ``profilepilot connect chatgpt`` for this data folder (the
+        wizard starts the secure tunnel and keeps it running while that window stays open)."""
+        status = await run(self.chatgpt_status)
+        if status.get("running"):
+            return ok({"started": False, "status": status})
+        argv = [_registered_python(), "-m", "profilepilot", "connect", "chatgpt"]
+        env = {"PROFILEPILOT_HOME": str(self.store.root)}
+        try:
+            await run(self.terminal, argv, env)
+        except Exception as exc:  # no terminal program found etc.
+            log.debug("could not open a terminal: %s", exc)
+            raise ApiError(501, "Couldn't open a terminal window here. Run this in a terminal yourself: "
+                                f"{status.get('commands', {}).get('connect') or 'profilepilot connect chatgpt'}",
+                           "no_terminal") from None
+        await run(self._log, "chatgpt", "Opened a terminal to start the ChatGPT connection.")
+        return ok({"started": True, "status": status})
+
+    @endpoint
     async def chatgpt_stop(self, request: Request) -> Response:
         data = await read_body(request)
         revoke = bool(_bool(data, "revoke"))
@@ -1621,6 +1944,7 @@ class ManagerAPI:
             r("/api/proxies", self.add_proxies, methods=["POST"]),
             r("/api/proxies/parse", self.parse_proxies, methods=["POST"]),
             r("/api/proxies/test", self.test_all_proxies, methods=["POST"]),
+            r("/api/proxies/test", self.cancel_proxy_test, methods=["DELETE"]),
             r("/api/proxies/{xid}", self.update_proxy, methods=["PATCH"]),
             r("/api/proxies/{xid}", self.delete_proxy, methods=["DELETE"]),
             r("/api/proxies/{xid}/test", self.test_proxy, methods=["POST"]),
@@ -1631,6 +1955,8 @@ class ManagerAPI:
             r("/api/identities/{iid}", self.delete_identity, methods=["DELETE"]),
             r("/api/identities/{iid}/secret/{field}", self.set_identity_secret, methods=["PUT", "DELETE"]),
             r("/api/identities/{iid}/origins", self.identity_origins, methods=["POST", "DELETE"]),
+            r("/api/identities/{iid}/chrome", self.identity_chrome, methods=["POST", "DELETE"]),
+            r("/api/autofill/sources", self.autofill_sources, methods=["GET"]),
             r("/api/help", self.list_help, methods=["GET"]),
             r("/api/help/{pid}/{rid}", self.resolve_help, methods=["POST"]),
             r("/api/activity", self.list_activity, methods=["GET"]),
@@ -1646,6 +1972,7 @@ class ManagerAPI:
             r("/api/clients", self.clients, methods=["GET"]),
             r("/api/clients/{client}/{action}", self.client_action, methods=["POST"]),
             r("/api/chatgpt", self.chatgpt, methods=["GET"]),
+            r("/api/chatgpt/start", self.chatgpt_start, methods=["POST"]),
             r("/api/chatgpt/stop", self.chatgpt_stop, methods=["POST"]),
         ]
 
@@ -1676,6 +2003,30 @@ def _open_path(path: Path) -> None:
         subprocess.Popen(["open", str(path)])
     else:
         subprocess.Popen(["xdg-open", str(path)])
+
+
+def _open_terminal(argv: list[str], env: dict[str, str]) -> None:
+    """Run ``argv`` in a new, visible terminal window that stays open (the user clicked "Start
+    connection"). Raises :class:`OSError` when no terminal program is found."""
+    full_env = {**os.environ, **env}
+    if sys.platform == "win32":
+        # A string command line: cmd.exe does not understand list2cmdline's \" escapes, and /k keeps a
+        # quoted executable path intact when the line holds exactly one quoted part.
+        subprocess.Popen(f"cmd.exe /k {subprocess.list2cmdline(argv)}", env=full_env,
+                         creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+        return
+    import shlex
+
+    command = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items()) + " " + shlex.join(argv)
+    if sys.platform == "darwin":
+        script = 'tell application "Terminal" to do script "' + command.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        subprocess.Popen(["osascript", "-e", script, "-e", 'tell application "Terminal" to activate'])
+        return
+    for term in (["x-terminal-emulator", "-e"], ["gnome-terminal", "--"], ["konsole", "-e"], ["xterm", "-e"]):
+        if shutil.which(term[0]):
+            subprocess.Popen([*term, "sh", "-c", f"{command}; exec \"${{SHELL:-sh}}\""], env=full_env)
+            return
+    raise OSError("no terminal program found")
 
 
 __all__ = ["ApiError", "Checks", "ManagerAPI", "record_proxy_history", "runtime_state"]

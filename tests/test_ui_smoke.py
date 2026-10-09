@@ -1,7 +1,7 @@
 """ProfilePilot Manager in a real browser: every view renders without console errors.
 
 The test seeds a temporary data root with obviously fake profiles, proxies, identities, help requests
-and activity, starts three of the profiles for real (off-screen windows, local test pages), serves the
+and activity, starts three of the profiles for real (headless, local test pages), serves the
 Manager and opens it in a throwaway Chrome driven by Playwright. Screenshots of every view and of the
 main dialogs, in the light and the dark theme, are saved to ``docs/img/manager/`` for the README
 (``PROFILEPILOT_UI_SHOTS=0`` skips writing them).
@@ -222,6 +222,18 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
+def launch_url(port: int, token: str) -> str:
+    """A one-time sign-in URL for the Manager on ``port`` (the master token never travels in a URL)."""
+    import httpx
+
+    from profilepilot.ui.server import TOKEN_HEADER
+
+    resp = httpx.post(f"http://127.0.0.1:{port}/api/launch-code", headers={TOKEN_HEADER: token}, timeout=10,
+                      trust_env=False)
+    resp.raise_for_status()
+    return f"http://127.0.0.1:{port}/?t={resp.json()['code']}"
+
+
 @contextlib.contextmanager
 def manager_server(store: Store, **kwargs: Any) -> Iterator[tuple[int, str]]:
     """Serve the Manager for ``store`` on a free port in a background thread. Yields (port, token)."""
@@ -289,31 +301,40 @@ def _kill_leftovers(marker: Path) -> None:
 
 
 @pytest.mark.chrome
-def test_manager_views_render_without_console_errors(tmp_path: Path) -> None:
+def test_manager_views_render_without_console_errors(tmp_path: Path, monkeypatch) -> None:
     pytest.importorskip("playwright")
     from playwright.sync_api import sync_playwright
 
+    from profilepilot import chrome_autofill
     from profilepilot.browser.runtime import RuntimeManager
 
     from .chrome_helper import launch_chrome
+    from .test_ui_api import HOME_EMAIL, WORK_STREET, make_web_data
 
     store = Store(tmp_path / "pp-home")
     ids = seed_store(store)
+    # Addresses "saved in the browser" come from a fake User Data folder: the user's real Chrome data is
+    # never read (and never ends up on a README screenshot). One identity takes its details from it.
+    browser_data = make_web_data(tmp_path / "browser")
+    monkeypatch.setattr(chrome_autofill, "_user_data_dirs", lambda: {"chrome": browser_data})
+    idents = IdentityStore(store)
+    idents.connect_chrome(idents.create("Personal").id, "chrome")
     runtime = RuntimeManager(store)
     shots = os.environ.get("PROFILEPILOT_UI_SHOTS", "1") != "0"
     if shots:
         SHOTS_DIR.mkdir(parents=True, exist_ok=True)
     try:
         with demo_pages() as pages:
-            # Three real profiles, started off-screen (never on the user's screen) without their fake proxies.
+            # Three real profiles, started headless (never on the user's screen, never taking the keyboard focus)
+            # without their fake proxies.
             for name, path in (("shop-us", "/shop"), ("mail-de", "/mail"), ("research", "/research")):
                 profile = store.get_profile(name)
                 saved_proxy = profile.proxy_id
                 store.update_profile(profile.id, proxy_id=None)
-                runtime.start(profile.id, window="offscreen", start_url=f"{pages}{path}", timeout=60)
+                runtime.start(profile.id, window="headless", start_url=f"{pages}{path}", timeout=60)
                 if saved_proxy:
                     store.update_profile(profile.id, proxy_id=saved_proxy)  # shown on the card; not used by the run
-                # Present them as normal windows on the screenshots (they are off-screen only for the test).
+                # Present them as normal windows on the screenshots (they are headless only for the test).
                 runtime_file = store.runtime_file(profile.id)
                 data = read_json(runtime_file)
                 data["window"] = "normal"
@@ -330,7 +351,7 @@ def test_manager_views_render_without_console_errors(tmp_path: Path) -> None:
             for client in ("claude-desktop", "codex"):
                 register(client, locations=locations)  # type: ignore[arg-type]
             with manager_server(store, focuser=lambda _pid: False, locations=locations) as (port, token), \
-                    launch_chrome(tmp_path / "ui-browser", "--force-device-scale-factor=1") as chrome, \
+                    launch_chrome(tmp_path / "ui-browser", "--force-device-scale-factor=1", "--headless=new") as chrome, \
                     sync_playwright() as pw:
                 browser = pw.chromium.connect_over_cdp(chrome.http_url)
                 context = browser.contexts[0]
@@ -343,10 +364,13 @@ def test_manager_views_render_without_console_errors(tmp_path: Path) -> None:
                     status=200, content_type="application/json", body=json.dumps({"ok": True, "focused": True})))
                 base = f"http://127.0.0.1:{port}"
 
-                # Unauthenticated: the API refuses, the page says "session ended".
+                # Unauthenticated: the API refuses, the page says "session ended". The master token is
+                # not a sign-in code either; a one-time launch code is.
                 page.goto(f"{base}/?t=wrong-code")
                 assert "expired" in page.content().lower()
                 page.goto(f"{base}/?t={token}")
+                assert "expired" in page.content().lower()
+                page.goto(launch_url(port, token))
                 page.wait_for_selector(".profile-card", timeout=15000)
                 errors.clear()  # the 401 page above logs its own status
 
@@ -365,6 +389,16 @@ def test_manager_views_render_without_console_errors(tmp_path: Path) -> None:
                     if path.stat().st_size > MAX_SHOT_BYTES:
                         page.screenshot(path=str(path), scale="css", clip={"x": 0, "y": 0, "width": 1320, "height": 760})
                     assert path.stat().st_size <= MAX_SHOT_BYTES, f"{path.name} is {path.stat().st_size} bytes"
+
+                def alex_card() -> Any:
+                    # (the "Personal" card mentions "Alex Sample" too: its browser address' summary)
+                    return page.locator(".identity-card").filter(has=page.get_by_role("button", name="Alex Sample", exact=True))
+
+                def discard_with_escape() -> None:
+                    """Esc on a dialog with typed text asks before throwing it away (never silently)."""
+                    page.keyboard.press("Escape")
+                    page.locator("dialog.narrow[open]").get_by_role("button", name="Discard", exact=True).click()
+                    page.wait_for_selector("dialog[open]", state="detached")
 
                 for theme in ("light", "dark"):
                     page.emulate_media(color_scheme=theme)
@@ -389,6 +423,10 @@ def test_manager_views_render_without_console_errors(tmp_path: Path) -> None:
                         if view == "identities":
                             page.wait_for_selector(".identity-card")
                             assert "4242424242424242" not in page.content() and "•••• 4242" in page.content()
+                            linked = page.locator(".identity-card .ic-link").inner_text()  # "Personal" only
+                            assert "from Google Chrome profile 'Me'" in linked and "Springfield" in linked
+                            content = page.content()  # summaries only: never the browser's e-mail, phone or street
+                            assert HOME_EMAIL not in content and WORK_STREET not in content
                         if view == "activity":
                             page.wait_for_selector(".feed-item")
                         if view == "connections":
@@ -406,8 +444,7 @@ def test_manager_views_render_without_console_errors(tmp_path: Path) -> None:
                     page.locator("dialog.dialog[open] input").first.fill("new-profile")
                     page.wait_for_timeout(300)
                     shoot(f"dialog-new-profile-{theme}")
-                    page.keyboard.press("Escape")
-                    page.wait_for_selector("dialog[open]", state="detached")
+                    discard_with_escape()
 
                     page.locator(".profile-card", has_text="shop-us").locator(".pc-name").click()
                     page.wait_for_selector("dialog.drawer[open]")
@@ -429,11 +466,10 @@ def test_manager_views_render_without_console_errors(tmp_path: Path) -> None:
                     page.wait_for_selector("dialog.dialog[open] .list-item .badge.red")
                     page.wait_for_timeout(300)
                     shoot(f"dialog-import-proxies-{theme}")
-                    page.keyboard.press("Escape")
-                    page.wait_for_selector("dialog[open]", state="detached")
+                    discard_with_escape()
 
                     page.evaluate("location.hash = '#/identities'")
-                    page.locator(".identity-card", has_text="Alex Sample").click()
+                    alex_card().locator(".ic-name").click()
                     page.wait_for_selector("dialog.drawer[open] .secret-row")
                     assert "4242424242424242" not in page.content()
                     page.wait_for_timeout(300)
@@ -451,15 +487,28 @@ def test_manager_views_render_without_console_errors(tmp_path: Path) -> None:
                 page.locator(".profile-card", has_text="research").get_by_role("button", name="Hand back").click()
                 wait_until(lambda: page.locator(".profile-card.is-paused", has_text="research").count() == 0, 10)
                 assert ControlStore(store).paused(ids["research"]) is None
-                # The help banner's Done button resolves the request.
-                page.locator(".help-banner").get_by_role("button", name="Done").click()
+                # Connect an identity to the browser's saved addresses (the fake User Data folder).
+                page.evaluate("location.hash = '#/identities'")
+                alex_card().get_by_role("button", name="Connect to browser").click()
+                page.wait_for_selector("dialog.dialog[open] .source-option")
+                page.locator("dialog.dialog[open] .source-option", has_text="Chicago").click()
+                page.locator("dialog.dialog[open]").get_by_role("button", name="Connect", exact=True).click()
+                page.wait_for_selector("dialog.dialog[open]", state="detached")
+                wait_until(lambda: "Chicago" in alex_card().inner_text(), 10)
+                alex = next(i for i in IdentityStore(store).list() if i.name == "Alex Sample")
+                assert alex.chrome_address and alex.chrome_source == "chrome:chrome/Default"
+                alex_card().get_by_role("button", name="Disconnect").click()
+                wait_until(lambda: IdentityStore(store).get(alex.id).chrome_source is None, 10)
+                page.evaluate("location.hash = '#/profiles'")
+                # The help banner's "I'm done" button resolves the request.
+                page.locator(".help-banner").get_by_role("button", name="I'm done").click()
                 page.wait_for_selector(".help-banner", state="detached", timeout=10000)
                 assert ControlStore(store).help_requests() == []
 
                 # First run: an empty data folder shows the "get started" steps.
                 with manager_server(Store(tmp_path / "empty-home"), focuser=lambda _pid: False,
                                     locations=locations) as (port2, token2):
-                    page.goto(f"http://127.0.0.1:{port2}/?t={token2}")
+                    page.goto(launch_url(port2, token2))
                     page.wait_for_selector(".onboarding .onb-step")
                     assert page.locator(".onb-step").count() == 3
                     for theme in ("light", "dark"):

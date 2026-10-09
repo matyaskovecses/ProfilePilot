@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import socket
 import sys
 import threading
@@ -33,6 +34,7 @@ from profilepilot.connect import (
     status_text,
     stop_sharing,
     tunnel_argv,
+    unlock_sharing,
 )
 from profilepilot.server.oauth import OAuthStore, pairing_code, rotate_pairing_code
 from profilepilot.store import Store
@@ -249,6 +251,7 @@ def test_cli_parser():
     args = parser.parse_args(["connect", "stop", "--revoke"])
     assert args.func is connect.cmd_connect_stop and args.revoke
     assert parser.parse_args(["connect", "status", "--json"]).func is connect.cmd_connect_status
+    assert parser.parse_args(["connect", "unlock"]).func is connect.cmd_connect_unlock
     with pytest.raises(SystemExit):
         parser.parse_args(["connect", "chatgpt", "--via", "carrier-pigeon"])
 
@@ -290,6 +293,12 @@ def test_cloudflared_session_end_to_end(store, fakes):
         fresh = rotate_pairing_code(store)
         assert wait_until(lambda: f"Pairing code for the next sign-in: {fresh}" in run.text), run.text
         assert "ChatGPT" in status_text(status_info(store))
+        assert "Never give the pairing code to anyone" in run.text
+
+        # the server reports that someone used up the wrong-code attempts: the wizard says how to get in
+        OAuthStore(store.root).mutate(lambda d: d["meta"].__setitem__("locked_until", time.time() + 600))
+        assert wait_until(lambda: "profilepilot connect unlock" in run.text), run.text
+        assert "locked until" in run.text
 
         # `profilepilot connect stop` from "another terminal"
         message = stop_sharing(store)
@@ -408,6 +417,26 @@ def test_status_stop_and_revoke(store):
     assert "Signed out 1 connected app(s)" in message
     assert OAuthStore(store.root).grants() == [] and pairing_code(store) != old
 
+    # someone used up the wrong-code attempts: status says so, `connect unlock` gives a new working code
+    OAuthStore(store.root).mutate(lambda d: d["meta"].__setitem__("locked_until", time.time() + 600))
+    locked = status_text(status_info(store))
+    assert "LOCKED" in locked and "profilepilot connect unlock" in locked
+    before = pairing_code(store)
+    message = unlock_sharing(store)
+    assert pairing_code(store) != before and pairing_code(store) in message
+    assert re.fullmatch(r"\w{4}-\w{4}-\w{4}", pairing_code(store))  # the longer unlock code
+    info = status_info(store)
+    assert info["unlock_until"] and info["locked_until"] is None
+    assert "unlocked until" in status_text(info)
+
+    # a connection approved for another (earlier) tunnel address is marked as such
+    text = status_text({"running": True, "tunnel": "cloudflared", "mcp_url": "https://new.trycloudflare.com/mcp",
+                        "pairing_code": "AAAA-BBBB", "connections": [
+                            {"client_name": "ChatGPT", "resource": "https://old.trycloudflare.com/mcp"},
+                            {"client_name": "Claude", "resource": "https://new.trycloudflare.com/mcp"}]})
+    rows = {line.strip().split(" (", 1)[0]: line for line in text.splitlines() if line.strip().startswith("- ")}
+    assert "earlier address" in rows["- ChatGPT"] and "earlier address" not in rows["- Claude"]
+
     # a state file whose processes are gone is stale and is cleaned up
     connect.state_path(store).write_text(json.dumps({"url": "https://x.trycloudflare.com", "pid": 999999,
                                                      "pid_create_time": 1.0, "server_pid": 999998}),
@@ -475,7 +504,7 @@ args = sys.argv[1:]
 port = int(args[args.index("--port") + 1])
 host = args[args.index("--public-host") + 1]
 store = Store(args[args.index("--home") + 1])
-setup = build_oauth(store, public_base_url("127.0.0.1", port, [host]))
+setup = build_oauth(store, public_base_url("127.0.0.1", port, [host]), rotate_code=True)  # like `serve`
 server = MCPServer("pp-connect-test", auth_server_provider=setup.provider, auth=setup.settings)
 
 @server.tool()

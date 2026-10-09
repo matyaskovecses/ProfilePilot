@@ -3,11 +3,11 @@
 The Manager controls logged-in browsers and secrets, so the server is strict even on loopback:
 
 * **Token auth.** A random 32-byte token is minted per server start. The launcher opens
-  ``/?t=<code>`` once, where ``<code>`` is a single-use launch code (or the token itself); the
-  server answers with an ``HttpOnly; SameSite=Strict`` session cookie and redirects to ``/``.
-  Every ``/api`` call needs that cookie or the ``X-ProfilePilot-Token`` header. Launch codes
-  expire after two minutes and work once, so the code that appears on the browser's command line
-  is useless afterwards.
+  ``/?t=<code>`` once, where ``<code>`` is a single-use launch code (minted with the token via
+  ``POST /api/launch-code``; the master token itself is never accepted in a URL); the server answers
+  with an ``HttpOnly; SameSite=Strict`` session cookie and redirects to ``/``. Every ``/api`` call
+  needs that cookie or the ``X-ProfilePilot-Token`` header. Launch codes expire after two minutes and
+  work once, so the code that appears on the browser's command line is useless afterwards.
 * **DNS rebinding.** The ``Host`` header must be ``127.0.0.1:<port>`` or ``localhost:<port>``.
 * **CSRF.** State-changing requests need a matching ``Origin`` (or the token header, which a
   browser cannot send cross-site without a CORS preflight that is never granted), and
@@ -100,7 +100,10 @@ class Auth:
         return code
 
     def redeem(self, value: str) -> str | None:
-        """A new session id for a valid launch code (single use) or the master token, else None."""
+        """A new session id for a valid launch code (single use), else None.
+
+        The master token is deliberately *not* accepted here: a URL ends up in browser history, on
+        command lines and in logs, so only short-lived single-use codes may travel in one."""
         now = time.monotonic()
         valid = False
         for code, expires in list(self._codes.items()):
@@ -108,7 +111,7 @@ class Auth:
                 del self._codes[code]
                 valid = expires > now
                 break
-        if not valid and not self.check_token(value):
+        if not valid:
             return None
         sid = secrets.token_urlsafe(32)
         self._sessions = {s: t for s, t in self._sessions.items() if t > now}
@@ -209,6 +212,7 @@ def create_app(
     checks: Checks | None = None,
     focuser: Callable[[int | None], bool] | None = None,
     opener: Callable[[Path], None] | None = None,
+    terminal: Callable[[list[str], dict[str, str]], None] | None = None,
     poll_interval: float = 1.0,
 ) -> SecurityMiddleware:
     """The Manager ASGI app for ``store`` served on ``127.0.0.1:<port>``.
@@ -217,7 +221,7 @@ def create_app(
     :class:`Auth` (the launcher mints launch codes with ``app.auth.new_code()``)."""
     auth = Auth(token)
     api = ManagerAPI(store, runtime=runtime, locations=locations, checks=checks, focuser=focuser, opener=opener,
-                     port=port, poll_interval=poll_interval)
+                     terminal=terminal, port=port, poll_interval=poll_interval)
     cookie_name = f"pp_session_{port}"
 
     async def index(request: Request) -> Response:

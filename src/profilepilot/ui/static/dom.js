@@ -161,9 +161,29 @@ export const fmt = {
     if (!iso) return "";
     return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   },
-  dateTime(iso) {
+  dateTime(iso, seconds = false) {
     if (!iso) return "";
-    return new Date(iso).toLocaleString([], { year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+    return new Date(iso).toLocaleString([], { year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+      second: seconds ? "2-digit" : undefined });
+  },
+  /** A length of time in words: "45 s", "5 min", "2 h 5 min", "3 days". */
+  span(seconds) {
+    const s = Math.max(0, Math.round(seconds || 0));
+    if (s < 60) return `${s} s`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m} min`;
+    const hrs = Math.floor(m / 60);
+    if (hrs < 48) return m % 60 ? `${hrs} h ${m % 60} min` : `${hrs} h`;
+    const days = Math.floor(hrs / 24);
+    return `${days} days`;
+  },
+  /** "5 min ago" style, short. */
+  agoShort(iso) {
+    if (!iso) return "";
+    const s = (Date.now() - new Date(iso).getTime()) / 1000;
+    if (Number.isNaN(s)) return "";
+    if (s < 45) return "just now";
+    return `${fmt.span(s)} ago`;
   },
   day(iso) {
     const d = new Date(iso);

@@ -71,6 +71,7 @@ class LaunchedChrome:
 
     def kill(self) -> None:
         kill_tree(self.proc.pid)
+        kill_using_dir(self.user_data_dir)  # a browser that relaunched itself (Edge does) has another parent
 
 
 def kill_tree(pid: int) -> None:
@@ -83,6 +84,15 @@ def kill_tree(pid: int) -> None:
         with contextlib.suppress(psutil.Error):
             p.kill()
     psutil.wait_procs(procs, timeout=10)
+
+
+def kill_using_dir(user_data_dir: Path) -> None:
+    """Kill the processes whose command line names ``user_data_dir`` (a test's own temp folder)."""
+    needle = str(user_data_dir).lower()
+    for proc in psutil.process_iter(["cmdline"]):
+        with contextlib.suppress(psutil.Error, TypeError):
+            if any(needle in str(arg).lower() for arg in proc.info["cmdline"] or ()):
+                kill_tree(proc.pid)
 
 
 @contextlib.contextmanager

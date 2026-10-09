@@ -195,6 +195,80 @@ def test_scrub_text_masks_secrets() -> None:
     assert scrub_text(None) == "" and scrub_text("\n\n") == ""
 
 
+def test_scrub_text_masks_secrets_in_urls_json_and_key_shapes() -> None:
+    # Secret-looking URL parameters: any name that contains token, secret, code, key, auth, session ...
+    assert scrub_text("Opened https://x.test/reset?reset_token=abc123&lang=en") == \
+        "Opened https://x.test/reset?reset_token=***&lang=en"
+    assert scrub_text("https://x.test/__/auth/action?mode=verifyEmail&oobCode=Zq9-k&apiKey=AIzaXYZ") == \
+        "https://x.test/__/auth/action?mode=verifyEmail&oobCode=***&apiKey=***"
+    assert "s3cr3tval" not in scrub_text("POST https://x.test/token?client_id=app&client_secret=s3cr3tval")
+    assert "pw1" not in scrub_text("https://x.test/login?password=pw1#x") and "x.test/login" in scrub_text(
+        "https://x.test/login?password=pw1#x")
+    # JSON fields with secret names, including access_token / client_secret.
+    text = scrub_text('Response {"access_token": "at-1234", "expires_in": 3600, "client_secret":"cs-99"}')
+    assert "at-1234" not in text and "cs-99" not in text and '"expires_in": 3600' in text
+    # Magic-link style path tokens shorter than 32 characters; slugs and dates stay readable.
+    assert scrub_text("Opened https://x.test/magic/Xk9fQ2pLm8RtZ1vB/confirm") == "Opened https://x.test/magic/***/confirm"
+    assert scrub_text("https://blog.test/2024-10-09-why-profiles-matter").endswith("2024-10-09-why-profiles-matter")
+    assert scrub_text("https://shop.test/products/trail-shoes-size-42").endswith("trail-shoes-size-42")
+    # Well-known key shapes, built at runtime so no real-looking key sits in the source.
+    aws = "AKIA" + "Q3EXAMPLE7KEY4AB"
+    github = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4"
+    assert scrub_text(f"env AWS_ACCESS_KEY_ID {aws} set") == "env AWS_ACCESS_KEY_ID *** set"
+    assert scrub_text(f"token {github}") == "token ***"
+
+
+def test_activity_event_blocked_flag(tmp_path: Path) -> None:
+    log = ActivityLog(tmp_path)
+    log.append(ActivityEvent(tool="browser_click", ok=False, blocked=True, summary="The user has taken control"))
+    log.append(ActivityEvent(tool="browser_click"))
+    first, second = log.tail()
+    assert first.blocked and not first.ok and not second.blocked
+    # Older log lines (written before the field existed) still parse.
+    assert ActivityEvent.model_validate_json('{"tool": "x", "ts": "2026-01-01T00:00:00Z"}').blocked is False
+
+
+def test_corrupt_control_file_fails_closed(store: Store) -> None:
+    from profilepilot.control import UNREADABLE_NOTE
+
+    profile = store.create_profile("shop-us")
+    control = ControlStore(store)
+    path = store.profile_dir(profile.id) / "control.json"
+    path.write_text('{"pause": {"paused": true, "by": "user"', encoding="utf-8")  # truncated: corrupt
+    pause = control.paused("shop-us")
+    assert pause is not None and pause.by == "user" and pause.note == UNREADABLE_NOTE
+    with pytest.raises(ProfilePausedError, match="could not read this profile's control state"):
+        control.check_not_paused("shop-us")
+    assert path.exists() and path.with_suffix(".json.bad").exists()  # kept (never silently "not paused")
+    # The Manager lists it as paused by the user; handing it back writes a clean file.
+    control.resume("shop-us")
+    assert control.paused("shop-us") is None
+    assert json.loads(path.read_text("utf-8"))["pause"] is None
+
+
+def test_locked_control_file_raises_instead_of_reporting_not_paused(store: Store, monkeypatch) -> None:
+    from profilepilot import control as control_mod
+    from profilepilot.control import ControlStateError
+
+    profile = store.create_profile("shop-us")
+    control = ControlStore(store)
+    control.pause("shop-us")
+    real = Path.read_bytes
+
+    def locked(self: Path) -> bytes:
+        if self.name == "control.json":
+            raise PermissionError(13, "The process cannot access the file")
+        return real(self)
+
+    monkeypatch.setattr(control_mod, "READ_ATTEMPTS", 2)
+    monkeypatch.setattr(Path, "read_bytes", locked)
+    with pytest.raises(ControlStateError, match="cannot be read right now"):
+        control.check_not_paused("shop-us")
+    # Display paths do not crash the Manager.
+    assert control.state_by_id(profile.id, strict=False).effective is None
+    assert control.help_requests() == []
+
+
 def test_activity_append_tail_and_filters(tmp_path: Path) -> None:
     log = ActivityLog(tmp_path)
     assert log.tail() == []
@@ -343,6 +417,195 @@ async def test_enforce_pause_hook(store: Store) -> None:
     await enforce_pause(ctx, "browser_navigate", {"profile": "unknown"})  # the tool reports it
     await enforce_pause(ctx, "browser_navigate", {"profile": "shardx:abc"})  # not ours
     await enforce_pause(None, "browser_navigate", {"profile": "shop-us"})  # no context: no check
+
+
+@pytest.mark.asyncio
+async def test_enforce_pause_guards_profile_management_and_forced_proxy_removal(store: Store) -> None:
+    from profilepilot.server.tools_control import enforce_pause, is_guarded_tool
+
+    proxy = store.add_proxy("socks5://proxy.example.net:1080", "de-1")
+    store.create_profile("bank", proxy_id=proxy.id)
+    store.create_profile("other")
+    ctx = _fake_ctx(store)
+    for tool in ("profile_clone", "profile_start", "profile_update", "profile_delete", "profile_stop",
+                 "profile_set_proxy"):
+        assert is_guarded_tool(tool)
+    ControlStore(store).pause("bank")
+    for tool in ("profile_clone", "profile_start", "profile_update", "profile_delete"):
+        with pytest.raises(ProfilePausedError):
+            await enforce_pause(ctx, tool, {"profile": "bank"})
+        await enforce_pause(ctx, tool, {"profile": "other"})  # other profiles are not affected
+    # Removing the paused profile's proxy would switch it to a direct connection under the user.
+    with pytest.raises(ProfilePausedError, match="Proxy 'de-1' is used by profile 'bank'"):
+        await enforce_pause(ctx, "proxy_remove", {"proxy": "de-1", "force": True})
+    await enforce_pause(ctx, "proxy_remove", {"proxy": "de-1", "force": False})  # refused by the tool itself
+    await enforce_pause(ctx, "proxy_remove", {"proxy": "nope", "force": True})  # the tool reports it
+    ControlStore(store).resume("bank")
+    await enforce_pause(ctx, "proxy_remove", {"proxy": "de-1", "force": True})
+    # A help request pauses the same way.
+    ControlStore(store).request_help("bank", "Solve the CAPTCHA", "captcha")
+    with pytest.raises(ProfilePausedError, match="waits for the user's help"):
+        await enforce_pause(ctx, "proxy_remove", {"proxy": "de-1", "force": True})
+
+
+@pytest.mark.asyncio
+async def test_enforce_pause_fails_closed(store: Store, monkeypatch) -> None:
+    from profilepilot import control as control_mod
+    from profilepilot.control import ControlStateError
+    from profilepilot.server.tools_control import enforce_pause
+
+    store.create_profile("shop-us")
+    ControlStore(store).pause("shop-us")
+    ctx = _fake_ctx(store)
+    real = Path.read_bytes
+
+    def locked(self: Path) -> bytes:
+        if self.name == "control.json":
+            raise PermissionError(13, "locked")
+        return real(self)
+
+    monkeypatch.setattr(control_mod, "READ_ATTEMPTS", 2)
+    monkeypatch.setattr(Path, "read_bytes", locked)
+    with pytest.raises(ControlStateError):
+        await enforce_pause(ctx, "profile_stop", {"profile": "shop-us"})
+    with pytest.raises(ControlStateError):
+        await enforce_pause(ctx, "browser_click", {"profile": "shop-us"})
+    await enforce_pause(ctx, "profile_status", {"profile": "shop-us"})  # not guarded: allowed
+
+    def broken(self: ControlStore, ref: str) -> None:
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(Path, "read_bytes", real)
+    monkeypatch.setattr(ControlStore, "check_not_paused", broken)
+    with pytest.raises(ControlStateError, match="Could not check whether the user controls profile 'shop-us'"):
+        await enforce_pause(ctx, "browser_click", {"profile": "shop-us"})
+
+
+@pytest.mark.asyncio
+async def test_real_tool_guard_logs_pause_refusals_as_blocked(store: Store) -> None:
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    from profilepilot.server.app import tool_guard
+
+    store.create_profile("shop-us")
+    ctx = _fake_ctx(store)
+    guarded = tool_guard(browser_navigate)
+    assert await guarded(ctx=ctx, profile="shop-us", url="https://example.com") == "Navigated shop-us to https://example.com"
+    ControlStore(store).pause("shop-us")
+    with pytest.raises(ToolError, match="The user has taken control of profile 'shop-us'"):
+        await guarded(ctx=ctx, profile="shop-us", url="https://example.com")
+    first, second = ActivityLog(store.root).tail()
+    assert first.ok and not first.blocked
+    assert not second.ok and second.blocked and second.tool == "browser_navigate"
+
+
+@pytest.mark.asyncio
+async def test_tool_guard_stops_a_page_tool_when_the_user_takes_control_mid_call(store: Store, monkeypatch) -> None:
+    import asyncio
+
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    from profilepilot.server import tools_control
+    from profilepilot.server.app import tool_guard
+
+    monkeypatch.setattr(tools_control, "PAUSE_POLL_S", 0.05)
+    store.create_profile("shop-us")
+    store.create_profile("other")
+    ctx = _fake_ctx(store)
+    typed: list[str] = []
+    cancelled = asyncio.Event()
+
+    async def browser_type(ctx: Context, profile: str, text: str) -> str:
+        """A stand-in for humanized typing: one character every 30 ms."""
+        try:
+            for ch in text:
+                typed.append(ch)
+                await asyncio.sleep(0.03)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return f"Typed {len(text)} characters"
+
+    guarded = tool_guard(browser_type)
+
+    async def later(seconds: float, fn: Any, *args: Any) -> None:
+        await asyncio.sleep(seconds)
+        await asyncio.to_thread(fn, *args)
+
+    started = time.perf_counter()
+    pauser = asyncio.create_task(later(0.2, ControlStore(store).pause, "shop-us"))
+    with pytest.raises(ToolError, match="browser_type was stopped before it finished. The user has taken control "
+                                       "of profile 'shop-us'"):
+        await guarded(ctx=ctx, profile="shop-us", text="x" * 200)  # about 6 s if it were not stopped
+    await pauser
+    assert cancelled.is_set() and len(typed) < 60 and time.perf_counter() - started < 3
+    count = len(typed)
+    await asyncio.sleep(0.2)
+    assert len(typed) == count  # nothing is typed after the stop
+    last = ActivityLog(store.root).tail(1)[0]
+    assert last.tool == "browser_type" and last.blocked and not last.ok
+
+    # The AI's own help request on another profile, or a pause of another profile, lets the call finish.
+    ControlStore(store).resume("shop-us")
+    other = asyncio.create_task(later(0.1, ControlStore(store).request_help, "other", "Solve the CAPTCHA", "captcha"))
+    assert await guarded(ctx=ctx, profile="shop-us", text="abcdefghij") == "Typed 10 characters"
+    await other
+    # A help request on the same profile stops it too.
+    helper = asyncio.create_task(later(0.1, ControlStore(store).request_help, "shop-us", "Enter the 2FA code", "verification"))
+    with pytest.raises(ToolError, match="browser_type was stopped before it finished. Profile 'shop-us' is waiting"):
+        await guarded(ctx=ctx, profile="shop-us", text="y" * 200)
+    await helper
+
+
+def test_python_client_respects_the_pause(store: Store) -> None:
+    """Scripts (and the Scrapling integration, which drives profiles through the client) cannot pull a
+    profile out from under the user either; the user's own scripts can opt out explicitly."""
+    from profilepilot.client import ProfilePilot
+
+    class FakeRuntime:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def status(self, profile_id: str) -> Any:
+            return SimpleNamespace(state="running", cdp_http_url="http://127.0.0.1:9", profile_name="bank",
+                                   http_proxy_url=None, proxy_url=None)
+
+        def start(self, profile_id: str, **kw: Any) -> Any:
+            self.calls.append("start")
+            return self.status(profile_id)
+
+        def stop(self, profile_id: str, **kw: Any) -> bool:
+            self.calls.append("stop")
+            return True
+
+        def set_upstream(self, profile_id: str, proxy_id: Any) -> None:
+            self.calls.append("set_upstream")
+
+    store.create_profile("bank")
+    runtime = FakeRuntime()
+    pp = ProfilePilot(store=store, runtime=runtime)
+    assert pp.cdp_url("bank", start=False) == "http://127.0.0.1:9"
+    ControlStore(store).pause("bank", note="paying a bill")
+    calls = {
+        "cdp_url": lambda: pp.cdp_url("bank", start=False), "proxy_url": lambda: pp.proxy_url("bank"),
+        "ensure_running": lambda: pp.ensure_running("bank"), "cookies": lambda: pp.cookies("bank"),
+        "set_cookies": lambda: pp.set_cookies("bank", [{"name": "a", "value": "b", "url": "https://example.com"}]),
+        "http_identity": lambda: pp.http_identity("bank"), "start": lambda: pp.start("bank"),
+        "stop": lambda: pp.stop("bank"), "set_proxy": lambda: pp.set_proxy("bank", None), "delete": lambda: pp.delete("bank"),
+    }
+    for name, call in calls.items():
+        with pytest.raises(ProfilePausedError, match="The user has taken control of profile 'bank'"):
+            call()
+    assert runtime.calls == [] and store.get_profile("bank")  # nothing was touched
+    assert pp.info("bank") is not None and [p.name for p in pp.profiles()] == ["bank"]  # reading is fine
+    # A help request pauses it the same way.
+    ControlStore(store).resume("bank")
+    ControlStore(store).request_help("bank", "Approve the payment", "payment")
+    with pytest.raises(ProfilePausedError, match="waiting for the user"):
+        pp.stop("bank")
+    # The user's own script may opt out.
+    assert ProfilePilot(store=store, runtime=runtime, ignore_pause=True).stop("bank") is True
+    assert runtime.calls == ["stop"]
 
 
 @pytest.mark.asyncio

@@ -83,3 +83,15 @@ def test_browser_close_helpers_never_raise(monkeypatch):
     monkeypatch.setattr("builtins.__import__", broken_import)
     assert control.cdp_browser_close("ws://127.0.0.1:9/devtools/browser/x", timeout=0.5) is False
     assert asyncio.run(control.async_cdp_browser_close("ws://127.0.0.1:9/devtools/browser/x", timeout=0.5)) is False
+
+
+def test_stop_all_keeps_the_profiles_keep_selects(store, monkeypatch):
+    from types import SimpleNamespace
+
+    manager = RuntimeManager(store)
+    hosts = [SimpleNamespace(profile_id="a", profile_name="A"), SimpleNamespace(profile_id="b", profile_name="B")]
+    stopped: list[str] = []
+    monkeypatch.setattr(manager, "_live_hosts", lambda: hosts)
+    monkeypatch.setattr(manager, "stop", lambda profile_id, timeout: stopped.append(profile_id) or True)
+    assert manager.stop_all(keep=lambda info: info.profile_id == "a") == ["B"] and stopped == ["b"]
+    assert manager.stop_all() == ["A", "B"]

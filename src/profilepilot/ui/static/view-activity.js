@@ -1,7 +1,7 @@
 // Activity: a live, filterable feed of what the AI (and you) did, and when.
 
 import { debounce, h, icon, replace } from "./dom.js";
-import { eventKey, isUserEvent, renderFeed } from "./feed.js";
+import { clientLabel, eventKey, isBlockedEvent, isUserEvent, renderFeed, toolLabel } from "./feed.js";
 import { openProfileDrawer } from "./profile-drawer.js";
 import { loadActivity, profileList, state } from "./store.js";
 import { emptyState, segmented } from "./ui.js";
@@ -15,7 +15,7 @@ export function createActivityView() {
   profileSelect.addEventListener("change", () => { filters.profile = profileSelect.value; render(); });
   const statusSeg = segmented([{ value: "all", label: "All" }, { value: "errors", label: "Errors" }], "all", (v) => { filters.status = v; render(); }, { label: "Status" });
   const whoSeg = segmented([{ value: "all", label: "Everyone" }, { value: "ai", label: "AI", icon: "sparkles" }, { value: "user", label: "You", icon: "user" }], "all", (v) => { filters.who = v; render(); }, { label: "Who" });
-  const search = h("input.input", { type: "search", attrs: { placeholder: "Search tools and results", "aria-label": "Search activity" } });
+  const search = h("input.input", { type: "search", attrs: { placeholder: "Search actions and results", "aria-label": "Search activity" } });
   search.addEventListener("input", debounce(() => { filters.q = search.value.trim().toLowerCase(); render(); }, 150));
   const header = h("header.view-header", h("div.view-title", h("h1", "Activity"), subtitle), h("div.view-actions", live));
   const toolbar = h("div.toolbar", h("div.search", icon("search"), search, h("kbd", "/")), profileSelect, whoSeg, statusSeg);
@@ -38,10 +38,10 @@ export function createActivityView() {
     }
     let events = state.activity;
     if (filters.profile) events = events.filter((e) => e.profile_id === filters.profile);
-    if (filters.status === "errors") events = events.filter((e) => !e.ok);
+    if (filters.status === "errors") events = events.filter((e) => !e.ok && !isBlockedEvent(e));
     if (filters.who === "ai") events = events.filter((e) => !isUserEvent(e));
     if (filters.who === "user") events = events.filter((e) => isUserEvent(e));
-    if (filters.q) events = events.filter((e) => `${e.tool} ${e.summary} ${e.profile_name || ""}`.toLowerCase().includes(filters.q));
+    if (filters.q) events = events.filter((e) => `${e.tool} ${toolLabel(e.tool)} ${clientLabel(e)} ${e.summary} ${e.profile_name || ""}`.toLowerCase().includes(filters.q));
     if (!state.activity.length) {
       replace(body, emptyState({ icon: "activity", title: "Nothing has happened yet",
         text: "When your AI uses ProfilePilot, each step appears here as it happens: which profile, which tool, and what came of it." }));

@@ -13,7 +13,9 @@ hosts, the CLI), so the hub *polls the files* once a second and turns changes in
 ``settings``       ``config.json`` changed
 ``trash``          the trash changed
 ``chatgpt``        ``chatgpt.json`` (the ChatGPT tunnel state) changed
-``proxy-test``     progress of a "test all proxies" run started from the Manager (in-process)
+``proxy-test``     progress of a proxy test run started from the Manager (in-process): ``started``
+                   with the ``ids`` being tested, one event per proxy, then ``finished``
+``clients``        the AI apps detected on this computer (in-process, after the first overview)
 =================  ===========================================================================
 
 In-process changes (Manager actions) are also published directly, so the UI does not wait for

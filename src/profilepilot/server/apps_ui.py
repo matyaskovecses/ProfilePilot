@@ -2,8 +2,8 @@
 
 Hosts that support the MCP Apps extension (``io.modelcontextprotocol/ui``; ChatGPT and Claude do)
 render the tool's result as a small interactive panel in the conversation: every profile with its
-status and proxy, Start / Stop, **Take control** / **Hand back to AI**, and the AI's open help
-requests with Done / Dismiss. The panel is one self-contained HTML document (no external URLs, no
+status and proxy, Start / Stop, **Take control**, and the AI's open help requests. The panel is one
+self-contained HTML document (no external URLs, no
 inline event handlers, no ``eval``) that talks to the host over the MCP Apps JSON-RPC
 ``postMessage`` bridge (``ui/initialize`` ... ``tools/call``); inside ChatGPT it falls back to
 ``window.openai`` when the standard bridge is unavailable.
@@ -11,10 +11,18 @@ inline event handlers, no ``eval``) that talks to the host over the MCP Apps JSO
 Clients without Apps support get the same overview as text, so the tool is useful everywhere.
 
 The panel's buttons call ``dashboard_action``, a tool visible to the app only
-(``_meta.ui.visibility = ["app"]``): taking control and handing back are the *user's* decisions, so
-the model must not be able to make them. Hosts that ignore visibility still cannot misuse it: every
-call needs the per-process action token that travels in the result's ``_meta`` (which hosts give to
-the panel, not to the model).
+(``_meta.ui.visibility = ["app"]``). The server cannot tell the panel's calls from the model's
+(hosts without MCP Apps list every tool, and some may show the result's ``_meta`` to the model), so
+the panel can only do what is safe even if the AI did it:
+
+* **take control** (pauses the AI), **start**, and **stop** (both refused while the user has
+  control or the AI waits for the user, like ``profile_start`` / ``profile_stop``);
+* handing a profile back to the AI and resolving help requests are *not* panel actions: they lift the
+  user's pause, so they happen only in ProfilePilot Manager or with ``profilepilot profile resume``.
+
+Every call also needs a short-lived action token from a recent panel result's ``_meta``. It is only
+given to clients that support MCP Apps (or whose capabilities are unknown, as on stateless HTTP), and
+``dashboard_action`` refuses clients that declared capabilities without MCP Apps.
 
 Wire-in: ``MCPServer(..., extensions=[apps_ui.build_apps()])`` in ``create_server`` (see
 docs/design/WIRE-IN.md, "ChatGPT").
@@ -24,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import secrets
+import time
 from datetime import datetime, timezone
 from functools import partial
 from hmac import compare_digest
@@ -37,7 +46,7 @@ from mcp.server.mcpserver.resources import TextResource
 from mcp.types import CallToolResult, TextContent
 from pydantic import Field
 
-from ..errors import NotFoundError, ProfilePilotError
+from ..errors import ProfilePilotError
 from .app import NoneOK, annotations, get_state, invocation_meta, run_sync, tool_guard
 
 log = logging.getLogger("profilepilot.server.apps_ui")
@@ -46,16 +55,23 @@ DASHBOARD_URI = "ui://profilepilot/dashboard.html"
 META_KEY = "profilepilot/dashboard"
 """Result ``_meta`` key carrying the panel's action token (given to the panel, not the model)."""
 MAX_PANEL_PROFILES = 60
-ACTIONS = ("start", "stop", "take_control", "hand_back", "help_done", "help_dismiss")
+ACTIONS = ("start", "stop", "take_control")
+"""Panel actions. Handing back and resolving help requests lift the user's pause, so they are
+ProfilePilot Manager / CLI only (see the module docstring)."""
+TOKEN_TTL = 30 * 60
+"""Seconds an action token from a panel result stays valid."""
+MAX_TOKENS = 256
 
 PANEL_NOTE = "Taken over in the chat panel"
+HAND_BACK_HINT = "hand it back in ProfilePilot Manager (or run: profilepilot profile resume \"{name}\")"
 
-DashboardAction = Literal["start", "stop", "take_control", "hand_back", "help_done", "help_dismiss"]
+DashboardAction = Literal["start", "stop", "take_control"]
 
 WIDGET_DESCRIPTION = (
     "An interactive panel listing the user's ProfilePilot browser profiles with their status, proxy and "
-    "open help requests. The user can start or stop profiles, take control of one (the AI must then not "
-    "act on it) and hand it back. Do not repeat the list in your reply; summarise what matters."
+    "open help requests. The user can start or stop profiles and take control of one (the AI must then not "
+    "act on it until the user hands it back in ProfilePilot Manager). Do not repeat the list in your reply; "
+    "summarise what matters."
 )
 
 
@@ -229,9 +245,11 @@ class DashboardApps(Apps):
     """The MCP Apps extension with ProfilePilot's panel, its model-visible tool and the app-only
     action tool."""
 
-    def __init__(self, *, control_factory: Callable[[Any], Any] | None = None) -> None:
+    def __init__(self, *, control_factory: Callable[[Any], Any] | None = None,
+                 clock: Callable[[], float] = time.monotonic) -> None:
         super().__init__()
-        self.action_token = secrets.token_urlsafe(24)
+        self._tokens: dict[str, float] = {}  # action token -> expiry (clock time)
+        self._clock = clock
         self._control_factory = control_factory or _default_control_factory
         self._extra_tools: list[ToolBinding] = []
         self.add_resource(TextResource(
@@ -281,8 +299,34 @@ class DashboardApps(Apps):
             log.debug("control store unavailable: %s", exc)
             return None
 
-    def _meta(self) -> dict[str, Any]:
-        return {META_KEY: {"token": self.action_token}}
+    def _prune_tokens(self, now: float) -> None:
+        for token in [t for t, until in self._tokens.items() if until <= now]:
+            del self._tokens[token]
+        if len(self._tokens) > MAX_TOKENS:
+            for token in sorted(self._tokens, key=self._tokens.__getitem__)[: len(self._tokens) - MAX_TOKENS]:
+                del self._tokens[token]
+
+    def issue_token(self) -> str:
+        """A fresh action token for one panel result (valid ``TOKEN_TTL`` seconds)."""
+        now = self._clock()
+        token = secrets.token_urlsafe(24)
+        self._tokens[token] = now + TOKEN_TTL
+        self._prune_tokens(now)
+        return token
+
+    def token_valid(self, token: Any) -> bool:
+        if not isinstance(token, str) or not token:
+            return False
+        self._prune_tokens(self._clock())
+        given = token.encode()
+        return any(compare_digest(given, known.encode()) for known in list(self._tokens))
+
+    def _meta(self, ctx: Context) -> dict[str, Any] | None:
+        """The panel's ``_meta`` (with an action token), or None for a client that declared it has no
+        MCP Apps support: there is no panel, and the token could end up in front of the model."""
+        if _apps_support(ctx) is False:
+            return None
+        return {META_KEY: {"token": self.issue_token()}}
 
     async def _result(self, ctx: Context, message: str | None = None) -> CallToolResult:
         state = get_state(ctx)
@@ -294,7 +338,7 @@ class DashboardApps(Apps):
         if message:
             text = message + "\n" + text
         return CallToolResult(content=[TextContent(type="text", text=text)], structured_content=data,
-                              _meta=self._meta())
+                              _meta=self._meta(ctx))
 
     # -- tools
 
@@ -314,74 +358,100 @@ class DashboardApps(Apps):
             ctx: Context,
             action: Annotated[DashboardAction, Field(description="The button the user clicked.")],
             profile: Annotated[str, NoneOK, Field(description="Profile id.")] = None,
-            request_id: Annotated[str, NoneOK, Field(description="Help request id (help_done / help_dismiss).")] = None,
             token: Annotated[str, NoneOK, Field(description="The panel's action token.")] = None,
         ) -> CallToolResult:
-            if not token or not compare_digest(str(token).encode(), apps.action_token.encode()):
+            if _apps_support(ctx) is False:
+                raise ToolError(
+                    "dashboard_action is only for the ProfilePilot panel in ChatGPT or Claude, and this client has "
+                    "no MCP Apps support. Use profile_start / profile_stop; taking control and handing back are the "
+                    "user's decisions."
+                )
+            if not apps.token_valid(token):
                 raise ToolError(
                     "dashboard_action only works from the buttons of the ProfilePilot panel (if you are the panel: "
                     "it is out of date, refresh it). The model must use profile_start / profile_stop; taking "
                     "control and handing back are the user's decisions."
                 )
-            message = await apps._perform(ctx, action, profile, request_id)
+            message = await apps._perform(ctx, action, profile)
             return await apps._result(ctx, message)
 
         dashboard_action.__doc__ = _dashboard_action_doc()
         return dashboard_action
 
-    async def _perform(self, ctx: Context, action: str, profile: str | None, request_id: str | None) -> str:
+    async def _perform(self, ctx: Context, action: str, profile: str | None) -> str:
         state = get_state(ctx)
         if not profile:
             raise ToolError("Choose a profile.")
         target = await run_sync(state.store.get_profile, profile)
+        control = self._control(state.store)
         if action == "start":
+            if control is not None:
+                await self._refuse_while_user_has_it(control, target, "start")
             await run_sync(partial(state.runtime.start, target.id))
             return f"Started '{target.name}'."
         if action == "stop":
+            if control is not None:
+                await self._refuse_while_user_has_it(control, target, "stop")
             await state.browsers.disconnect(target.id)
             stopped = await run_sync(state.runtime.stop, target.id)
             return f"Stopped '{target.name}'." if stopped else f"'{target.name}' was not running."
-        control = self._control(state.store)
-        if control is None:
-            raise ToolError("Taking control needs ProfilePilot's control layer, which is not available here.")
         if action == "take_control":
+            if control is None:
+                raise ToolError("Taking control needs ProfilePilot's control layer, which is not available here.")
             await run_sync(partial(control.pause, target.id, PANEL_NOTE))
-            return f"You have control of '{target.name}': the AI will not act on it until you hand it back."
-        if action == "hand_back":
-            await run_sync(partial(control.resume, target.id))
-            return f"Handed '{target.name}' back to the AI."
-        if action in ("help_done", "help_dismiss"):
-            if not request_id:
-                raise ToolError("Which help request? (request_id is missing)")
-            status = "done" if action == "help_done" else "dismissed"
-            try:
-                await run_sync(partial(control.resolve_help, target.id, request_id, status=status))
-            except NotFoundError:
-                raise ToolError("That help request no longer exists; refresh the panel.") from None
-            return "Marked the request as done." if status == "done" else "Dismissed the request."
-        raise ToolError(f"Unknown action {action!r}; use one of: {', '.join(ACTIONS)}.")
+            return (f"You have control of '{target.name}': the AI will not act on it until you "
+                    + HAND_BACK_HINT.format(name=target.name) + ".")
+        raise ToolError(f"Unknown action {action!r}; the panel can {', '.join(ACTIONS)}. To hand a profile back to "
+                        "the AI or to close a help request, use ProfilePilot Manager.")
+
+    async def _refuse_while_user_has_it(self, control: Any, target: Any, verb: str) -> None:
+        """The panel's Start / Stop follow ``profile_start`` / ``profile_stop``: not while the user has
+        control (or the AI waits for the user there), since the panel's calls cannot be told apart from
+        the model's."""
+        done = "stopped" if verb == "stop" else "started"
+        try:
+            cstate = await run_sync(control.state_by_id, target.id)
+            busy = getattr(cstate, "effective", None) is not None
+        except Exception as exc:  # cannot tell: do not touch the user's window
+            log.debug("control state of %s unavailable: %s", target.id, exc)
+            raise ToolError(f"Could not check whether you are using '{target.name}', so it was not {done}. "
+                            f"{verb.capitalize()} it in ProfilePilot Manager.") from None
+        if busy:
+            yourself = "Close its window yourself" if verb == "stop" else "Start it in ProfilePilot Manager"
+            raise ToolError(f"'{target.name}' is in your hands (you took control, or the AI is waiting for you there), "
+                            f"so the panel does not {verb} it. {yourself}, or "
+                            + HAND_BACK_HINT.format(name=target.name) + " first.")
+
+
+def _apps_support(ctx: Context) -> bool | None:
+    """True / False when the client declared its capabilities (with / without MCP Apps), None when
+    it did not (stateless HTTP requests carry no capabilities, e.g. ChatGPT's)."""
+    try:
+        if ctx.client_capabilities is None:
+            return None
+        return client_supports_apps(ctx)
+    except Exception:
+        return None
 
 
 def _supports_apps(ctx: Context) -> bool:
-    try:
-        return client_supports_apps(ctx)
-    except Exception:
-        return False
+    return _apps_support(ctx) is True
 
 
 def _profiles_dashboard_doc() -> str:
     return (
         "Show the user's ProfilePilot browser profiles as an interactive panel (in ChatGPT and Claude): status, "
-        "proxy, Start/Stop, Take control / Hand back, and your open help requests. Other clients get the same "
-        "overview as text. Use it when the user wants to see or manage their profiles; for one profile's details "
-        "use profile_status."
+        "proxy, Start/Stop, Take control, and your open help requests. Other clients get the same overview as "
+        "text. Use it when the user wants to see or manage their profiles; for one profile's details use "
+        "profile_status."
     )
 
 
 def _dashboard_action_doc() -> str:
     return (
-        "Only for the buttons of the ProfilePilot panel (the user's own clicks): start/stop a profile, take control "
-        "/ hand back, resolve a help request. Needs the panel's token; the model cannot use it."
+        "Only for the buttons of the ProfilePilot panel (the user's own clicks): start or stop a profile, or take "
+        "control of it. Needs a token from the panel; the model cannot use it. Handing a profile back to the AI "
+        "happens only in ProfilePilot Manager."
     )
 
 
@@ -497,6 +567,8 @@ button { font: inherit; color: inherit; }
 .help-title { font-weight: 600; }
 .help-msg { margin: 2px 0 0; overflow-wrap: anywhere; }
 .help-when { color: var(--pp-text-2); font-size: 12px; margin-top: 2px; }
+.help-next { color: var(--pp-text-2); font-size: 12px; margin-top: 4px; }
+.hint { color: var(--pp-text-2); font-size: 12px; align-self: center; text-align: right; max-width: 190px; }
 .kind {
   display: inline-block; margin-left: 6px; padding: 0 7px; border-radius: 99px; font-size: 11.5px; font-weight: 600;
   color: var(--pp-warn); border: 1px solid var(--pp-warn-border); vertical-align: 1px;
@@ -739,22 +811,20 @@ button { font: inherit; color: inherit; }
     finally { S.busy.delete("refresh"); $("refresh").removeAttribute("aria-busy"); }
   }
 
-  async function act(action, profile, extra) {
-    const key = [action, profile && profile.id, extra && extra.request_id].join(":");
-    if (S.busy.has(key)) return;
+  async function act(action, profile, retried) {
+    const key = [action, profile && profile.id].join(":");
+    if (S.busy.has(key) && !retried) return;
     S.busy.add(key);
     render();
+    let again = false;
     try {
-      const args = { action, profile: profile ? profile.id : "", token: S.token };
-      if (extra && extra.request_id) args.request_id = extra.request_id;
-      const result = await callTool("dashboard_action", args);
+      const result = await callTool("dashboard_action", { action, profile: profile ? profile.id : "", token: S.token });
       if (result && result.isError) {
         const text = textOf(result) || "That did not work.";
-        toast(text, true);
-        if (/out of date/i.test(text)) refresh();
+        if (!retried && /out of date/i.test(text)) again = true;  // an old token: refresh and try once more
+        else toast(text, true);
       } else {
         applyResult(result);
-        if (extra && extra.tellAi) tellAi(extra.tellAi);
       }
     } catch (err) {
       toast(err.message || String(err), true);
@@ -762,11 +832,10 @@ button { font: inherit; color: inherit; }
       S.busy.delete(key);
       render();
     }
-  }
-
-  function tellAi(text) {
-    if (!S.connected || !S.hostCaps.message) return;
-    request("ui/message", { role: "user", content: [{ type: "text", text }] }, 15000).catch(() => {});
+    if (again) {
+      await refresh();
+      await act(action, profile, true);
+    }
   }
 
   // ------------------------------------------------------------------ rendering
@@ -795,9 +864,6 @@ button { font: inherit; color: inherit; }
     const byId = new Map(data.profiles.map((p) => [p.id, p]));
     for (const req of data.help || []) {
       const profile = byId.get(req.profile_id) || { id: req.profile_id, name: req.profile_name || req.profile_id };
-      const doneKey = ["help_done", profile.id, req.id].join(":");
-      const dismissKey = ["help_dismiss", profile.id, req.id].join(":");
-      const canTell = S.connected && S.hostCaps.message;
       box.append(h("div", { class: "help-card", role: "group", "aria-label": "Help request" }, [
         h("span", { class: "help-icon", "aria-hidden": "true", text: "!" }),
         h("div", { class: "help-body" }, [
@@ -806,13 +872,8 @@ button { font: inherit; color: inherit; }
           h("p", { class: "help-msg", text: "“" + req.message + "”" }),
           h("div", { class: "help-when", text: "Asked " + ago(req.created_at) +
             (req.pauses ? " · the AI waits until you finish" : "") }),
-        ]),
-        h("div", { class: "actions" }, [
-          busyBtn(canTell ? "Done, continue" : "Done", doneKey, { class: "btn primary",
-            title: "Mark it done" + (canTell ? " and tell the AI to continue" : ""),
-            click: () => act("help_done", profile, { request_id: req.id,
-              tellAi: "I took care of “" + req.message + "” in the ProfilePilot profile “" + profile.name + "”. Please continue." }) }),
-          busyBtn("Dismiss", dismissKey, { class: "btn quiet", click: () => act("help_dismiss", profile, { request_id: req.id }) }),
+          h("div", { class: "help-next", text: "Do it in the profile’s browser window, then click Done in " +
+            "ProfilePilot Manager on your computer." }),
         ]),
       ]));
     }
@@ -839,13 +900,18 @@ button { font: inherit; color: inherit; }
 
     const startKey = ["start", p.id].join(":");
     const stopKey = ["stop", p.id].join(":");
-    const ctlKey = [p.paused ? "hand_back" : "take_control", p.id].join(":");
+    const ctlKey = ["take_control", p.id].join(":");
+    const yours = p.paused || p.help_open;
     const actions = [];
-    if (state === "stopped") actions.push(busyBtn("Start", startKey, { class: "btn", click: () => act("start", p) }));
-    else actions.push(busyBtn("Stop", stopKey, { class: "btn quiet", click: () => act("stop", p) }));
+    // while the profile is the user's, the panel neither starts nor stops it (the AI could press those too)
+    if (!yours) {
+      actions.push(state === "stopped"
+        ? busyBtn("Start", startKey, { class: "btn", click: () => act("start", p) })
+        : busyBtn("Stop", stopKey, { class: "btn quiet", click: () => act("stop", p) }));
+    }
     if (S.data && S.data.features && S.data.features.control) {
       actions.push(p.paused
-        ? busyBtn("Hand back to AI", ctlKey, { class: "btn primary", title: "Let the AI use this profile again", click: () => act("hand_back", p) })
+        ? h("span", { class: "hint", text: "Hand back to the AI in ProfilePilot Manager" })
         : busyBtn("Take control", ctlKey, { class: "btn", title: "Pause the AI on this profile while you use it", click: () => act("take_control", p) }));
     }
     return h("li", { class: "row", "data-state": state, "aria-label": p.name + ", " + stateLabel }, [

@@ -10,67 +10,129 @@ export function nextId(prefix = "pp") {
 
 // ------------------------------------------------------------------ toasts
 
-export function toast(text, { kind = "info", title, timeout, action } = {}) {
+/**
+ * toast(text, {kind, title, timeout, action: {label, onClick}, details})
+ * `details` (text) goes under a "Details" disclosure, e.g. the full report of a client registration.
+ * The toast stays while the pointer or the keyboard focus is on it.
+ */
+export function toast(text, { kind = "info", title, timeout, action, details } = {}) {
   const host = document.getElementById("toasts");
-  if (!host) return;
+  if (!host) return () => {};
   const icons = { success: "check", error: "alert", info: "info", warn: "alert" };
+  const kindIcon = icon(icons[kind] || "info", "toast-icon");
   const el = h("div.toast", { class: kind, attrs: { role: kind === "error" ? "alert" : "status" } },
-    icon(icons[kind] || "info"),
-    h("div.toast-body", title ? h("div.toast-title", title) : null, h("div.toast-text", text)),
+    kindIcon,
+    h("div.toast-body",
+      title ? h("div.toast-title", title) : null,
+      text ? h("div.toast-text", text) : null,
+      details ? h("details.toast-details", h("summary", "Details"), h("div.toast-detail-text", details)) : null),
     action ? h("button.btn.xs", { onclick: () => { action.onClick(); dismiss(); } }, action.label) : null,
-    h("button.btn.ghost.xs.icon-only", { onclick: () => dismiss(), attrs: { "aria-label": "Dismiss" } }, icon("x")),
+    h("button.btn.ghost.xs.icon-only.toast-close", { onclick: () => dismiss(), attrs: { "aria-label": "Dismiss" } }, icon("x")),
   );
   let gone = false;
+  let timer = null;
   const dismiss = () => {
     if (gone) return;
     gone = true;
+    clearTimeout(timer);
     el.classList.add("leaving");
     setTimeout(() => el.remove(), 200);
   };
+  const ms = timeout || (kind === "error" ? 8000 : action ? 7000 : 4200);
+  const arm = () => { clearTimeout(timer); timer = setTimeout(dismiss, ms); };
+  const hold = () => clearTimeout(timer);
+  el.addEventListener("mouseenter", hold);
+  el.addEventListener("mouseleave", () => { if (!el.contains(document.activeElement)) arm(); });
+  el.addEventListener("focusin", hold);
+  el.addEventListener("focusout", (event) => { if (!el.contains(event.relatedTarget)) arm(); });
   host.append(el);
-  while (host.children.length > 4) host.firstElementChild.remove();
-  setTimeout(dismiss, timeout || (kind === "error" ? 8000 : 4200));
+  while (host.children.length > 3) host.firstElementChild.remove();
+  arm();
   return dismiss;
 }
 
 // ------------------------------------------------------------------ dialogs
 
+/** Track unsaved changes: snapshot() returns a comparable string of the current values. */
+export function changeTracker(snapshot) {
+  let base = snapshot();
+  return {
+    dirty: () => snapshot() !== base,
+    reset: () => { base = snapshot(); },
+  };
+}
+
+async function confirmDiscard() {
+  return confirmDialog({
+    title: "Discard changes?", message: "What you changed here has not been saved.",
+    confirmLabel: "Discard", cancelLabel: "Keep editing", danger: true,
+  });
+}
+
+/** Esc, a backdrop click and the close button ask before throwing away unsaved changes. */
+function guardClose(dialog, isDirty) {
+  let asking = false;
+  const requestClose = async () => {
+    if (!dialog.open || asking) return;
+    if (isDirty && isDirty()) {
+      asking = true;
+      const discard = await confirmDiscard();
+      asking = false;
+      if (!discard) return;
+    }
+    if (dialog.open) dialog.close();
+  };
+  dialog.addEventListener("cancel", (event) => {
+    if (isDirty && isDirty()) {
+      event.preventDefault();
+      requestClose();
+    }
+  });
+  dialog.addEventListener("click", (event) => {
+    if (event.target !== dialog) return;
+    if (isDirty && isDirty()) return; // a stray click outside never throws work away
+    dialog.close();
+  });
+  return requestClose;
+}
+
 /**
- * openDialog({title, description, body, footer, size}) -> {el, close, body, footer}
- * `body`/`footer` are nodes (or arrays). Esc and a click on the backdrop close the dialog.
+ * openDialog({title, description, body, footer, size, isDirty}) -> {el, close, forceClose, body, footer}
+ * `body`/`footer` are nodes (or arrays). Esc and a click on the backdrop close the dialog; while
+ * `isDirty()` is true they ask "Discard changes?" first (`forceClose` skips that, e.g. after saving).
  */
-export function openDialog({ title, description, body, footer, size = "", onClose, label } = {}) {
+export function openDialog({ title, description, body, footer, size = "", onClose, label, isDirty } = {}) {
   const titleId = nextId("dlg");
   const dialog = h("dialog.dialog", { class: size, attrs: { "aria-labelledby": titleId } });
-  const close = () => { if (dialog.open) dialog.close(); };
+  const forceClose = () => { if (dialog.open) dialog.close(); };
+  const close = guardClose(dialog, isDirty);
   const header = h("div.dialog-header",
     h("div.dialog-title", h("h2", { id: titleId }, title || label || ""), description ? h("p", description) : null),
-    h("button.btn.ghost.sm.icon-only.close", { onclick: close, attrs: { "aria-label": "Close" } }, icon("x")),
+    h("button.btn.ghost.sm.icon-only.close", { onclick: () => close(), attrs: { "aria-label": "Close", type: "button" } }, icon("x")),
   );
   const bodyEl = h("div.dialog-body", body);
   const footerEl = footer ? h("div.dialog-footer", footer) : null;
   dialog.append(header, bodyEl);
   if (footerEl) dialog.append(footerEl);
-  dialog.addEventListener("click", (event) => { if (event.target === dialog) close(); });
   dialog.addEventListener("close", () => {
     dialog.remove();
     if (onClose) onClose();
   });
   document.body.append(dialog);
   dialog.showModal();
-  const first = dialog.querySelector("[autofocus], .dialog-body input, .dialog-body textarea, .dialog-body select");
+  const first = dialog.querySelector("[autofocus], .dialog-body input:not([type=hidden]), .dialog-body textarea, .dialog-body select");
   if (first) first.focus();
-  return { el: dialog, close, body: bodyEl, footer: footerEl };
+  return { el: dialog, close, forceClose, body: bodyEl, footer: footerEl };
 }
 
-export function confirmDialog({ title, message, confirmLabel = "Confirm", danger = false, details } = {}) {
+export function confirmDialog({ title, message, confirmLabel = "Confirm", cancelLabel = "Cancel", danger = false, details } = {}) {
   return new Promise((resolve) => {
     let answered = false;
-    const confirm = h("button.btn", { class: danger ? "danger solid" : "primary", onclick: () => { answered = true; dlg.close(); resolve(true); } }, confirmLabel);
+    const confirm = h("button.btn", { class: danger ? "danger solid" : "primary", attrs: { type: "button" }, onclick: () => { answered = true; dlg.forceClose(); resolve(true); } }, confirmLabel);
     const dlg = openDialog({
       title, size: "narrow",
-      body: h("div.stack", h("p.muted", message), details || null),
-      footer: [h("span.spacer"), h("button.btn", { onclick: () => dlg.close() }, "Cancel"), confirm],
+      body: h("div.stack", message ? h("p.muted", message) : null, details || null),
+      footer: [h("span.spacer"), h("button.btn", { attrs: { type: "button" }, onclick: () => dlg.forceClose() }, cancelLabel), confirm],
       onClose: () => { if (!answered) resolve(false); },
     });
     confirm.focus();
@@ -79,27 +141,36 @@ export function confirmDialog({ title, message, confirmLabel = "Confirm", danger
 
 // ------------------------------------------------------------------ drawers
 
-/** openDrawer({onClose}) -> {el, close, header, tabs, body, footer} (fill them in). */
-export function openDrawer({ onClose, label = "Details" } = {}) {
+/**
+ * openDrawer({onClose, label, isDirty}) -> {el, close, forceClose, header, tabs, body, footer, focusInitial}
+ * (fill them in, then call focusInitial() so the keyboard starts on the selected tab or first field).
+ */
+export function openDrawer({ onClose, label = "Details", isDirty } = {}) {
   const dialog = h("dialog.drawer", { attrs: { "aria-label": label } });
-  const close = () => { if (dialog.open) dialog.close(); };
+  const forceClose = () => { if (dialog.open) dialog.close(); };
+  const close = guardClose(dialog, isDirty);
   const header = h("div.drawer-header");
-  const tabs = h("div.drawer-tabs", { attrs: { role: "tablist" } });
+  const tabs = h("div.drawer-tabs", { attrs: { role: "tablist", "aria-label": `${label} sections` } });
   const body = h("div.drawer-body");
   const footer = h("div.drawer-footer.hidden");
   dialog.append(header, tabs, body, footer);
-  dialog.addEventListener("click", (event) => { if (event.target === dialog) close(); });
   dialog.addEventListener("close", () => {
     dialog.remove();
     if (onClose) onClose();
   });
   document.body.append(dialog);
   dialog.showModal();
-  return { el: dialog, close, header, tabs, body, footer };
+  const focusInitial = () => {
+    const target = dialog.querySelector('[role="tab"][aria-selected="true"]')
+      || body.querySelector("input:not([type=hidden]), select, textarea, button")
+      || header.querySelector(".close");
+    if (target) target.focus();
+  };
+  return { el: dialog, close, forceClose, header, tabs, body, footer, focusInitial };
 }
 
 export function closeButton(close) {
-  return h("button.btn.ghost.sm.icon-only.close", { onclick: close, attrs: { "aria-label": "Close", title: "Close (Esc)" } }, icon("x"));
+  return h("button.btn.ghost.sm.icon-only.close", { onclick: () => close(), attrs: { "aria-label": "Close", title: "Close (Esc)", type: "button" } }, icon("x"));
 }
 
 // ------------------------------------------------------------------ menus
@@ -121,9 +192,15 @@ export function openMenu(anchor, items) {
     if (item === "-") { menu.append(h("hr")); continue; }
     if (!item) continue;
     menu.append(h("button", {
-      class: item.danger ? "danger" : "", attrs: { role: "menuitem" },
+      class: item.danger ? "danger" : "", attrs: { role: "menuitem", type: "button", title: item.title || null },
       onclick: (event) => { event.stopPropagation(); closeMenu(); item.onClick(); },
     }, item.icon ? icon(item.icon) : null, item.label));
+  }
+  // Drop separators at the edges or next to each other (items may be conditional).
+  for (const hr of [...menu.querySelectorAll("hr")]) {
+    const prev = hr.previousElementSibling;
+    const next = hr.nextElementSibling;
+    if (!prev || !next || next.tagName === "HR") hr.remove();
   }
   document.body.append(menu);
   const rect = anchor.getBoundingClientRect();
@@ -141,9 +218,12 @@ export function openMenu(anchor, items) {
   const onKey = (event) => {
     const buttons = [...menu.querySelectorAll("button")];
     const index = buttons.indexOf(document.activeElement);
-    if (event.key === "Escape") { closeMenu(); anchor.focus(); }
+    if (event.key === "Escape") { event.stopPropagation(); closeMenu(); anchor.focus(); }
+    else if (event.key === "Tab") { event.preventDefault(); closeMenu(); anchor.focus(); }
     else if (event.key === "ArrowDown") { event.preventDefault(); buttons[(index + 1) % buttons.length].focus(); }
     else if (event.key === "ArrowUp") { event.preventDefault(); buttons[(index - 1 + buttons.length) % buttons.length].focus(); }
+    else if (event.key === "Home") { event.preventDefault(); buttons[0].focus(); }
+    else if (event.key === "End") { event.preventDefault(); buttons[buttons.length - 1].focus(); }
   };
   menu.addEventListener("keydown", onKey);
   setTimeout(() => {
@@ -185,7 +265,10 @@ export function copyable(text, display) {
   return h("span.copyable", h("code", { title: text }, display || text), copyButton(text));
 }
 
-/** Segmented control. options: [{value, label, icon}]; returns element with .value */
+/**
+ * Segmented control (a radio group). options: [{value, label, icon, title}]; returns element with .value.
+ * One tab stop for the group (roving tabindex); arrow keys move the selection.
+ */
 export function segmented(options, value, onChange, { label, block = false } = {}) {
   const el = h("div.segmented", { class: block ? "block" : "", attrs: { role: "radiogroup", "aria-label": label || null } });
   let current = value;
@@ -197,19 +280,29 @@ export function segmented(options, value, onChange, { label, block = false } = {
     el.append(btn);
     return btn;
   });
+  function sync() {
+    const selected = options.some((o) => o.value === current) ? current : options[0] && options[0].value;
+    buttons.forEach((b, i) => {
+      b.setAttribute("aria-checked", String(options[i].value === current));
+      b.tabIndex = options[i].value === selected ? 0 : -1;
+    });
+  }
   function set(v, fire) {
     current = v;
-    buttons.forEach((b, i) => b.setAttribute("aria-checked", String(options[i].value === v)));
+    sync();
     if (fire && onChange) onChange(v);
   }
   el.addEventListener("keydown", (event) => {
-    if (event.key !== "ArrowRight" && event.key !== "ArrowLeft") return;
+    const keys = { ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1 };
+    if (!(event.key in keys)) return;
     event.preventDefault();
-    const i = options.findIndex((o) => o.value === current);
-    const next = options[(i + (event.key === "ArrowRight" ? 1 : options.length - 1)) % options.length];
+    const enabled = options.filter((o, i) => !buttons[i].disabled);
+    const i = enabled.findIndex((o) => o.value === current);
+    const next = enabled[(i + keys[event.key] + enabled.length) % enabled.length];
     set(next.value, true);
     buttons[options.indexOf(next)].focus();
   });
+  sync();
   Object.defineProperty(el, "value", { get: () => current, set: (v) => set(v, false) });
   return el;
 }
@@ -230,9 +323,22 @@ export function choiceCards(options, value, onChange, { label } = {}) {
   });
   function set(v, fire) {
     current = v;
-    cards.forEach((c, i) => c.setAttribute("aria-checked", String(options[i].value === v)));
+    cards.forEach((c, i) => {
+      c.setAttribute("aria-checked", String(options[i].value === v));
+      c.tabIndex = options[i].value === v ? 0 : -1;
+    });
     if (fire && onChange) onChange(v);
   }
+  el.addEventListener("keydown", (event) => {
+    const keys = { ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1 };
+    if (!(event.key in keys)) return;
+    event.preventDefault();
+    const i = options.findIndex((o) => o.value === current);
+    const next = options[(i + keys[event.key] + options.length) % options.length];
+    set(next.value, true);
+    cards[options.indexOf(next)].focus();
+  });
+  set(current, false);
   Object.defineProperty(el, "value", { get: () => current, set: (v) => set(v, false) });
   return el;
 }
@@ -264,18 +370,44 @@ export function chipInput(values = [], { placeholder = "Add a tag…", id, onCha
   input.addEventListener("blur", commit);
   render();
   Object.defineProperty(el, "values", { get: () => { commit(); return [...tags]; } });
+  // Pending text counts as a change (for "Discard changes?") without committing it.
+  Object.defineProperty(el, "pending", { get: () => [...tags, input.value.trim()].filter(Boolean).join(",") });
   return el;
 }
 
 export function field(label, control, { hint, id, error } = {}) {
   const controlId = id || control.id || nextId("f");
   if (!control.id && control.tagName && /^(INPUT|SELECT|TEXTAREA)$/.test(control.tagName)) control.id = controlId;
+  let hintEl = null;
+  if (hint) {
+    hintEl = h("div.hint", { id: nextId("hint") }, hint);
+    if (control.setAttribute && /^(INPUT|SELECT|TEXTAREA)$/.test(control.tagName || "")) control.setAttribute("aria-describedby", hintEl.id);
+  }
   return h("div.field",
     label ? h("label", { attrs: { for: control.id || controlId } }, label) : null,
     control,
-    hint ? h("div.hint", hint) : null,
+    hintEl,
     error ? h("div.error-text", error) : null,
   );
+}
+
+/** Show (or clear, with an empty message) an inline error under `control` and mark it invalid. */
+export function setError(control, message) {
+  const host = control.closest(".field") || control.closest("form") || control.parentElement;
+  if (!host) return;
+  let err = host.querySelector(":scope > .error-text");
+  if (!message) {
+    control.removeAttribute("aria-invalid");
+    if (err) err.remove();
+    return;
+  }
+  if (!err) {
+    err = h("div.error-text", { id: nextId("err"), attrs: { role: "alert" } });
+    host.append(err);
+  }
+  err.textContent = message;
+  control.setAttribute("aria-invalid", "true");
+  control.setAttribute("aria-errormessage", err.id);
 }
 
 export function select(options, value, { id, onChange, cls = "" } = {}) {
@@ -285,8 +417,8 @@ export function select(options, value, { id, onChange, cls = "" } = {}) {
   return el;
 }
 
-export function toggle(checked, { label, onChange, id } = {}) {
-  const input = h("input", { type: "checkbox", id, checked, attrs: { role: "switch" } });
+export function toggle(checked, { label, onChange, id, disabled = false } = {}) {
+  const input = h("input", { type: "checkbox", id, checked, disabled, attrs: { role: "switch" } });
   input.addEventListener("change", () => onChange && onChange(input.checked));
   const el = h("label.switch", input, h("span.track"), label ? h("span", label) : null);
   Object.defineProperty(el, "checked", { get: () => input.checked, set: (v) => { input.checked = v; } });
@@ -294,8 +426,8 @@ export function toggle(checked, { label, onChange, id } = {}) {
   return el;
 }
 
-export function emptyState({ icon: iconName = "info", title, text, actions = [] }) {
-  return h("div.empty",
+export function emptyState({ icon: iconName = "info", title, text, actions = [], compact = false }) {
+  return h("div.empty", { class: compact ? "compact" : "" },
     h("div.empty-icon", icon(iconName)),
     h("h2", title),
     text ? h("p", text) : null,

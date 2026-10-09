@@ -174,6 +174,15 @@ def test_pairing_code_shape_and_rotation(store):
     assert pairing_code(store) == first  # stable until used
     assert oauth_mod.rotate_pairing_code(store) != first
     assert normalize_pairing_code(" abcd 2345 ") == normalize_pairing_code("ABCD-2345") == "ABCD2345"
+    # the longer code of `connect unlock` (about 59 bits) is kept like a normal one until it is used
+    long_code = new_pairing_code(oauth_mod.UNLOCK_CODE_LENGTH)
+    assert re.fullmatch(r"[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}", long_code)
+    assert set(long_code.replace("-", "")) <= alphabet
+    store.secrets.set(oauth_mod.PAIRING_KEY, long_code)
+    assert pairing_code(store) == long_code
+    assert len(normalize_pairing_code(oauth_mod.rotate_pairing_code(store))) == oauth_mod.PAIRING_LENGTH
+    store.secrets.set(oauth_mod.PAIRING_KEY, "ABC-123")  # anything else is replaced
+    assert len(normalize_pairing_code(pairing_code(store))) == oauth_mod.PAIRING_LENGTH
 
 
 def test_public_urls_and_redirect_validation(store):
@@ -181,10 +190,16 @@ def test_public_urls_and_redirect_validation(store):
     assert public_base_url("127.0.0.1", 8931, ["https://x.example/mcp"]) == "https://x.example"
     assert public_base_url("0.0.0.0", 9000, []) == "http://127.0.0.1:9000"
     for good in (CHATGPT_REDIRECT_URI, "http://localhost:3000/callback", "http://127.0.0.1:5173/cb",
-                 "cursor://anysphere.cursor-retrieval/oauth/callback", "https://claude.ai/api/mcp/auth_callback"):
+                 "cursor://anysphere.cursor-retrieval/oauth/callback", "https://claude.ai/api/mcp/auth_callback",
+                 "vscode://vscode.github-authentication/did-authenticate", "claude://oauth/callback",
+                 "com.example.app:/oauth2redirect"):
         assert validate_redirect_uri(good) == good
+    # an allowlist: Windows protocol handlers and network shares are refused (they start programs / leak NTLM)
     for bad in ("javascript:alert(1)", "data:text/html,hi", "http://evil.example/cb", "https://a.example/cb#frag",
-                "file:///C:/x", "https://user:pw@a.example/cb", "nonsense"):
+                "file:///C:/x", "https://user:pw@a.example/cb", "nonsense",
+                r"search-ms:query=x&crumb=location:\\evil.example\share", "ms-officecmd:{}",
+                "smb://evil.example/share", "ms-settings:privacy", "mailto:x@evil.example", "ftp://evil.example/x",
+                "cursor://user:pw@anysphere.cursor-retrieval/cb"):
         with pytest.raises(ValueError):
             validate_redirect_uri(bad)
     with pytest.raises(Exception, match="https"):
@@ -393,9 +408,11 @@ async def test_replayed_code_wrong_verifier_and_expiry(store):
         assert refreshed.status_code == 200
         new = refreshed.json()
 
-        # a rotated refresh token works within the grace window (lost response) ...
+        # a rotated refresh token works within the grace window (lost response): the same tokens again ...
         again = await token_request(http, client, grant_type="refresh_token", refresh_token=tokens["refresh_token"])
         assert again.status_code == 200
+        assert again.json()["refresh_token"] == new["refresh_token"]
+        assert again.json()["access_token"] == new["access_token"]
         # ... but reusing it later revokes the whole connection
         clock.advance(REFRESH_GRACE + 1)
         reuse = await token_request(http, client, grant_type="refresh_token", refresh_token=tokens["refresh_token"])
@@ -417,12 +434,16 @@ async def test_consent_rate_limit_deny_and_bad_requests(store):
         query = parse_qs(urlsplit(denied.headers["location"]).query)
         assert query["error"] == ["access_denied"] and query["state"] == ["deny-me"] and query["iss"] == [BASE]
 
-        # 5 wrong codes per 10 minutes, then even the right code waits
+        # 5 wrong codes close the sign-in request; 5 per 10 minutes overall, then even the right code waits
         _, fields = await open_consent(http, client, challenge)
         for _ in range(5):
             assert (await submit(http, fields, "AAAA-AAAA")).status_code == 400
+        closed = await submit(http, fields, pairing_code(store))
+        assert closed.status_code == 400 and "no longer valid" in closed.text
+        _, fields = await open_consent(http, client, challenge)
         locked = await submit(http, fields, pairing_code(store))
-        assert locked.status_code == 429 and "Too many" in locked.text
+        assert locked.status_code == 429 and "Too many" in locked.text and "connect unlock" in locked.text
+        assert OAuthStore(store.root, clock=clock).sign_in_lock()["locked_until"] > clock.now
         clock.advance(oauth_mod.ATTEMPT_WINDOW + 1)
         _, fields = await open_consent(http, client, challenge)  # the pending request expired meanwhile
         assert (await submit(http, fields, pairing_code(store))).status_code == 303
@@ -600,3 +621,466 @@ async def test_claude_code_loopback_redirect_on_any_port(store):
                                                  "resource": MCP_URL})
         assert tokens.status_code == 200, tokens.text
         assert (await mcp_list(http, tokens.json()["access_token"])).status_code == 200
+
+
+# ---------------------------------------------------------------------- security regressions
+
+
+def browser(http: httpx2.AsyncClient) -> httpx2.AsyncClient:
+    """Another browser (its own cookie jar) on the same server."""
+    return httpx2.AsyncClient(transport=http._transport, base_url=BASE)
+
+
+async def wrong_codes(http: httpx2.AsyncClient, client: dict[str, Any], count: int) -> list[int]:
+    """``count`` wrong pairing codes, on as few sign-in requests as the per-request limit allows."""
+    statuses: list[int] = []
+    fields: dict[str, str] | None = None
+    for i in range(count):
+        if i % oauth_mod.REQUEST_ATTEMPT_LIMIT == 0:
+            _, fields = await open_consent(http, client, pkce()[1])
+        assert fields is not None
+        statuses.append((await submit(http, fields, "ZZZZ-ZZZZ")).status_code)
+    return statuses
+
+
+@pytest.mark.asyncio
+async def test_owner_unlocks_after_someone_used_up_the_attempts(store):
+    """Finding 3: wrong codes from someone who knows the tunnel URL must not lock the owner out for
+    good: `connect unlock` (local) makes a new code that is checked whatever the limiter says."""
+    clock = FakeClock()
+    async with oauth_app(store, clock) as (setup, http):
+        attacker = await register(http, client_name="attacker")
+        assert await wrong_codes(http, attacker, oauth_mod.ATTEMPT_LIMIT) == [400] * oauth_mod.ATTEMPT_LIMIT
+        async with browser(http) as owner_browser:
+            owner = await register(owner_browser)
+            old_code = pairing_code(store)
+            _, fields = await open_consent(owner_browser, owner, pkce()[1])
+            locked = await submit(owner_browser, fields, old_code)
+            assert locked.status_code == 429 and "profilepilot connect unlock" in locked.text
+            status = oauth_mod.oauth_status(store)
+            assert status["locked_until"] and status["unlock_until"] is None
+
+            new_code = oauth_mod.unlock_sign_in(store, clock=clock)
+            assert new_code != old_code and pairing_code(store) == new_code
+            # wrong codes are not counted against everyone in the unlock window, so its code is long
+            # enough that unlimited guessing for UNLOCK_TTL seconds is hopeless (~59 bits)
+            assert len(normalize_pairing_code(new_code)) == oauth_mod.UNLOCK_CODE_LENGTH >= 12
+            assert oauth_mod.oauth_status(store)["unlock_until"] and not oauth_mod.oauth_status(store)["locked_until"]
+            # the attacker keeps guessing during the unlock window: the owner still gets through
+            assert set(await wrong_codes(http, attacker, 12)) <= {400}
+            assert (await submit(owner_browser, fields, old_code)).status_code == 400  # the old code is dead
+            approved = await submit(owner_browser, fields, new_code.lower().replace("-", " "))
+            assert approved.status_code == 303 and "code=" in approved.headers["location"]
+        # the unlock ends with that sign-in (back to a normal code); the attempts are used up again
+        assert oauth_mod.oauth_status(store)["unlock_until"] is None
+        assert len(normalize_pairing_code(pairing_code(store))) == oauth_mod.PAIRING_LENGTH
+        _, fields = await open_consent(http, attacker, pkce()[1])
+        assert (await submit(http, fields, pairing_code(store))).status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_unlock_only_skips_the_limit_for_its_own_long_code(store):
+    """The unlock window lets wrong codes go uncounted only while its long code is in effect. When
+    that code is replaced by a normal 8-character one (the server restarted and made a new code,
+    `connect stop --revoke`, ...), the normal limit applies again, also to concurrent guesses."""
+    import asyncio
+
+    clock = FakeClock()
+    async with oauth_app(store, clock) as (setup, http):
+        attacker = await register(http, client_name="attacker")
+        oauth_mod.unlock_sign_in(store, clock=clock)
+        oauth_mod.rotate_pairing_code(store)  # e.g. `serve --auth oauth` restarted
+        assert oauth_mod.oauth_status(store)["unlock_until"]  # the window is still recorded ...
+        browsers = [browser(http) for _ in range(5)]
+        try:
+            forms = [(b, (await open_consent(b, attacker, pkce()[1]))[1]) for b in browsers]
+            responses = await asyncio.gather(*(submit(b, f, "ZZZZ-ZZZZ") for b, f in forms for _ in range(4)))
+        finally:
+            for b in browsers:
+                await b.aclose()
+        statuses = [r.status_code for r in responses]
+        wrong_checked = sum(1 for r in responses if r.status_code == 400 and "not right" in r.text)
+        assert wrong_checked == oauth_mod.ATTEMPT_LIMIT, statuses  # ... but it no longer lifts the limit
+        assert statuses.count(429) == len(responses) - oauth_mod.ATTEMPT_LIMIT, statuses
+        _, fields = await open_consent(http, attacker, pkce()[1])
+        assert (await submit(http, fields, pairing_code(store))).status_code == 429  # not even checked
+        assert oauth_mod.oauth_status(store)["locked_until"]
+        # the owner's way out still works: a new unlock gives a new long code
+        code = oauth_mod.unlock_sign_in(store, clock=clock)
+        assert (await submit(http, fields, code)).status_code == 303
+
+
+@pytest.mark.asyncio
+async def test_concurrent_guesses_cannot_pass_the_limit(store):
+    """Finding 4: the limit is checked and counted in one step, so a burst of concurrent guesses gets
+    at most ATTEMPT_LIMIT codes checked (the right one among them is refused like the others)."""
+    import asyncio
+
+    clock = FakeClock()
+    async with oauth_app(store, clock) as (setup, http):
+        client = await register(http)
+        browsers = [browser(http) for _ in range(12)]  # one sign-in each (the CSRF cookie is per browser)
+        forms = [(b, (await open_consent(b, client, pkce()[1]))[1]) for b in browsers]
+        right = pairing_code(store)
+        guesses = []
+        for i in range(60):
+            code = right if i == 30 else oauth_mod.new_pairing_code()
+            if i != 30 and normalize_pairing_code(code) == normalize_pairing_code(right):
+                code = "ZZZZ-ZZZZ"
+            guesses.append((*forms[i % len(forms)], code))
+        try:
+            responses = await asyncio.gather(*(submit(b, f, c) for b, f, c in guesses))
+        finally:
+            for b in browsers:
+                await b.aclose()
+        statuses = [r.status_code for r in responses]
+        wrong_checked = sum(1 for r in responses if r.status_code == 400 and "not right" in r.text)
+        assert wrong_checked <= oauth_mod.ATTEMPT_LIMIT, statuses
+        assert statuses.count(429) >= len(guesses) - oauth_mod.ATTEMPT_LIMIT - 1, statuses
+        if statuses[30] != 303:  # the right code was not among the first five: it was not even checked
+            assert statuses[30] == 429
+
+
+@pytest.mark.asyncio
+async def test_concurrent_guesses_on_one_request_respect_its_limit(store):
+    """Finding 4 (per request): a sign-in request's own limit is also counted before the await, so a
+    burst on one consent link gets at most REQUEST_ATTEMPT_LIMIT codes checked, even during an
+    unlock window (when the global limit does not count)."""
+    import asyncio
+
+    clock = FakeClock()
+    async with oauth_app(store, clock) as (setup, http):
+        client = await register(http)
+        _, fields = await open_consent(http, client, pkce()[1])
+        oauth_mod.unlock_sign_in(store, clock=clock)
+        provider = setup.provider
+        checked: list[float] = []
+        original = provider._wrong_code
+
+        async def counting(pending: Any, now: float, **kw: Any) -> None:
+            checked.append(now)
+            await original(pending, now, **kw)
+
+        provider._wrong_code = counting  # type: ignore[method-assign]
+        responses = await asyncio.gather(*(submit(http, fields, "ZZZZ-ZZZZ") for _ in range(20)))
+        assert len(checked) == oauth_mod.REQUEST_ATTEMPT_LIMIT
+        assert {r.status_code for r in responses} == {400}
+        assert any("This sign-in request is closed" in r.text for r in responses)
+        # the request is closed: the right code does nothing on it any more ...
+        assert (await submit(http, fields, pairing_code(store))).status_code == 400
+        # ... but a new sign-in works (the unlock is still on)
+        _, fresh = await open_consent(http, client, pkce()[1])
+        assert (await submit(http, fresh, pairing_code(store))).status_code == 303
+
+
+@pytest.mark.asyncio
+async def test_clients_registered_before_the_redirect_allowlist(store):
+    """Finding 6 (stored clients): redirect URIs saved by an older version that the allowlist now
+    refuses are ignored, both for sign-in and for error redirects."""
+    clock = FakeClock()
+    async with oauth_app(store, clock) as (setup, http):
+        mixed = await register(http, redirect_uris=["https://ok.example/cb"], client_name="mixed")
+        only_bad = await register(http, redirect_uris=["https://ok.example/cb2"], client_name="bad")
+        bad_uri = r"search-ms:query=x&crumb=location:\\evil.example\share"
+
+        def legacy(data: dict[str, Any]) -> None:
+            data["clients"][mixed["client_id"]]["info"]["redirect_uris"] = ["https://ok.example/cb", bad_uri]
+            data["clients"][only_bad["client_id"]]["info"]["redirect_uris"] = ["ms-officecmd:{}"]
+            data["grants"]["g"] = {"client_id": mixed["client_id"], "created_at": clock.now}
+            data["access"]["h"] = {"grant_id": "g", "expires_at": clock.now + 3600}
+
+        OAuthStore(store.root, clock=clock).mutate(legacy)
+        info = await setup.provider.get_client(mixed["client_id"])
+        assert info is not None and [str(u) for u in info.redirect_uris or []] == ["https://ok.example/cb"]
+        assert await setup.provider.get_client(only_bad["client_id"]) is None
+        assert setup.provider.trusted_redirect("https://ok.example/cb?error=x")  # approved before
+        assert not setup.provider.trusted_redirect(bad_uri + "&error=x")
+        params = {"response_type": "code", "client_id": mixed["client_id"], "redirect_uri": bad_uri,
+                  "code_challenge": pkce()[1], "code_challenge_method": "S256", "state": "s", "resource": MCP_URL}
+        refused = await http.get("/authorize?" + urlencode(params))
+        assert refused.status_code == 400 and "location" not in refused.headers
+
+
+@pytest.mark.asyncio
+async def test_authorize_flood_cannot_evict_the_owners_sign_in(store):
+    """Finding 3: consent links are signed, not stored, so no number of /authorize calls pushes the
+    owner's sign-in out; tampered, foreign and expired links are refused."""
+    clock = FakeClock()
+    async with oauth_app(store, clock) as (setup, http):
+        owner = await register(http)
+        _, fields = await open_consent(http, owner, pkce()[1])
+        attacker = await register(http, client_name="x")
+        for _ in range(300):
+            assert (await start_authorize(http, attacker, pkce()[1])).status_code == 302
+        page = await http.get(f"/oauth/consent?request={fields['request']}")
+        assert page.status_code == 200 and "Allow ChatGPT" in page.text
+
+        blob, signature = fields["request"].rsplit(".", 1)
+        forged_body = json.loads(oauth_mod._unb64(blob))
+        forged_body["r"] = "https://evil.example/cb"
+        forged = oauth_mod._b64(json.dumps(forged_body).encode()) + "." + signature
+        for bad in (forged, blob + ".x", "x" * 9000, "nonsense"):
+            assert (await http.get("/oauth/consent?" + urlencode({"request": bad}))).status_code == 400
+        other = build_oauth(store, BASE, clock=clock).provider  # another server process: another key
+        assert other.pending(fields["request"]) is None
+
+        clock.advance(oauth_mod.PENDING_TTL + 1)
+        assert (await http.get(f"/oauth/consent?request={fields['request']}")).status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_metadata_fetch_budgets(store):
+    """Finding 3: junk client_id URLs cannot use up ChatGPT's client metadata fetches."""
+    clock = FakeClock()
+    fetched: list[str] = []
+
+    async def fetcher(url: str) -> dict[str, Any]:
+        fetched.append(url)
+        if "junk" in url:
+            raise ValueError("HTTP 404")
+        return {"client_id": url, "client_name": "ChatGPT", "redirect_uris": [CHATGPT_REDIRECT_URI],
+                "token_endpoint_auth_method": "none"}
+
+    async with oauth_app(store, clock, cimd_fetcher=fetcher) as (setup, http):
+        # malformed URLs are refused before any budget is spent (and never fetched)
+        for i in range(50):
+            await start_authorize(http, {"client_id": f"https://nodots{i}/c"}, pkce()[1])
+        assert fetched == []
+        # junk on many other hosts: they share one budget, which ChatGPT's host does not use
+        for i in range(80):
+            await start_authorize(http, {"client_id": f"https://junk{i}.example/c.json"}, pkce()[1])
+        assert len(fetched) == oauth_mod.CIMD_GLOBAL_FETCHES_PER_MINUTE
+        legit = "https://chatgpt.com/oauth/profilepilot/client.json"
+        ok = await start_authorize(http, {"client_id": legit}, pkce()[1])
+        assert ok.status_code == 302 and "/oauth/consent?request=" in ok.headers["location"]
+        assert fetched[-1] == legit
+        # one other host cannot even use all of the shared budget
+        fetched.clear()
+        clock.advance(61)
+        for i in range(30):
+            await start_authorize(http, {"client_id": f"https://junk.example/c{i}.json"}, pkce()[1])
+        assert len(fetched) == oauth_mod.CIMD_FETCHES_PER_MINUTE
+        # a document that worked before is refreshed even when its host's budget is used up
+        clock.advance(oauth_mod.CIMD_CACHE_TTL + 1)
+        for i in range(40):
+            await start_authorize(http, {"client_id": f"https://chatgpt.com/junk{i}"}, pkce()[1])
+        fetched.clear()
+        assert (await start_authorize(http, {"client_id": legit}, pkce()[1])).status_code == 302
+        assert fetched == [legit]
+
+
+@pytest.mark.asyncio
+async def test_registration_budgets(store):
+    """Finding 3: junk dynamic registrations cannot block Claude's (or ChatGPT's) registration."""
+    clock = FakeClock()
+    async with oauth_app(store, clock) as (setup, http):
+        codes = []
+        for i in range(oauth_mod.MAX_REGISTRATIONS_PER_HOUR + 5):
+            response = await http.post("/register", json={"redirect_uris": [f"https://junk{i}.example/cb"],
+                                                          "client_name": f"junk{i}"})
+            codes.append(response.status_code)
+        assert codes.count(201) == oauth_mod.MAX_REGISTRATIONS_PER_HOUR and codes[-1] == 400
+        claude = await http.post("/register", json={"redirect_uris": ["https://claude.ai/api/mcp/auth_callback"],
+                                                     "client_name": "Claude"})
+        assert claude.status_code == 201, claude.text
+        assert (await http.post("/register", json={"redirect_uris": [CHATGPT_REDIRECT_URI],
+                                                   "client_name": "ChatGPT"})).status_code == 201
+        # one host cannot use up the shared budget alone either
+        clock.advance(3601)
+        same = [(await http.post("/register", json={"redirect_uris": ["https://one.example/cb"]})).status_code
+                for _ in range(oauth_mod.REGISTRATIONS_PER_HOST_PER_HOUR + 1)]
+        assert same[-1] == 400 and same.count(201) == oauth_mod.REGISTRATIONS_PER_HOST_PER_HOUR
+        assert (await http.post("/register", json={"redirect_uris": ["https://two.example/cb"]})).status_code == 201
+
+
+@pytest.mark.asyncio
+async def test_refresh_replay_gets_the_same_tokens(store):
+    """Finding 5: replaying a just-rotated refresh token never mints an independent token family."""
+    clock = FakeClock()
+    async with oauth_app(store, clock) as (setup, http):
+        client = await register(http)
+        verifier, challenge = pkce()
+        code = await authorize_code(http, store, client, challenge)
+        first = (await exchange(http, client, code, verifier)).json()
+
+        def refresh(token: str):
+            return token_request(http, client, grant_type="refresh_token", refresh_token=token)
+
+        legit = (await refresh(first["refresh_token"])).json()
+        clock.advance(10)
+        stolen = [(await refresh(first["refresh_token"])).json() for _ in range(3)]
+        assert {s["refresh_token"] for s in stolen} == {legit["refresh_token"]}
+        assert {s["access_token"] for s in stolen} == {legit["access_token"]}
+        assert all(s["expires_in"] <= ACCESS_TTL - 10 for s in stolen)
+        assert len(OAuthStore(store.root, clock=clock).read()["refresh"]) == 1  # one live family
+        raw = (store.root / "oauth.json").read_text(encoding="utf-8")
+        assert legit["refresh_token"] not in raw and first["refresh_token"] not in raw
+
+        # after the grace window the salt is gone and the first token is spent for good
+        clock.advance(oauth_mod.REFRESH_GRACE + 1)
+        stale_used = await refresh(first["refresh_token"])
+        assert stale_used.status_code == 400
+        assert all("salt" not in r for r in OAuthStore(store.root, clock=clock).read()["used_refresh"].values())
+        # ... and that reuse signed the whole connection out (both copies of the successor are dead)
+        assert (await refresh(legit["refresh_token"])).status_code == 400
+        assert (await mcp_list(http, legit["access_token"])).status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_refresh_after_both_parties_used_the_successor(store):
+    """Finding 5: whoever uses the shared successor second (after its grace window) revokes it all."""
+    clock = FakeClock()
+    async with oauth_app(store, clock) as (setup, http):
+        client = await register(http)
+        verifier, challenge = pkce()
+        first = (await exchange(http, client, await authorize_code(http, store, client, challenge), verifier)).json()
+
+        def refresh(token: str):
+            return token_request(http, client, grant_type="refresh_token", refresh_token=token)
+
+        legit = (await refresh(first["refresh_token"])).json()
+        stolen = (await refresh(first["refresh_token"])).json()  # replay within the grace window
+        attacker_next = (await refresh(stolen["refresh_token"])).json()  # the attacker moves first
+        clock.advance(oauth_mod.REFRESH_GRACE + 1)
+        assert (await refresh(legit["refresh_token"])).status_code == 400  # the owner's app comes back later
+        assert (await mcp_list(http, attacker_next["access_token"])).status_code == 401
+        assert (await refresh(attacker_next["refresh_token"])).status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_refresh_tokens_are_bound_to_the_server_url(store):
+    """Finding 9: a refresh token approved for one tunnel address does not work at another."""
+    clock = FakeClock()
+    async with oauth_app(store, clock) as (setup, http):
+        client = await register(http)
+        verifier, challenge = pkce()
+        tokens = (await exchange(http, client, await authorize_code(http, store, client, challenge), verifier)).json()
+    moved = build_oauth(store, "https://new-tunnel.example", clock=clock).provider
+    info = await moved.get_client(client["client_id"])
+    assert info is not None
+    assert await moved.load_refresh_token(info, tokens["refresh_token"]) is None
+    assert await moved.load_access_token(tokens["access_token"]) is None
+    same = build_oauth(store, BASE, clock=clock).provider
+    assert await same.load_refresh_token(info, tokens["refresh_token"]) is not None
+    assert OAuthStore(store.root, clock=clock).grants()[0]["resource"] == MCP_URL
+
+
+@pytest.mark.asyncio
+async def test_no_open_redirect(store):
+    """Finding 6: error and deny redirects only go to approved / first-party / loopback clients."""
+    clock = FakeClock()
+    async with oauth_app(store, clock) as (setup, http):
+        evil = await register(http, redirect_uris=["https://evil.example/landing"], client_name="x")
+        for scheme_uri in ("search-ms:query=x", "ms-officecmd:{}", "smb://evil.example/share"):
+            bad = await http.post("/register", json={"redirect_uris": [scheme_uri], "client_name": "x"})
+            assert bad.status_code == 400 and bad.json()["error"] in ("invalid_redirect_uri", "invalid_client_metadata")
+        params = {"response_type": "code", "client_id": evil["client_id"],
+                  "redirect_uri": "https://evil.example/landing", "code_challenge": pkce()[1],
+                  "code_challenge_method": "S256", "state": "s", "resource": "https://other.example/"}
+        refused = await http.get("/authorize?" + urlencode(params))
+        assert refused.status_code == 400 and "location" not in refused.headers
+        assert "invalid_target" in refused.text and "evil.example" not in refused.headers.get("location", "")
+        assert "frame-ancestors 'none'" in refused.headers["content-security-policy"]
+        bad_scope = await http.get("/authorize?" + urlencode({**params, "resource": MCP_URL, "scope": "admin"}))
+        assert bad_scope.status_code == 400 and "location" not in bad_scope.headers
+        assert "invalid_scope" in bad_scope.text
+
+        # "Deny" for an app the user never approved: a page, not a redirect
+        params["resource"] = MCP_URL
+        response = await http.get("/authorize?" + urlencode(params))
+        page = await http.get(response.headers["location"])
+        denied = await submit(http, consent_fields(page.text), "", action="deny")
+        assert denied.status_code == 200 and "You denied the request" in denied.text
+        assert "location" not in denied.headers
+
+        # once the user approved the client (it has a connection), its errors go back to it
+        verifier, challenge = pkce()
+        response = await http.get("/authorize?" + urlencode({**params, "code_challenge": challenge}))
+        page = await http.get(response.headers["location"])
+        approved = await submit(http, consent_fields(page.text), pairing_code(store))
+        assert approved.status_code == 303
+        code = parse_qs(urlsplit(approved.headers["location"]).query)["code"][0]
+        assert (await token_request(http, evil, grant_type="authorization_code", code=code,
+                                    redirect_uri="https://evil.example/landing",
+                                    code_verifier=verifier)).status_code == 200
+        again = await http.get("/authorize?" + urlencode({**params, "resource": "https://other.example/"}))
+        assert again.status_code == 302 and again.headers["location"].startswith("https://evil.example/landing?")
+
+        # ChatGPT (first party) always gets its errors and denials back
+        chatgpt = await register(http)
+        _, fields = await open_consent(http, chatgpt, pkce()[1])
+        assert (await submit(http, fields, "", action="deny")).status_code == 303
+
+
+def test_consent_trust_signals():
+    """Finding 11: the product badge only for exact known redirect URIs; the "did you start this"
+    warning and the request's age always; the code is only ever asked for on this page."""
+    def pending(uri: str, created: float = 1000.0) -> Any:
+        return oauth_mod.PendingAuthorization(
+            request_id="r", client_id="c", client_name="ChatGPT", redirect_uri=uri,
+            redirect_uri_provided_explicitly=True, state=None, scopes=["profilepilot"], code_challenge="c",
+            resource=MCP_URL, csrf="t", created_at=created)
+
+    exact = render_consent_page(pending(CHATGPT_REDIRECT_URI), nonce="n", now=1000.0)
+    assert '<span class="badge">ChatGPT</span>' in exact
+    assert "Only approve if you started connecting ChatGPT" in exact and "just now" in exact
+    assert "never asks for it anywhere else" in exact
+    lookalike = render_consent_page(pending("https://chatgpt.com/share/attacker"), nonce="n", now=1000.0 + 420)
+    assert 'class="badge"' not in lookalike and "not ChatGPT or Claude" in lookalike
+    assert "7 minutes ago" in lookalike
+    with_query = render_consent_page(pending(CHATGPT_REDIRECT_URI + "?next=x"), nonce="n", now=1000.0)
+    assert 'class="badge"' not in with_query
+    claude = render_consent_page(pending("https://claude.ai/api/mcp/auth_callback"), nonce="n", now=1000.0)
+    assert '<span class="badge">Claude</span>' in claude
+
+
+@pytest.mark.asyncio
+async def test_metadata_fetch_connects_to_the_checked_address(monkeypatch):
+    """Minor note: the client metadata fetch connects to the address it checked (no DNS rebinding
+    between check and connect); TLS still verifies the real host name."""
+    import httpx
+
+    seen: list[httpx.Request] = []
+
+    async def resolve(host: str, port: int) -> list[str]:
+        assert host == "client.example" and port == 443
+        return ["93.184.216.34"]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"client_id": "https://client.example/c.json", "redirect_uris": []})
+
+    monkeypatch.setattr(oauth_mod, "_resolve_public", resolve)
+    document = await oauth_mod.fetch_client_metadata_document("https://client.example/c.json",
+                                                              transport=httpx.MockTransport(handler))
+    assert document["client_id"] == "https://client.example/c.json"
+    request = seen[0]
+    assert request.url.host == "93.184.216.34" and request.url.path == "/c.json"
+    assert request.headers["host"] == "client.example"
+    assert request.extensions["sni_hostname"] == "client.example"
+
+    def private(*_a: Any, **_k: Any) -> list[Any]:
+        return [(2, 1, 6, "", ("93.184.216.34", 443)), (2, 1, 6, "", ("10.0.0.5", 443))]
+
+    monkeypatch.undo()
+    monkeypatch.setattr(oauth_mod.socket, "getaddrinfo", private)
+    with pytest.raises(ValueError, match="private"):
+        await oauth_mod._resolve_public("client.example", 443)
+
+
+def test_serve_rotates_the_code_and_hides_it_from_logs(store):
+    """Finding 12: `serve --auth oauth` makes a new pairing code at start, and the banner only shows
+    it on an interactive terminal."""
+    import io
+
+    from profilepilot.server import http as http_mod
+
+    before = pairing_code(store)
+    plan = http_mod.build_http_app(store=store, auth="oauth", public_hosts=["tunnel.example"], log_level="WARNING")
+    now = pairing_code(store)
+    assert now != before
+    assert now in http_mod.describe_plan(plan)
+    hidden = http_mod.describe_plan(plan, show_pairing_code=False)
+    assert now not in hidden and "connect status" in hidden
+    assert http_mod._is_terminal(io.StringIO()) is False
+    assert http_mod._is_terminal(None) is False

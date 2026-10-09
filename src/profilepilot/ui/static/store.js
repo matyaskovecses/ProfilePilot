@@ -22,16 +22,29 @@ export const state = {
   chatgpt: null,
   trash: null,
   meta: null,
-  proxyTest: null, // {job, done, total, finished}
+  proxyTest: null, // {job, done, total, finished, cancelled}
+  proxyTesting: new Set(), // ids of the proxies a running test job has not reported yet
   pending: new Map(), // profile id -> "starting" | "stopping" | ...
   aiActive: new Map(), // profile id -> {ts, tool, summary} of the AI's latest tool call
 };
 
 export const AI_ACTIVE_MS = 8000;
 
+/** Where secrets are kept, for copy like "Passwords go to …". */
+export function secretPlace() {
+  if (state.secretsBackend === "keyring") return "your OS keychain";
+  return state.platform === "win32" ? "an encrypted file in your data folder" : "a private file in your data folder";
+}
+
+/** Short label of the secret store for the Settings badge. */
+export function secretStoreLabel() {
+  if (state.secretsBackend === "keyring") return "OS keychain";
+  return state.platform === "win32" ? "Encrypted file" : "Private file";
+}
+
 /** Remember that the AI just used a profile (cards show "AI working" for a few seconds). */
 export function markAiActive(event) {
-  if (!event || !event.profile_id || event.source === "ui" || event.source === "cli") return;
+  if (!event || !event.profile_id || event.source === "ui" || event.source === "cli" || event.blocked) return;
   state.aiActive.set(event.profile_id, { ts: Date.now(), tool: event.tool, summary: event.summary, client: event.client });
   setTimeout(() => notify("profiles"), AI_ACTIVE_MS + 50);
 }
@@ -134,6 +147,26 @@ export async function loadChatGPT() {
   notify("chatgpt");
 }
 
+// ------------------------------------------------------------------ proxy tests
+
+/** A test job started (by this window, a toast, or another window): mark its rows "Testing". */
+export function proxyTestStarted(job) {
+  if (!job) return;
+  state.proxyTest = { job: job.job, done: job.done || 0, total: job.total, finished: false };
+  for (const id of job.ids || []) state.proxyTesting.add(id);
+  notify("proxy-test", "proxies");
+}
+
+export async function startProxyTest(ids) {
+  const job = await api.post("/api/proxies/test", ids && ids.length ? { ids } : {});
+  proxyTestStarted(job);
+  return job;
+}
+
+export async function cancelProxyTest() {
+  await api.del("/api/proxies/test");
+}
+
 // ------------------------------------------------------------------ profile updates
 
 export function upsertProfile(view) {
@@ -160,8 +193,26 @@ function syncHelpFromProfiles() {
   state.help = help;
 }
 
+const byName = (a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
+
 export function profileList() {
-  return [...state.profiles.values()].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
+  return [...state.profiles.values()].sort(byName);
+}
+
+/** Sort rank: what needs the user first (help, then their own pause), then running, crashed, stopped. */
+export function profileRank(p) {
+  const control = p.control || {};
+  if (control.help && control.help.length) return 0;
+  if (control.paused) return 1;
+  const runtime = state.pending.get(p.id) || p.state;
+  if (runtime === "running" || runtime === "starting" || runtime === "stopping") return 2;
+  if (runtime === "crashed") return 3;
+  return 4;
+}
+
+/** The profiles grid order: by {@link profileRank}, then by name. */
+export function profilesByPriority() {
+  return [...state.profiles.values()].sort((a, b) => profileRank(a) - profileRank(b) || byName(a, b));
 }
 
 /** The status shown to the user, combining the runtime state and the control state. */
@@ -177,6 +228,26 @@ export function displayStatus(p) {
 
 export function proxyById(id) {
   return state.proxies.find((p) => p.id === id) || null;
+}
+
+/** Is `name` just the proxy's address (the default name of an unnamed proxy)? */
+export function isAddressName(p) {
+  const address = `${p.host}:${p.port}`;
+  return !p.name || p.name === address || p.name.startsWith(`${address}#`);
+}
+
+/** Where a tested proxy exits: "Frankfurt am Main" (the country code is shown as a badge). */
+export function proxyPlace(check) {
+  if (!check || !check.ok) return "";
+  return check.city || check.region || check.country || "";
+}
+
+/** A readable proxy name: its own name, or for an unnamed one the place it exits from, else its host. */
+export function proxyLabel(p) {
+  if (!p) return "";
+  if (!isAddressName(p)) return p.name;
+  const check = p.last_check || (p.ok ? { ok: p.ok, city: p.city, country_code: p.country_code } : null);
+  return proxyPlace(check) || p.host || p.name;
 }
 
 // ------------------------------------------------------------------ actions
@@ -228,6 +299,12 @@ export const actions = {
     }
     return result;
   },
+  /** Start a stopped profile in a normal window (if needed) and bring its window up. */
+  async openWindow(id) {
+    const p = state.profiles.get(id);
+    if (!p || p.state !== "running") await actions.start(id, "normal");
+    return actions.focus(id);
+  },
   async takeControl(id) {
     const p = state.profiles.get(id);
     const result = await guarded(api.post(`/api/profiles/${enc(id)}/pause`, { note: "" }));
@@ -253,9 +330,20 @@ export const actions = {
   },
   async deleteProfile(id) {
     const p = state.profiles.get(id);
-    const result = await guarded(api.del(`/api/profiles/${enc(id)}`), `"${p ? p.name : id}" was moved to the trash.`);
+    const result = await guarded(api.del(`/api/profiles/${enc(id)}`));
     removeProfile(id);
+    toast(`"${p ? p.name : id}" was moved to the trash.`, {
+      kind: "success", timeout: 6000,
+      action: { label: "Undo", onClick: () => actions.restore(result.trash_id).catch(() => {}) },
+    });
     return result;
+  },
+  async restore(trashId) {
+    const view = await guarded(api.post(`/api/trash/${enc(trashId)}/restore`));
+    upsertProfile(view);
+    if (state.trash) loadTrash().catch(() => {});
+    toast(`Restored "${view.name}".`, { kind: "success" });
+    return view;
   },
 };
 

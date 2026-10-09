@@ -509,17 +509,20 @@ def tool_guard(fn: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
 
     @functools.wraps(fn)
     async def wrapper(*args: Any, **kwargs: Any) -> T:
-        from .tools_control import enforce_pause, log_activity  # lazy: tools_control imports .app
+        # lazy: tools_control imports .app
+        from .tools_control import enforce_pause, is_pause_refusal, log_activity, run_unless_paused
 
         started = time.perf_counter()
         ctx = kwargs.get("ctx")
         try:
             await enforce_pause(ctx, fn.__name__, kwargs)
-            result = await fn(*args, **kwargs)
+            # A pause that starts while a page tool runs (the user took control) stops the call.
+            result = await run_unless_paused(ctx, fn.__name__, kwargs, lambda: fn(*args, **kwargs))
         except Exception as exc:  # cancellation (a BaseException) passes through untouched
-            crash = await _crash_instead(exc, kwargs)
+            blocked = is_pause_refusal(exc)
+            crash = None if blocked else await _crash_instead(exc, kwargs)
             error = to_tool_error(crash or exc, fn.__name__)
-            await log_activity(ctx, fn.__name__, kwargs, ok=False, result=error, started=started)
+            await log_activity(ctx, fn.__name__, kwargs, ok=False, result=error, started=started, blocked=blocked)
             raise error from None
         await log_activity(ctx, fn.__name__, kwargs, ok=True, result=result, started=started)
         return result

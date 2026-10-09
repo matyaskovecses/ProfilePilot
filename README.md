@@ -132,6 +132,9 @@ Not everything can be automated. `profilepilot ui` opens **ProfilePilot Manager*
 
 The Manager listens on 127.0.0.1 only, requires a one-time code from its launcher, and never shows stored
 secrets. The same controls are on the command line: `profilepilot profile pause|resume`, `profilepilot help list|resolve`.
+A paused profile is off-limits everywhere, not just to the AI's tools: the Python client, Scrapling sessions
+and the CLI's `start`, `stop`, `delete`, proxy changes and `stop-all` leave it alone until you hand it back
+(your own scripts can pass `ignore_pause=True`, the CLI `--ignore-pause`).
 
 ## Use with ChatGPT
 
@@ -196,6 +199,25 @@ profilepilot identity allow "Jane" https://shop.example.com
 - `form_detect` lists a page's fields, including those in cross-origin iframes such as Stripe's card fields.
 - `form_autofill` fills text fields, selects, dates, radios, and split phone, SSN and card fields.
 - `form_autofill_sensitive` fills card, SSN and password fields. It needs your approval for every call and only works on allow-listed sites. Card fields can also go into known payment processors' iframes.
+- `autofill_sources` lists where details can come from, including the addresses you already saved in Chrome, Edge or Brave.
+
+**Use what your browser already knows.** `form_autofill` can fill from the addresses saved in your own
+browser ("Addresses and more"): `identity="chrome"` takes the active Chrome profile, and
+`chrome:edge` or `chrome:chrome/Profile 1` pick another one. A profile with no linked identity uses
+them by itself (turn that off in Settings or with `autofill_from_browser` in the config). Only
+names, email, phone, company and address are read, live and read-only; saved cards, passwords and
+form history are never opened, and the AI sees each address only as a name and a city.
+
+```bash
+profilepilot identity sources
+```
+
+```bash
+profilepilot identity connect-chrome "Jane" --source chrome --address 1
+```
+
+An identity linked this way takes its details from the browser at fill time; values you set on the
+identity itself win.
 
 Hidden or covered fields are never filled, nothing is submitted for you, and tool output never
 contains the values.
@@ -246,7 +268,7 @@ More recipes (spiders, cookie write-back) are in [docs/SCRAPLING.md](docs/SCRAPL
 | Human handoff | `profile_request_help` (asks you in the Manager and pauses the profile), `profiles_dashboard` (interactive panel in ChatGPT/Claude) |
 | Proxies | `proxy_list`, `proxy_add` (many at once), `proxy_remove`, `proxy_test` |
 | Browser | `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_paste`, `browser_press_key`, `browser_select_option`, `browser_hover`, `browser_scroll`, `browser_wait_for`, `browser_screenshot`, `browser_read`, `browser_extract`, `browser_evaluate`, `browser_tabs` |
-| Identities & forms | `identity_list`, `identity_show`, `identity_create`, `identity_update`, `form_detect`, `form_autofill`, `form_autofill_sensitive` |
+| Identities & forms | `identity_list`, `identity_show`, `identity_create`, `identity_update`, `form_detect`, `form_autofill`, `form_autofill_sensitive`, `autofill_sources` |
 | Data | `cookies_get`, `cookies_set`, `cookies_clear`, `cookies_export`, `cookies_import`, `http_fetch` |
 | ShardX (optional) | `shardx_status`, `shardx_profiles`, `shardx_start`, `shardx_stop`; any browser tool also takes `profile="shardx:<name>"` |
 

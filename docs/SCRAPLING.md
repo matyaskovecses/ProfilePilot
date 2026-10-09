@@ -38,6 +38,11 @@ tabs they opened themselves. The user's window, tabs and cookies are left as the
 is needed and is not running yet, it is started. Pass `autostart=False` to get an error instead.
 Sessions never stop the profile: call `ProfilePilot().stop(ref)` yourself when you are done.
 
+While you have taken control of a profile in ProfilePilot Manager (or it waits for your help after the
+AI asked for it), sessions and `ProfilePilot()` refuse to drive it, start, stop or re-route it: they
+raise `ProfilePausedError` until you hand it back. Your own scripts can opt out with
+`ProfilePilot(ignore_pause=True)` (pass it as `pilot=`); never give that to an agent.
+
 ## 0. Create a profile and start it
 
 ```python

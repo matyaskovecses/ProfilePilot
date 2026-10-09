@@ -276,3 +276,43 @@ and `tests/test_cli.py`. Choices the text above leaves open:
   that used the identity. `profile clone` copies the identity link, unless the identity no longer
   exists. `serve --allow-sensitive-autofill` is only accepted with `--http`, and the HTTP startup
   banner says whether sensitive autofill is on.
+
+## 9. Browser-saved addresses (`src/profilepilot/chrome_autofill.py`)
+
+Users already keep their name, email, phone and address in their browser ("Addresses and more").
+Autofill can use them without copying them anywhere.
+
+- **Where:** each Chromium profile's `Web Data` SQLite file, tables `addresses` (one row per
+  address: `guid`, `use_count`, `use_date`, `record_type`, `label`) and `address_type_tokens` (one
+  row per field: `type` = Chromium `FieldType`). Verified on Chrome 154 (schema version 154). Mapped
+  types: 3/4/5/7 names, 9 email, 14 phone, 60 company, 77 street address (lines split into `street`
+  and `address_line2`), 33 city, 34 state, 35 ZIP, 36 country (ISO-2, plus the derived country
+  name). Values that do not validate as identity values are dropped.
+- **Never read:** `credit_cards`, `masked_*`, IBANs, `autofill` (form history), `Login Data`, and
+  Chrome's "Autofill AI" entities (passport, licence, national ID). Chrome stores no SSN. The
+  connection is `file:...?mode=ro&immutable=1` (no lock, nothing written, works while the browser
+  runs; a torn read is retried) with an authorizer that only allows `SELECT` reads of the two address
+  tables, so even a bug in a query could not reach card or form-history rows.
+- **Sources:** `chrome` (the last-used profile of the first installed browser: Chrome, Edge, Brave,
+  Chromium, then the Beta/Dev/Canary channels; no Opera or Vivaldi), `chrome:<browser>`,
+  `chrome:<browser>/<folder or display name>`, and `profile` (the ProfilePilot profile's own
+  `udd/Default`, addresses the user saved in that window). Profiles come from `Local State`
+  (`profile.info_cache`, `profile.last_used`).
+- **Tools:** `form_autofill(identity=<source>, address=<n>)`; `autofill_sources(profile?)` (read-only;
+  each address as name and locality only). Without a linked or named identity, `form_autofill` tries
+  `profile`, then `chrome` (`AppConfig.autofill_from_browser`, default true). A named identity that
+  does not exist is an error, never a silent fallback. `form_autofill_sensitive` refuses browser
+  sources.
+- **Linked identities:** `IdentityStore.connect_chrome(identity, source, address)` stores only the
+  link (`chrome_source`, and `chrome_address` = the address GUID when one was picked; picking one
+  pins the browser profile). `fill_values` reads the browser at fill time and merges with
+  `merge_live`: the identity's own values win, and a name or address part set on the identity
+  replaces the browser's whole name or address. A missing browser profile only yields a note.
+  `masked()` adds `chrome: {source, address (summary), fields_from_chrome}`; `identity_show` lists
+  those field names, not their values.
+- **CLI:** `identity sources`, `identity connect-chrome NAME [--source] [--address] [--create]`,
+  `identity disconnect-chrome NAME`, `identity import-chrome NAME [--source] [--address]` (a
+  snapshot copy instead of a live link).
+- **Tests:** `tests/test_chrome_autofill.py` builds `Web Data` files in the 154 schema (with card and
+  form-history rows that must stay unread); `tests/conftest.py` points discovery at nothing for every
+  other test, so no test reads the user's real browsers.

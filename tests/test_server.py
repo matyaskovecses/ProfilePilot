@@ -41,7 +41,7 @@ BROWSER_TOOLS = {
 }
 DATA_TOOLS = {"cookies_get", "cookies_set", "cookies_clear", "cookies_export", "cookies_import", "http_fetch"}
 IDENTITY_TOOLS = {"identity_list", "identity_show", "identity_create", "identity_update", "form_detect",
-                  "form_autofill", "form_autofill_sensitive"}
+                  "form_autofill", "form_autofill_sensitive", "autofill_sources"}
 SHARDX_TOOLS = {"shardx_status", "shardx_profiles", "shardx_start", "shardx_stop"}
 
 SECRET = "Sup3r-S3cret!pw"

@@ -192,8 +192,10 @@ def build_http_app(
     elif auth == "oauth":
         from .oauth import build_oauth, public_base_url
 
-        # issuer = https://<first public host>; without one http://127.0.0.1:<port> (local clients only)
-        oauth_setup = build_oauth(store, public_base_url(host, port, publics), mcp_path=base_path)
+        # issuer = https://<first public host>; without one http://127.0.0.1:<port> (local clients only).
+        # A new pairing code on every start: a code seen earlier (a log, a screenshot) dies with a restart.
+        oauth_setup = build_oauth(store, public_base_url(host, port, publics), mcp_path=base_path,
+                                  rotate_code=True)
         auth_settings = oauth_setup.settings
     else:  # secret-path
         endpoint = f"{base_path}/{path_secret(store, rotate=new_secret)}"
@@ -220,15 +222,18 @@ def build_http_app(
                     oauth=oauth_setup)
 
 
-def describe_plan(plan: HttpPlan) -> str:
-    """Human-readable startup banner (contains the secret URL / generated token: show once)."""
+def describe_plan(plan: HttpPlan, *, show_pairing_code: bool = True) -> str:
+    """Human-readable startup banner (contains the secret URL / generated token: show once).
+
+    ``show_pairing_code=False`` leaves the OAuth pairing code out (``serve_http`` does that when
+    stderr is not a terminal, e.g. redirected to a log file)."""
     lines = [f"ProfilePilot MCP server (Streamable HTTP) listening on {plan.host}:{plan.port}"]
     if plan.auth == "secret-path":
         lines.append("Auth: secret path. Treat these URLs like passwords:")
     elif plan.auth == "token":
         lines.append("Auth: bearer token (send 'Authorization: Bearer <token>').")
     elif plan.auth == "oauth":
-        lines += plan.oauth.describe()
+        lines += plan.oauth.describe(show_code=show_pairing_code)
         if not any(u.startswith("https://") for u in plan.urls):
             lines.append("No --public-host: only local clients can sign in. For ChatGPT run "
                          "'profilepilot connect chatgpt'.")
@@ -245,6 +250,13 @@ def describe_plan(plan: HttpPlan) -> str:
         lines.append("Sensitive autofill (card, SSN, password) is off for remote clients "
                      "(--allow-sensitive-autofill enables it).")
     return "\n".join(lines)
+
+
+def _is_terminal(stream: Any) -> bool:
+    try:
+        return bool(stream is not None and stream.isatty())
+    except (AttributeError, ValueError, OSError):
+        return False
 
 
 def serve_http(
@@ -266,7 +278,9 @@ def serve_http(
     """Run the remote MCP server until interrupted (blocking).
 
     ``announce`` receives the startup banner with the endpoint URL(s); by default it is written to
-    stderr. It contains the secret path / generated token and is shown exactly once.
+    stderr. It contains the secret path / generated token and is shown exactly once. The OAuth
+    pairing code is only included when stderr is an interactive terminal (never in a log file or a
+    parent process's pipe; ``profilepilot connect status`` shows it).
     """
     import anyio
     import uvicorn
@@ -276,11 +290,10 @@ def serve_http(
         allow_private=allow_private, i_understand=i_understand, new_secret=new_secret, root=root,
         log_level=log_level, allow_sensitive_autofill=allow_sensitive_autofill,
     )
-    banner = describe_plan(plan)
     if announce is not None:
-        announce(banner)
+        announce(describe_plan(plan))
     else:
-        sys.stderr.write(banner + "\n")
+        sys.stderr.write(describe_plan(plan, show_pairing_code=_is_terminal(sys.stderr)) + "\n")
         sys.stderr.flush()
     config = uvicorn.Config(
         plan.app, host=host, port=int(port), log_level="warning", access_log=False, lifespan="on",
