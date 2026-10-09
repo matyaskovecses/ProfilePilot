@@ -27,8 +27,8 @@ from profilepilot.install import InstallError, Locations
 ROOT = Path(__file__).resolve().parent.parent
 # A native interpreter path for this OS (spaces on purpose; backslashes on Windows). The installer
 # resolves paths in the running OS's own form, so a Windows path is not "absolute" on Linux/macOS.
-PY = (r"C:\Users\Test User\pp\.venv\Scripts\python.exe" if sys.platform == "win32"
-      else "/opt/Test User/pp/.venv/bin/python")
+WIN_PY = r"C:\Users\Test User\pp\.venv\Scripts\python.exe"
+PY = WIN_PY if sys.platform == "win32" else "/opt/Test User/pp/.venv/bin/python"
 
 
 @pytest.fixture(autouse=True)
@@ -270,7 +270,8 @@ def test_codex_append_preserves_every_byte(loc):
     report = install.register("codex", python=PY, locations=loc)
     new = cfg.read_text(encoding="utf-8")
     assert new.startswith(CODEX_ORIGINAL + "\n[mcp_servers.profilepilot]\n")
-    assert f"command = '{PY}'" in new  # literal string: Windows backslashes need no escaping
+    # a literal string for Windows paths (backslashes need no escaping), a basic string otherwise
+    assert f"command = {install._toml_str(PY)}" in new
     doc = tomllib.loads(new)
     entry = doc["mcp_servers"]["profilepilot"]
     assert entry == {
@@ -317,7 +318,7 @@ def test_codex_replace_in_place_keeps_user_settings(loc):
     new = cfg.read_text(encoding="utf-8")
     expected_block = (
         "[mcp_servers.profilepilot]\n"
-        f"command = '{PY}'\n"
+        f"command = {install._toml_str(PY)}\n"
         'args = ["-m", "profilepilot", "serve"]\n'
         "startup_timeout_sec = 120\n"  # user's larger value kept
         "tool_timeout_sec = 180\n"  # raised to our minimum
@@ -434,6 +435,7 @@ def test_claude_code_cli_failure_raises(loc, tmp_path):
 
 
 def test_snippets_for_every_client():
+    PY = WIN_PY  # this test renders the *Windows* snippets, whatever OS runs it
     snips = install.snippets(PY, env={}, platform="win32")
     assert set(snips) >= {"claude-desktop", "claude-code", "claude-code-plugin", "codex", "cursor", "chatgpt"}
     assert json.loads(snips["claude-desktop"])["mcpServers"]["profilepilot"]["command"] == PY

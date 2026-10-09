@@ -114,8 +114,15 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
     def log_message(self, *a):
         pass
+class QuickServer(HTTPServer):
+    def server_bind(self):
+        # HTTPServer.server_bind calls socket.getfqdn(), a reverse DNS lookup that can stall for
+        # 30+ s on macOS CI runners (longer than the wizard's readiness timeout). Skip it.
+        import socketserver
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = "127.0.0.1", self.server_address[1]
 print("fake ProfilePilot server ready", flush=True)
-HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+QuickServer(("127.0.0.1", port), Handler).serve_forever()
 '''
 
 
