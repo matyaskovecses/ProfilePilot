@@ -156,6 +156,15 @@ async def wait_for_devtools(
         await asyncio.sleep(0.1)
 
 
+def _quiet_connection_resets(loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+    """Peers (Chrome, proxies) resetting relay sockets are routine: log them at DEBUG, not as
+    ERROR tracebacks from the proactor's ``_call_connection_lost``."""
+    if isinstance(context.get("exception"), (ConnectionResetError, ConnectionAbortedError)):
+        log.debug("connection reset by peer: %s", context.get("message"))
+        return
+    loop.default_exception_handler(context)
+
+
 def _setup_logging(path: Path) -> logging.Handler:
     path.parent.mkdir(parents=True, exist_ok=True)
     handler = logging.handlers.RotatingFileHandler(path, maxBytes=LOG_MAX_BYTES, backupCount=1, encoding="utf-8")
@@ -197,6 +206,7 @@ class ProfileHost:
     async def run(self) -> int:
         started = time.monotonic()
         self._install_signal_handlers()
+        asyncio.get_running_loop().set_exception_handler(_quiet_connection_resets)
         if put_self_in_kill_on_close_job() is None and _WINDOWS:
             log.warning("running without a kill-on-close job: Chrome may outlive a crashed host")
         try:
@@ -475,6 +485,7 @@ class ProfileHost:
                     # The parser's message may echo the URL (credentials): never return it.
                     raise ControlError(400, "Invalid proxy URL.") from None
         self.relay.upstream = endpoint
+        self.relay.stats.last_error = None  # never blame the new upstream for the old one's failure
         self.info.proxy_id = proxy_id
         self.info.upstream = endpoint.redacted() if endpoint else None
         self._write_info()

@@ -228,10 +228,12 @@ def cdp_browser_close(ws_url: str, timeout: float = 5.0) -> bool:
     Chrome flushes cookies and session state and exits cleanly (``exit_type = Normal``). The
     connection usually drops before the reply arrives; that still counts as success.
     """
-    from websockets.exceptions import ConnectionClosed
-    from websockets.sync.client import connect
-
     try:
+        # Imported here so that a broken or too old ``websockets`` install (``proxy=`` needs 15+)
+        # only costs the graceful close: callers fall back to WM_CLOSE / killing the browser.
+        from websockets.exceptions import ConnectionClosed
+        from websockets.sync.client import connect
+
         with connect(ws_url, proxy=None, open_timeout=timeout, close_timeout=1, max_size=None) as conn:
             conn.send(json.dumps({"id": 1, "method": "Browser.close"}))
             try:
@@ -242,16 +244,16 @@ def cdp_browser_close(ws_url: str, timeout: float = 5.0) -> bool:
             except (ConnectionClosed, TimeoutError):
                 return True
     except Exception as exc:  # unreachable / handshake refused / invalid URL
-        log.debug("Browser.close via %s failed: %s", ws_url, exc)
+        log.warning("Browser.close via %s failed: %s", ws_url, exc)
         return False
 
 
 async def async_cdp_browser_close(ws_url: str, timeout: float = 5.0) -> bool:
     """Async variant of :func:`cdp_browser_close`."""
-    from websockets.asyncio.client import connect
-    from websockets.exceptions import ConnectionClosed
-
     try:
+        from websockets.asyncio.client import connect
+        from websockets.exceptions import ConnectionClosed
+
         async with connect(ws_url, proxy=None, open_timeout=timeout, close_timeout=1, max_size=None) as conn:
             await conn.send(json.dumps({"id": 1, "method": "Browser.close"}))
             try:
@@ -262,5 +264,5 @@ async def async_cdp_browser_close(ws_url: str, timeout: float = 5.0) -> bool:
             except (ConnectionClosed, asyncio.TimeoutError):
                 return True
     except Exception as exc:
-        log.debug("Browser.close via %s failed: %s", ws_url, exc)
+        log.warning("Browser.close via %s failed: %s", ws_url, exc)
         return False

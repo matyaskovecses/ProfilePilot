@@ -169,8 +169,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
             raise CliError("--public-host/--auth/--token/--allow-private-network need --http.")
         from .server.app import serve_stdio
 
-        serve_stdio(args.home, log_level=args.log_level)
+        serve_stdio(args.home, log_level=args.log_level, files_anywhere=args.files_anywhere)
         return 0
+    if args.files_anywhere:
+        raise CliError("--files-anywhere is only available for the stdio server (remote clients never get it).")
     from .server.http import serve_http
 
     token = args.token
@@ -759,6 +761,9 @@ def build_parser() -> argparse.ArgumentParser:
                                                  "default PROFILEPILOT_TOKEN or a generated one)")
     p.add_argument("--allow-private-network", action="store_true",
                    help="let remote clients open localhost / private-network URLs")
+    p.add_argument("--files-anywhere", action="store_true",
+                   help="stdio only: let cookies_export / cookies_import use any folder, not just the "
+                        "profiles' exports folders")
     p.add_argument("--i-understand", action="store_true", help="confirm --auth none on a loopback host")
     p.add_argument("--new-secret", action="store_true", help="rotate the secret path")
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])

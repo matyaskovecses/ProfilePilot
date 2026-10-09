@@ -105,3 +105,79 @@ async def test_direct_mode_without_upstream():
             assert b"echo /hello" in await _get_via_socks(relay.port, "127.0.0.1", origin.port)
     finally:
         await relay.stop()
+
+
+class _SilentServer:
+    """TCP server that accepts connections and never sends or closes anything."""
+
+    def __init__(self) -> None:
+        self._server: asyncio.base_events.Server | None = None
+        self.writers: list[asyncio.StreamWriter] = []
+
+    async def start(self) -> "_SilentServer":
+        async def handle(reader, writer):
+            self.writers.append(writer)
+            await asyncio.Event().wait()
+
+        self._server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        return self
+
+    @property
+    def port(self) -> int:
+        assert self._server is not None
+        return self._server.sockets[0].getsockname()[1]
+
+    async def stop(self) -> None:
+        for w in self.writers:
+            w.close()
+        assert self._server is not None
+        self._server.close()
+
+
+async def _open_tunnel(relay_port: int, port: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    reader, writer = await asyncio.open_connection("127.0.0.1", relay_port)
+    writer.write(f"CONNECT 127.0.0.1:{port} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+    await writer.drain()
+    assert b" 200 " in await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
+    return reader, writer
+
+
+async def test_half_closed_tunnel_is_torn_down_after_the_grace_period():
+    silent = await _SilentServer().start()
+    relay = LocalRelay(None, half_close_grace=0.3)
+    await relay.start()
+    try:
+        _reader, writer = await _open_tunnel(relay.port, silent.port)
+        assert relay.stats.connections_active == 1
+        writer.close()  # the browser side goes away; the upstream never closes
+        for _ in range(100):
+            if relay.stats.connections_active == 0:
+                break
+            await asyncio.sleep(0.05)
+        assert relay.stats.connections_active == 0 and not relay._tasks
+    finally:
+        await relay.stop()
+        await silent.stop()
+
+
+async def test_stop_does_not_wait_for_open_tunnels_like_python_3_12_wait_closed():
+    silent = await _SilentServer().start()
+    relay = LocalRelay(None)
+    await relay.start()
+    server = relay._server
+    assert server is not None
+
+    async def wait_closed_3_12():  # CPython >= 3.12.1 waits for every active connection
+        while relay.stats.connections_active:
+            await asyncio.sleep(0.05)
+
+    server.wait_closed = wait_closed_3_12  # type: ignore[method-assign]
+    try:
+        _reader, writer = await _open_tunnel(relay.port, silent.port)
+        writer.close()  # half-closed tunnel whose upstream never closes
+        await asyncio.sleep(0.1)
+        await asyncio.wait_for(relay.stop(), 3)
+        assert relay.stats.connections_active == 0
+    finally:
+        await relay.stop()
+        await silent.stop()

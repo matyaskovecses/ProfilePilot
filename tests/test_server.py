@@ -284,6 +284,17 @@ async def test_remote_mode_blocks_private_targets_before_starting_anything(home)
         assert "Blocked" in out
         out = await rec.call("profile_create", {"name": "q", "start_url": "http://localhost:3000"}, ok=False)
         assert "Blocked" in out
+        # Chrome reads '\' as '/' in http(s) URLs: the checked host must be the one Chrome contacts
+        sneaky = "http://127.0.0.1:8080\\@example.com/any/path?x=1"
+        for url in (sneaky, "127.0.0.1:8080\\@example.com/", "http:\\\\169.254.169.254\\latest"):
+            out = await rec.call("browser_navigate", {"profile": "p", "url": url}, ok=False)
+            assert "Blocked" in out, url
+        out = await rec.call("browser_tabs", {"profile": "p", "action": "new", "url": sneaky}, ok=False)
+        assert "Blocked" in out
+        out = await rec.call("profile_create", {"name": "q", "start_url": sneaky}, ok=False)
+        assert "Blocked" in out
+        out = await rec.call("profile_update", {"profile": "p", "start_url": sneaky}, ok=False)
+        assert "Blocked" in out
     pid = home.get_profile("p").id
     assert not home.runtime_file(pid).exists()  # nothing was started for a blocked URL
 
@@ -574,10 +585,14 @@ async def test_cookie_files_roundtrip(chrome_home, tmp_path):
                 {"name": "token", "value": "v-123456", "url": origin.url + "/"},
                 {"name": "lang", "value": "de", "domain": ".example.com", "path": "/", "secure": True},
             ]})
-            exported = await rec.call("cookies_export", {"profile": "src", "path": str(tmp_path / "c.txt")})
-            assert "Exported 2 cookie(s)" in exported and "v-123456" not in exported
-            assert "v-123456" in (tmp_path / "c.txt").read_text(encoding="utf-8")
-            imported = await rec.call("cookies_import", {"profile": "dst", "path": str(tmp_path / "c.txt")})
+            # cookie files live in the exports folders (other folders need serve --files-anywhere)
+            outside = await rec.call("cookies_export", {"profile": "src", "path": str(tmp_path / "c.txt")}, ok=False)
+            assert "Blocked" in outside and not (tmp_path / "c.txt").exists()
+            exported = await rec.call("cookies_export", {"profile": "src", "path": "c.txt"})
+            src_file = store.profile_dir(store.get_profile("src").id) / "exports" / "c.txt"
+            assert "Exported 2 cookie(s)" in exported and "v-123456" not in exported and str(src_file) in exported
+            assert "v-123456" in src_file.read_text(encoding="utf-8")
+            imported = await rec.call("cookies_import", {"profile": "dst", "path": str(src_file)})
             assert "Imported 2 cookie(s)" in imported
             dst = await rec.call("cookies_get", {"profile": "dst"})
             assert '"name": "token"' in dst and '"name": "lang"' in dst

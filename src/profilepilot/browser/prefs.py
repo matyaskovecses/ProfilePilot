@@ -94,15 +94,24 @@ def profile_in_use(udd: Path) -> bool:
         os.close(fd)
         return False
 
-    singleton = udd / "SingletonLock"
+    return _singleton_lock_in_use(udd / "SingletonLock")
+
+
+def _singleton_lock_in_use(singleton: Path) -> bool:
+    """POSIX: does the ``<hostname>-<pid>`` SingletonLock symlink belong to a live process?
+
+    A PID that was created after the lock was written is a different process that reused the
+    number (the lock is stale), so it does not count."""
     try:
         target = os.readlink(singleton)
+        written = os.lstat(singleton).st_mtime
     except OSError:
         return False
     host, _, pid_text = target.rpartition("-")
     if host and host != socket.gethostname():
         return True  # locked by another machine (shared home directory): treat as in use
     try:
-        return psutil.pid_exists(int(pid_text))
-    except ValueError:
+        proc = psutil.Process(int(pid_text))
+        return proc.is_running() and proc.create_time() <= written + 2.0
+    except (ValueError, psutil.Error):
         return False

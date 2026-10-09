@@ -58,7 +58,22 @@ _LOCAL_NAMES = frozenset({"localhost", "localhost.localdomain", "ip6-localhost",
 _LOCAL_SUFFIXES = (".localhost", ".local", ".internal", ".home.arpa")
 _DOT_LIKE = str.maketrans({"。": ".", "．": ".", "｡": "."})
 _SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*:")
-_HOST_PORT_RE = re.compile(r"^(\[[0-9a-fA-F:.]+\]|[^:/?#\s]+):\d+(?:[/?#]|$)")
+_HOST_PORT_RE = re.compile(r"^(\[[0-9a-fA-F:.]+\]|[^:/?#\\\s]+):\d+(?:[/?#\\]|$)")
+_SPECIAL_RE = re.compile(r"(?is)^(https?:)([^?#]*)(.*)$")
+
+
+def whatwg_slashes(text: str) -> str:
+    r"""Treat ``\`` as ``/`` before the query/fragment of an http(s) URL, as browsers do.
+
+    The WHATWG URL standard (which Chrome follows) reads a backslash in a special-scheme URL as a
+    path separator, while :func:`urllib.parse.urlsplit` keeps it as part of the authority. Without
+    this, ``http://127.0.0.1:8080\@example.com/`` would be checked as host ``example.com`` but
+    requested from ``127.0.0.1:8080``.
+    """
+    match = _SPECIAL_RE.match(text)
+    if not match:
+        return text
+    return match.group(1) + match.group(2).replace("\\", "/") + match.group(3)
 
 
 class UrlPolicy:
@@ -110,6 +125,22 @@ class UrlPolicy:
             return
         self._check_resolved(host, (info[4][0] for info in infos))
 
+    def check_host(self, host: str, port: int) -> None:
+        """Remote mode: refuse a proxy (or other TCP) endpoint on a local / private network.
+
+        Same rules as :meth:`check` (local names, numeric IP spellings, DNS answers); a no-op when
+        private targets are allowed. Resolves DNS synchronously.
+        """
+        if not self.restricts_private:
+            return
+        self.check(_host_url(host, port))
+
+    async def acheck_host(self, host: str, port: int) -> None:
+        """Async variant of :meth:`check_host`."""
+        if not self.restricts_private:
+            return
+        await self.acheck(_host_url(host, port))
+
     def is_allowed(self, url: str) -> bool:
         try:
             self.check(url)
@@ -126,6 +157,7 @@ class UrlPolicy:
             raise PolicyError("No URL given.")
         if any(ord(ch) < 32 for ch in text):
             raise PolicyError("URL contains control characters.")
+        text = whatwg_slashes(text)  # check the host the browser will really contact
         try:
             parts = urlsplit(text)
         except ValueError as exc:
@@ -264,6 +296,15 @@ def _private_error(host: str, addr: IPAddress | None = None) -> PolicyError:
     )
 
 
+def _host_url(host: str, port: int) -> str:
+    host = (host or "").strip()
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"  # IPv6 literal
+    if not host or any(ch in host for ch in "/?#@\\") or any(ord(ch) < 33 for ch in host):
+        raise PolicyError("Invalid proxy host.")
+    return f"http://{host}:{int(port)}/"
+
+
 def _shorten(text: str, limit: int = 120) -> str:
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
@@ -277,14 +318,18 @@ def normalize_url(value: str) -> str:
     text = (value or "").strip()
     if not text:
         raise PolicyError("No URL given.")
-    if text.startswith("//"):
-        return "https:" + text
+    return whatwg_slashes(_with_scheme(text))  # the URL that is checked is the URL that is opened
+
+
+def _with_scheme(text: str) -> str:
+    if text.startswith(("//", "\\\\", "/\\", "\\/")):
+        return "https://" + text[2:]
     if _SCHEME_RE.match(text) and not _HOST_PORT_RE.match(text):
         return text
     if text.startswith("[") and "]" in text:
         host = text[1 : text.index("]")].lower()
     else:
-        host = re.split(r"[/:?#]", text, maxsplit=1)[0].lower()
+        host = re.split(r"[/:?#\\]", text, maxsplit=1)[0].lower()
     local = host in _LOCAL_NAMES or host.endswith(".localhost")
     if not local:
         try:

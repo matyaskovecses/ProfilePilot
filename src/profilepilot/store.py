@@ -26,13 +26,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-import psutil
+from filelock import FileLock, Timeout
 from pydantic import ValidationError
 
 from .errors import AmbiguousError, ConflictError, NotFoundError, ProfilePilotError, ProfileRunningError
 from .jsonio import lock_for, read_json, write_json
-from .models import AppConfig, LaunchOptions, Profile, ProxyCheck, ProxyRecord, TrashEntry, utcnow
+from .models import AppConfig, LaunchOptions, Profile, ProxyCheck, ProxyRecord, RuntimeInfo, TrashEntry, utcnow
 from .paths import data_root, is_valid_id, new_id
+from .procs import host_alive, pid_started_before
 from .proxy.url import ProxyEndpoint, parse_proxy
 from .secrets import SecretStore
 
@@ -43,6 +44,9 @@ CACHE_DIRS = {
     "optimization_guide_model_store", "Safe Browsing", "segmentation_platform", "BrowserMetrics",
 }
 RUNTIME_FILES = {"lockfile", "DevToolsActivePort", "SingletonLock", "SingletonSocket", "SingletonCookie"}
+HOST_LOCK_NAME = "host.lock"
+# Files a host process leaves in profiles/<id>/ itself (safe to discard in an orphaned folder).
+HOST_LEFTOVERS = {HOST_LOCK_NAME, "host.log", "host.log.1", "host-stderr.log", "runtime.json"}
 MAX_NAME = 64
 
 
@@ -99,8 +103,11 @@ class Store:
         return self.profile_dir(profile_id) / "host.log"
 
     def downloads_dir(self, profile_id: str) -> Path:
-        path = self.profile_dir(profile_id) / "downloads"
-        path.mkdir(parents=True, exist_ok=True)
+        base = self.profile_dir(profile_id)
+        if not base.is_dir():  # never resurrect the folder of a deleted profile (it blocks a restore)
+            raise NotFoundError(f"Profile {profile_id} no longer exists.")
+        path = base / "downloads"
+        path.mkdir(exist_ok=True)
         return path
 
     def _profile_file(self, profile_id: str) -> Path:
@@ -242,6 +249,8 @@ class Store:
 
     def touch_started(self, profile_id: str) -> None:
         path = self._profile_file(profile_id)
+        if not path.parent.is_dir():
+            return  # deleted meanwhile: lock_for() would recreate the folder and block a restore
         with lock_for(path):
             data = read_json(path)
             if data:
@@ -250,6 +259,8 @@ class Store:
 
     def add_runtime(self, profile_id: str, seconds: float) -> None:
         path = self._profile_file(profile_id)
+        if not path.parent.is_dir():
+            return  # deleted meanwhile (see touch_started)
         with lock_for(path):
             data = read_json(path)
             if data:
@@ -257,17 +268,50 @@ class Store:
                 write_json(path, data)
 
     def is_running_on_disk(self, profile_id: str) -> bool:
-        """Cheap check: a runtime.json whose host process is still alive."""
-        info = read_json(self.runtime_file(profile_id))
-        if not info:
+        """Cheap check: a runtime.json whose host process is still alive (PID-reuse safe)."""
+        path = self.runtime_file(profile_id)
+        data = read_json(path)
+        if not data or not isinstance(data, dict):
             return False
-        pid = info.get("host_pid")
-        return bool(pid) and psutil.pid_exists(int(pid))
+        try:
+            return host_alive(RuntimeInfo.model_validate(data))
+        except ValidationError:
+            # Malformed: the host wrote the file after it started, so it must predate the mtime.
+            try:
+                return pid_started_before(int(data.get("host_pid") or 0), path.stat().st_mtime)
+            except (OSError, TypeError, ValueError):
+                return False
+
+    def _ensure_not_in_use(self, profile: Profile, action: str) -> None:
+        """Refuse when anything still holds the profile: a live host (registered or not) or a
+        browser process on its user-data-dir."""
+        if self.is_running_on_disk(profile.id):
+            raise ProfileRunningError(f"Profile '{profile.name}' is running; stop it before you {action}.")
+        lock_path = self.profile_dir(profile.id) / HOST_LOCK_NAME
+        if lock_path.exists():
+            # Probe the host lock and release it at once: holding it would block the move itself.
+            lock = FileLock(str(lock_path))
+            try:
+                lock.acquire(timeout=0)
+            except Timeout:
+                raise ProfileRunningError(
+                    f"Profile '{profile.name}' is starting or stopping; try again in a moment."
+                ) from None
+            except OSError:
+                pass
+            else:
+                lock.release()
+        from .browser.prefs import profile_in_use  # lazy: keeps `import profilepilot.store` light
+
+        if profile_in_use(self.user_data_dir(profile.id)):
+            raise ProfileRunningError(
+                f"Profile '{profile.name}' is open in a browser process; close it before you {action}."
+            )
 
     def clone_profile(self, ref: str, new_name: str, *, copy_data: bool = False) -> Profile:
         src = self.get_profile(ref)
-        if copy_data and self.is_running_on_disk(src.id):
-            raise ProfileRunningError(f"Stop profile '{src.name}' before cloning its browser data.")
+        if copy_data:
+            self._ensure_not_in_use(src, "clone its browser data")
         clone = self.create_profile(
             new_name, notes=src.notes, tags=src.tags, proxy_id=src.proxy_id, browser=src.browser,
             launch=src.launch.model_copy(deep=True), color=src.color,
@@ -282,8 +326,7 @@ class Store:
         """Move a stopped profile to the trash (restorable with :meth:`restore_profile`)."""
         with self._profiles_lock:
             profile = self.get_profile(ref)
-            if self.is_running_on_disk(profile.id):
-                raise ProfileRunningError(f"Profile '{profile.name}' is running; stop it first.")
+            self._ensure_not_in_use(profile, "delete it")
             self.trash_dir.mkdir(exist_ok=True)
             stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
             trash_id = f"{profile.id}-{stamp}"
@@ -307,6 +350,12 @@ class Store:
         entries.sort(key=lambda e: e.deleted_at, reverse=True)
         return entries
 
+    def _orphaned_trash_dirs(self) -> list[Path]:
+        """``trash/*`` folders without a ``trash.json`` (left by an interrupted delete)."""
+        if not self.trash_dir.exists():
+            return []
+        return [d for d in self.trash_dir.iterdir() if d.is_dir() and not (d / "trash.json").exists()]
+
     def restore_profile(self, trash_id: str) -> Profile:
         with self._profiles_lock:
             src = self.trash_dir / trash_id
@@ -315,9 +364,23 @@ class Store:
                 raise NotFoundError(f"Trash entry '{trash_id}' not found.")
             entry = TrashEntry.model_validate(entry_data)
             pid = entry.profile_id
-            if self.profile_dir(pid).exists():
-                raise ConflictError(f"A profile with id {pid} already exists.")
-            _move_dir(src, self.profile_dir(pid))
+            target = self.profile_dir(pid)
+            if target.exists():
+                if self._profile_file(pid).exists():
+                    raise ConflictError(f"A profile with id {pid} already exists.")
+                leftovers = {p.name for p in target.iterdir()} if target.is_dir() else {"?"}
+                if leftovers - HOST_LEFTOVERS:
+                    raise ConflictError(
+                        f"Cannot restore '{entry.name}': the folder {target} is left over from an earlier "
+                        "run and still contains files. Move or delete it, then try again."
+                    )
+                _rmtree(target)  # only host logs / lock files: safe to discard
+                if target.exists():
+                    raise ConflictError(
+                        f"Cannot restore '{entry.name}': the leftover folder {target} is in use by another "
+                        "process. Close it and try again."
+                    )
+            _move_dir(src, target)
             (self.profile_dir(pid) / "trash.json").unlink(missing_ok=True)
             profile = Profile.model_validate(read_json(self._profile_file(pid)))
             taken = {p.name.casefold() for p in self.list_profiles() if p.id != pid}
@@ -336,6 +399,14 @@ class Store:
             if entry.deleted_at <= cutoff:
                 _rmtree(self.trash_dir / entry.trash_id)
                 removed += 1
+        # Folders without trash.json are invisible to list_trash / restore: never keep them.
+        orphan_cutoff = time.time() - older_than_days * 86400
+        for orphan in self._orphaned_trash_dirs():
+            try:
+                if orphan.stat().st_mtime <= orphan_cutoff:
+                    _rmtree(orphan)
+            except OSError:
+                pass
         return removed
 
     # ------------------------------------------------------------------ proxies
@@ -565,16 +636,24 @@ def _rmtree(path: Path) -> None:
 
 
 def _move_dir(src: Path, dst: Path) -> None:
+    """Rename ``src`` to ``dst`` (both inside the data root, so never across volumes).
+
+    There is deliberately no copy-and-delete fallback: when a file in ``src`` is held open, a copy
+    would succeed while the delete half-fails, leaving a profile that is neither here nor there.
+    On failure nothing is changed and a clear error is raised.
+    """
     dst.parent.mkdir(parents=True, exist_ok=True)
     for attempt in range(10):
         try:
             os.replace(src, dst)
             return
-        except PermissionError:
+        except PermissionError:  # antivirus / indexer, or a real holder: retry briefly
             if attempt == 9:
                 break
             time.sleep(0.2)
         except OSError:
             break
-    shutil.copytree(src, dst)
-    _rmtree(src)
+    raise ProfilePilotError(
+        f"Cannot move {src.name}: files in the profile folder are in use by another process (a starting/"
+        "stopping browser host, a terminal or a log viewer). Close it and try again."
+    )

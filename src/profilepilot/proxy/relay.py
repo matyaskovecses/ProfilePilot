@@ -65,6 +65,8 @@ class LocalRelay:
     upstream: ProxyEndpoint | None
     host: str = "127.0.0.1"
     connect_timeout: float = 20.0
+    half_close_grace: float = 60.0
+    """Seconds a tunnel stays open after one direction ended (a half-close) before it is torn down."""
     stats: RelayStats = field(default_factory=RelayStats)
     _server: asyncio.base_events.Server | None = field(default=None, init=False, repr=False)
     _tasks: set[asyncio.Task] = field(default_factory=set, init=False, repr=False)
@@ -90,15 +92,23 @@ class LocalRelay:
         return self.port
 
     async def stop(self) -> None:
-        if self._server is not None:
-            self._server.close()
-            with contextlib.suppress(Exception):
-                await self._server.wait_closed()
-            self._server = None
+        """Stop listening and tear down every open tunnel.
+
+        Handler tasks are cancelled *before* waiting for the server: since CPython 3.12.1
+        ``Server.wait_closed()`` waits for every active connection, so a tunnel whose peer never
+        closes would otherwise block the stop forever.
+        """
+        server, self._server = self._server, None
+        if server is not None:
+            server.close()
         for task in list(self._tasks):
-            task.cancel()
+            task.cancel()  # _handle's finally closes the client writer, detaching its transport
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
+        if server is not None:
+            with contextlib.suppress(Exception):
+                # bounded: covers connections accepted but not yet registered in _tasks
+                await asyncio.wait_for(server.wait_closed(), 2.0)
 
     async def serve_forever(self) -> None:
         if self._server is None:
@@ -301,9 +311,19 @@ class LocalRelay:
                     if dst.can_write_eof():
                         dst.write_eof()
 
+        up = asyncio.ensure_future(copy(c_reader, u_writer, True))
+        down = asyncio.ensure_future(copy(u_reader, c_writer, False))
         try:
-            await asyncio.gather(copy(c_reader, u_writer, True), copy(u_reader, c_writer, False))
+            _done, pending = await asyncio.wait({up, down}, return_when=asyncio.FIRST_COMPLETED)
+            if pending:
+                # One side finished and half-closed the other. Legitimate half-close clients get a
+                # bounded grace period; a peer that never closes must not keep the tunnel (and its
+                # sockets) alive for the relay's whole life.
+                await asyncio.wait(pending, timeout=self.half_close_grace)
         finally:
+            for task in (up, down):
+                task.cancel()
+            await asyncio.gather(up, down, return_exceptions=True)
             _close(u_writer)
 
 

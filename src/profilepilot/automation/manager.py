@@ -82,6 +82,8 @@ class ProfileSession:
         self.timezone = timezone
         self.dialogs: deque[dict[str, Any]] = deque(maxlen=20)
         """Recent JavaScript dialogs (alert/confirm/prompt/beforeunload) that were auto-answered."""
+        self.new_tabs: deque[Page] = deque(maxlen=20)
+        """Tabs opened since the last :meth:`drain_new_tabs` (popups, window.open, new tabs)."""
         self._active: Page | None = None
         self._disconnected = False
         self._browser_cdp: CDPSession | None = None
@@ -164,6 +166,7 @@ class ProfileSession:
     def _on_page(self, page: Page) -> None:
         # New tabs and popups (window.open, target=_blank) become the active tab.
         self._active = page
+        self.new_tabs.append(page)
         page.on("close", self._on_page_close)
         if self.timezone:
             self._spawn(self._apply_timezone(page))
@@ -186,6 +189,16 @@ class ProfileSession:
         items = list(self.dialogs)
         self.dialogs.clear()
         return items
+
+    def drain_new_tabs(self) -> list[Page]:
+        """Return and forget the tabs opened since the last call (still open ones only)."""
+        items = [p for p in self.new_tabs if not p.is_closed()]
+        self.new_tabs.clear()
+        return items
+
+    def is_active(self, page: Page) -> bool:
+        """Is ``page`` the tab the tools act on by default?"""
+        return self._current(self._pages()) is page
 
     async def _apply_timezone(self, page: Page) -> None:
         if page in self._tz_sessions or page.is_closed() or not self.timezone:
@@ -214,13 +227,18 @@ class ProfileSession:
             return self._active
         return pages[-1] if pages else None
 
-    async def page(self, tab: int | None = None) -> Page:
+    async def page(self, tab: int | None = None, *, interactive: bool = True) -> Page:
         """The page to act on: tab ``tab`` if given (it becomes the active tab), else the active
         tab. Opens a new tab when the browser has none.
 
-        The page is brought to the front when it is not visible: Chrome stops
-        ``requestAnimationFrame`` in background tabs, and Playwright's actionability checks
+        For ``interactive`` use the page is brought to the front when it is not visible: Chrome
+        stops ``requestAnimationFrame`` in background tabs, and Playwright's actionability checks
         (clicks, typing) wait for animation frames, so acting on a hidden tab would hang.
+
+        A *minimized* window is never restored: ``bringToFront``, ``Browser.setWindowBounds`` and
+        even ``ShowWindow(SW_SHOWNOACTIVATE)`` give Chrome the keyboard focus (verified on Windows
+        11 / Chrome 154), so the user's typing would go into the profile's window. Read-only callers
+        (``interactive=False``) work on the hidden page; interactive callers get a clear error.
         """
         self._ensure_open()
         pages = self._pages()
@@ -228,8 +246,38 @@ class ProfileSession:
         if current is None:
             current = await self.context.new_page()
         self._active = current
-        await _ensure_foreground(current)
+        await self._ensure_foreground(current, interactive=interactive)
         return current
+
+    async def _ensure_foreground(self, page: Page, *, interactive: bool = True) -> None:
+        try:
+            state = await asyncio.wait_for(page.evaluate("document.visibilityState"), TITLE_TIMEOUT)
+        except Exception:  # navigation in flight or a dialog is open: leave it alone
+            return
+        if state == "visible":
+            return
+        if await self.window_minimized(page):
+            if interactive:
+                raise ProfilePilotError(minimized_message(self.label))
+            return
+        await _bring_to_front(page)  # a background tab of a normal window: no focus change
+
+    async def window_minimized(self, page: Page) -> bool:
+        """Is the browser window holding ``page`` minimized? (CDP ``Browser.getWindowForTarget``)"""
+        try:
+            cdp = await self.context.new_cdp_session(page)
+        except PlaywrightError:
+            return False
+        try:
+            window = await cdp.send("Browser.getWindowForTarget")
+            return (window.get("bounds") or {}).get("windowState") == "minimized"
+        except PlaywrightError:
+            return False
+        finally:
+            try:
+                await cdp.detach()
+            except PlaywrightError:
+                pass
 
     async def tabs(self) -> list[dict[str, Any]]:
         """``[{index, url, title, active}]`` for every open tab."""
@@ -263,7 +311,8 @@ class ProfileSession:
         """Make tab ``index`` active and bring it to the front."""
         self._ensure_open()
         page = self._page_at(index)
-        await _bring_to_front(page)
+        if not await self.window_minimized(page):  # bringing a minimized window up would steal the focus
+            await _bring_to_front(page)
         self._active = page
         return page
 
@@ -283,7 +332,8 @@ class ProfileSession:
             remaining = self._pages()
             if remaining:
                 self._active = remaining[min(index, len(remaining) - 1)]
-                await _bring_to_front(self._active)
+                if not await self.window_minimized(self._active):  # never steal the focus
+                    await _bring_to_front(self._active)
 
     # ------------------------------------------------------------------ elements
 
@@ -554,13 +604,12 @@ async def _safe_title(page: Page) -> str:
         return ""
 
 
-async def _ensure_foreground(page: Page) -> None:
-    try:
-        state = await asyncio.wait_for(page.evaluate("document.visibilityState"), TITLE_TIMEOUT)
-    except Exception:  # navigation in flight or a dialog is open: leave it alone
-        return
-    if state != "visible":
-        await _bring_to_front(page)
+def minimized_message(label: str) -> str:
+    return (
+        f"The window of '{label}' is minimized, and restoring it would take the user's keyboard focus. Ask the "
+        "user to restore it, or use offscreen mode (profile_update window='offscreen', then profile_stop + "
+        "profile_start). Reading tools (browser_read, browser_snapshot, browser_extract, browser_navigate) still work."
+    )
 
 
 async def _bring_to_front(page: Page) -> None:

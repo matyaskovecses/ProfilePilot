@@ -16,7 +16,7 @@ from pydantic import Field
 
 from ..automation.manager import SHARDX_PREFIX
 from ..errors import ProfilePilotError
-from .app import AppState, add_tool, get_state
+from .app import DEFAULT_MAX_CHARS, AppState, MaxCharsArg, OffsetArg, add_tool, get_state, paginate_text
 
 log = logging.getLogger("profilepilot.server")
 
@@ -57,7 +57,7 @@ async def shardx_status(ctx: Context) -> str:
     return "\n".join(lines)
 
 
-async def shardx_profiles(ctx: Context) -> str:
+async def shardx_profiles(ctx: Context, max_chars: MaxCharsArg = DEFAULT_MAX_CHARS, offset: OffsetArg = 0) -> str:
     """List ShardX profiles. Use them with any browser tool as profile='shardx:<name>'."""
     client = _client(get_state(ctx))
     profiles = await client.list_profiles()
@@ -69,7 +69,7 @@ async def shardx_profiles(ctx: Context) -> str:
         if p.get("notes"):
             parts.append(f"notes: {str(p['notes'])[:120]}")
         lines.append(_redact(" | ".join(parts)))
-    return "\n".join(lines)
+    return paginate_text("\n".join(lines), offset, max_chars)
 
 
 async def shardx_start(ctx: Context, profile: ShardXProfileArg) -> str:

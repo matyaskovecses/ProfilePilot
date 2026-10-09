@@ -71,7 +71,7 @@ def _expires(value: Any) -> int | None:
     try:
         dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
-        raise CookieFormatError(f"Unrecognised cookie expiry: {text!r}") from None
+        raise CookieFormatError("Unrecognised cookie expiry.") from None  # never echo file content
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return int(dt.timestamp())
@@ -153,14 +153,18 @@ def to_playwright(cookie: Mapping[str, Any]) -> dict[str, Any]:
     return out
 
 
-def to_playwright_list(cookies: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """Convert many cookies, naming the offending entry on error."""
+def to_playwright_list(cookies: Iterable[Mapping[str, Any]], *, quiet: bool = False) -> list[dict[str, Any]]:
+    """Convert many cookies, naming the offending entry (by position) on error.
+
+    ``quiet`` drops the detail of the error (it may quote a cookie name from the input): used for
+    files, whose content must not reach a model."""
     out = []
     for i, cookie in enumerate(cookies):
         try:
             out.append(to_playwright(cookie))
         except CookieFormatError as exc:
-            raise CookieFormatError(f"Cookie #{i + 1}: {exc}") from None
+            detail = "missing or invalid name, domain or expiry" if quiet else str(exc)
+            raise CookieFormatError(f"Cookie #{i + 1}: {detail}") from None
     return out
 
 
@@ -244,9 +248,8 @@ def parse_netscape(text: str) -> list[dict[str, Any]]:
             line = line[len("#HttpOnly_"):]
         elif line.lstrip().startswith("#"):
             continue
+        # Tabs only: a whitespace fallback would turn any line of prose into a "cookie".
         fields = line.split("\t")
-        if len(fields) < 6:
-            fields = line.split(None, 6)
         if len(fields) == 6:
             fields.append("")
         if len(fields) != 7:
@@ -262,7 +265,7 @@ def parse_netscape(text: str) -> list[dict[str, Any]]:
         try:
             exp = _expires(int(expires.strip() or 0))
         except ValueError:
-            raise CookieFormatError(f"cookies.txt line {lineno}: invalid expiry {expires!r}.") from None
+            raise CookieFormatError(f"cookies.txt line {lineno}: invalid expiry.") from None  # no file content
         cookies.append({
             "domain": domain,
             "name": name,
@@ -279,9 +282,9 @@ def parse_netscape(text: str) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------- JSON / detection
 
 
-def parse_json_cookies(data: Any) -> list[dict[str, Any]]:
+def parse_json_cookies(data: Any, *, quiet: bool = False) -> list[dict[str, Any]]:
     """Portable cookies from decoded JSON: a list, ``{"cookies": [...]}`` (ShardX API,
-    Playwright ``storage_state``) or a single cookie object."""
+    Playwright ``storage_state``) or a single cookie object. ``quiet``: see :func:`to_playwright_list`."""
     if isinstance(data, Mapping):
         if isinstance(data.get("cookies"), list):
             data = data["cookies"]
@@ -296,7 +299,8 @@ def parse_json_cookies(data: Any) -> list[dict[str, Any]]:
         try:
             out.append(to_portable(item))
         except CookieFormatError as exc:
-            raise CookieFormatError(f"Cookie #{i + 1}: {exc}") from None
+            detail = "missing or invalid name, domain or expiry" if quiet else str(exc)
+            raise CookieFormatError(f"Cookie #{i + 1}: {detail}") from None
     return out
 
 
@@ -308,7 +312,7 @@ def detect_format(text: str) -> CookieFormat:
     return "netscape"
 
 
-def parse_cookies_text(text: str, fmt: CookieFormat | None = None) -> list[dict[str, Any]]:
+def parse_cookies_text(text: str, fmt: CookieFormat | None = None, *, quiet: bool = False) -> list[dict[str, Any]]:
     """Parse cookie text (format auto-detected unless given) into portable cookies."""
     text = text.lstrip("﻿")
     fmt = fmt or detect_format(text)
@@ -317,7 +321,7 @@ def parse_cookies_text(text: str, fmt: CookieFormat | None = None) -> list[dict[
             data = json.loads(text)
         except json.JSONDecodeError as exc:
             raise CookieFormatError(f"Invalid JSON cookie file: {exc.msg} (line {exc.lineno}).") from None
-        return parse_json_cookies(data)
+        return parse_json_cookies(data, quiet=quiet)
     if fmt == "netscape":
         return parse_netscape(text)
     raise CookieFormatError(f"Unknown cookie format {fmt!r}; use 'json' or 'netscape'.")
@@ -336,13 +340,18 @@ def dumps_cookies(cookies: Iterable[Mapping[str, Any]], fmt: CookieFormat = "jso
     raise CookieFormatError(f"Unknown cookie format {fmt!r}; use 'json' or 'netscape'.")
 
 
-def export_cookies(cookies: Iterable[Mapping[str, Any]], path: Path | str, fmt: CookieFormat | None = None) -> Path:
+def export_cookies(cookies: Iterable[Mapping[str, Any]], path: Path | str, fmt: CookieFormat | None = None, *,
+                   create_parents: bool = True) -> Path:
     """Write cookies to ``path`` (JSON list or Netscape cookies.txt; inferred from the suffix when
-    ``fmt`` is None). The file is created with owner-only permissions where the OS supports it."""
+    ``fmt`` is None). The file is created with owner-only permissions where the OS supports it.
+    ``create_parents=False`` refuses to create missing folders."""
     target = Path(path).expanduser()
     fmt = fmt or format_for_path(target)
     payload = dumps_cookies(list(cookies), fmt)
-    target.parent.mkdir(parents=True, exist_ok=True)
+    if create_parents:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    elif not target.parent.is_dir():
+        raise CookieFormatError(f"The folder {target.parent} does not exist.")
     tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0)
     fd = os.open(tmp, flags, 0o600)
@@ -380,7 +389,8 @@ def load_cookie_file(path: Path | str, fmt: CookieFormat | None = None) -> list[
             continue
     else:
         raise CookieFormatError(f"Cookie file is not UTF-8 text: {source}")
-    return to_playwright_list(parse_cookies_text(text, fmt))
+    # quiet: the file may be anything; its content must not be echoed in error messages
+    return to_playwright_list(parse_cookies_text(text, fmt, quiet=True), quiet=True)
 
 
 # ---------------------------------------------------------------------- model-facing views

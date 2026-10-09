@@ -34,7 +34,7 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
-from pydantic import Field, ValidationError
+from pydantic import Field, ValidationError, WrapValidator
 
 from .. import __version__
 from ..errors import PolicyError, ProfilePilotError
@@ -87,6 +87,18 @@ cookies_clear, proxy_remove, purchases, posting, sending messages).
 
 # ---------------------------------------------------------------------- shared argument types
 
+
+def _none_passes(value: Any, handler: Any) -> Any:
+    return None if value is None else handler(value)
+
+
+NoneOK = WrapValidator(_none_passes)
+"""Use as ``Annotated[str, NoneOK, Field(...)] = None`` for optional free-text parameters.
+
+The MCP SDK ``json.loads`` every string argument whose annotation is not exactly ``str`` (so
+``'{"a": 1}'`` became a dict and ``'null'`` became None). Annotating such parameters as plain
+``str`` keeps the text verbatim; this validator still accepts an explicit JSON ``null``."""
+
 ProfileArg = Annotated[
     str,
     Field(description="Profile name, id or unique id prefix (or shardx:<name> for a ShardX profile)."),
@@ -96,12 +108,15 @@ TabArg = Annotated[
     Field(description="Tab index from browser_tabs (default: the active tab). The tab becomes active.", ge=0),
 ]
 RefArg = Annotated[
-    str | None,
-    Field(description="Element ref from the latest browser_snapshot, e.g. 'e12'."),
+    str,
+    NoneOK,
+    Field(description="Element ref from the latest browser_snapshot, e.g. 'e12' or 'f1e12'; copy it exactly."),
 ]
 SelectorArg = Annotated[
-    str | None,
-    Field(description="CSS selector (or Playwright 'text=...') used when there is no ref; the first match is used."),
+    str,
+    NoneOK,
+    Field(description="CSS selector (or Playwright 'text=...') used when there is no ref; the first visible match "
+                      "is used."),
 ]
 MaxCharsArg = Annotated[int, Field(description="Maximum characters to return.", ge=200, le=100_000)]
 OffsetArg = Annotated[int, Field(description="Character offset to continue from (the previous next_offset).", ge=0)]
@@ -121,8 +136,12 @@ class AppState:
     policy: UrlPolicy
     shardx: "AsyncShardXClient | None" = None
     remote: bool = False
+    files_anywhere: bool = False
+    """Local mode only: cookie file tools may use paths outside the data root (``--files-anywhere``)."""
     user_agents: dict[str, str] = field(default_factory=dict)
     """Cached ``navigator.userAgent`` per session key (used by ``http_fetch``)."""
+    accept_languages: dict[str, str] = field(default_factory=dict)
+    """Cached ``Accept-Language`` header (from ``navigator.languages``) per session key."""
 
 
 def get_state(ctx: Context) -> AppState:
@@ -159,6 +178,7 @@ def create_server(
     enable_shardx: bool | None = None,
     remote: bool = False,
     allow_private: bool = False,
+    files_anywhere: bool = False,
     token_verifier: "TokenVerifier | None" = None,
     auth: "AuthSettings | None" = None,
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO",
@@ -169,10 +189,14 @@ def create_server(
     :param store: an existing store (overrides ``root``); ``runtime`` / ``shardx`` may be injected too.
     :param enable_shardx: register the ``shardx_*`` tools (default: ``config.shardx.enabled``).
     :param remote: remote (HTTP) mode: the URL policy blocks private / local targets unless
-        ``allow_private``, and file-system paths of the cookie tools are confined to the data root.
+        ``allow_private``, and cookie files are confined to the exports folders.
+    :param files_anywhere: local mode only: let the cookie file tools use any folder (by default
+        they are confined to the exports folders of the data root, like in remote mode).
     :param token_verifier: / ``auth``: bearer-token auth for the HTTP transport (see :mod:`.http`).
     """
     store = store if store is not None else Store(root)
+    if remote and files_anywhere:
+        raise ProfilePilotError("files_anywhere is not available in remote mode.")
     if enable_shardx is None:
         enable_shardx = shardx is not None or store.load_config().shardx.enabled
     policy = UrlPolicy(remote=remote, allow_private=allow_private)
@@ -189,7 +213,8 @@ def create_server(
             sx = make_shardx_client(store)
             owns_shardx = True
         browsers = BrowserManager(store, rt, sx)
-        state = AppState(store=store, runtime=rt, browsers=browsers, policy=policy, shardx=sx, remote=remote)
+        state = AppState(store=store, runtime=rt, browsers=browsers, policy=policy, shardx=sx, remote=remote,
+                         files_anywhere=files_anywhere)
         log.info("ProfilePilot server ready (data root %s, %s)", store.root, policy.describe())
         try:
             yield state
@@ -233,9 +258,16 @@ def create_server(
     return server
 
 
-def serve_stdio(root: Path | str | None = None, *, log_level: str = "INFO") -> None:
+def quiet_http_client_logs() -> None:
+    """Every internal DevTools / control-API probe would otherwise be logged at INFO."""
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+def serve_stdio(root: Path | str | None = None, *, log_level: str = "INFO", files_anywhere: bool = False) -> None:
     """Run the server over stdio (blocking). Nothing but MCP messages is written to stdout."""
-    server = create_server(root, log_level=log_level.upper())  # type: ignore[arg-type]
+    server = create_server(root, log_level=log_level.upper(), files_anywhere=files_anywhere)  # type: ignore[arg-type]
+    quiet_http_client_logs()
     server.run("stdio")
 
 
@@ -347,9 +379,16 @@ def to_tool_error(exc: BaseException, tool: str) -> ToolError:
         )
         return ToolError(f"Invalid value(s): {problems}")
     if PlaywrightTimeoutError and isinstance(exc, PlaywrightTimeoutError):
+        message = playwright_message(exc).rstrip(".")
+        if tool == "browser_navigate" or "navigating to" in str(exc):
+            return ToolError(
+                f"Navigation timed out ({message}): the site or the profile's proxy did not respond. Check the "
+                "proxy with profile_status or proxy_test(profile=...), or retry with a longer timeout_s or "
+                "wait_until='commit'."
+            )
         return ToolError(
-            f"Timed out: {playwright_message(exc)}. The page may still be loading or the element is hidden or "
-            "covered; try browser_wait_for, or take a new browser_snapshot and retry."
+            f"Timed out: {message}. The page may still be loading or the element is hidden or covered; try "
+            "browser_wait_for, or take a new browser_snapshot and retry."
         )
     if PlaywrightError and isinstance(exc, PlaywrightError):
         message = playwright_message(exc)
@@ -360,8 +399,9 @@ def to_tool_error(exc: BaseException, tool: str) -> ToolError:
             )
         if "Download is starting" in message:
             return ToolError(
-                "That URL started a file download instead of opening a page. The file is saved in the profile's "
-                "downloads folder; use http_fetch to read a file's content."
+                "That URL started a file download instead of opening a page; Chrome saves it in the profile's "
+                "downloads folder. http_fetch(profile, url) shows text files (CSV/JSON/TXT); binary files "
+                "(ZIP, PDF, images) cannot be shown as text, so http_fetch saves them and returns the path."
             )
         return ToolError(message)
     if isinstance(exc, TimeoutError):
@@ -370,7 +410,10 @@ def to_tool_error(exc: BaseException, tool: str) -> ToolError:
         import httpx
 
         if isinstance(exc, httpx.HTTPError):
-            return ToolError(f"HTTP request failed: {type(exc).__name__}: {_scrub(first_line(str(exc)))}")
+            detail = _scrub(first_line(str(exc)))
+            if not detail and isinstance(exc, httpx.TimeoutException):
+                detail = "no response within the timeout"
+            return ToolError(f"HTTP request failed: {type(exc).__name__}{': ' + detail if detail else ''}")
     except ImportError:  # pragma: no cover
         pass
     log.error("unexpected error in tool %s", tool, exc_info=exc)
@@ -434,6 +477,7 @@ def is_blank(value: str | None) -> bool:
 
 __all__ = [
     "AppState",
+    "NoneOK",
     "INSTRUCTIONS",
     "add_tool",
     "annotations",

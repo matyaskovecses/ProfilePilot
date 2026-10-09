@@ -155,25 +155,15 @@ def snapshot_refs(snapshot_text: str) -> list[str]:
 
 # ---------------------------------------------------------------------- read_page
 
-# Runs in the page. Walks the live (composed) tree read-only, decides visibility from computed
-# styles and layout boxes, and serialises the visible part straight to strings - no DOM nodes are
-# created, cloned or modified, so no page code is triggered.
-_READ_JS = r"""
-(opts) => {
-  const DROP = new Set(['script','style','noscript','template','svg','canvas','iframe','frame','frameset',
-    'object','embed','video','audio','source','track','link','meta','head','title','base','map','area',
-    'input','textarea','datalist','param']);
-  const VOID = new Set(['area','base','br','col','embed','hr','img','input','link','meta','source','track','wbr']);
-  const KEEP_ATTRS = ['href','src','alt','title','id','class','role','aria-label','colspan','rowspan','datetime',
-    'lang','dir','name','headers','scope','start','type'];
-  const BLOCK = new Set(['block','flex','grid','list-item','table','flow-root','table-caption','table-row',
-    'table-row-group','table-header-group','table-footer-group','-webkit-box','block flow','block flow-root']);
+# Shared by the in-page scripts below: visibility rules from computed styles and layout boxes.
+_VISIBILITY_JS = r"""
   const ZERO_CLIP = /^rect\(\s*0(px)?[\s,]+0(px)?[\s,]+0(px)?[\s,]+0(px)?\s*\)$/;
   const sx = window.scrollX, sy = window.scrollY, vw = window.innerWidth, vh = window.innerHeight;
   const escText = (s) => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   const escAttr = (s) => escText(s).replace(/"/g,'&quot;');
   const transparent = (c) => c === 'transparent' || /^rgba\(.*,\s*0(\.0+)?\)$/.test(c) || /\/\s*0(\.0+)?\)$/.test(c);
-  let removed = 0;
+  // parent across shadow boundaries (a shadow root's parent is its host element)
+  const up = (n) => n.parentElement || (n.parentNode && n.parentNode.host) || null;
 
   function hidden(el, cs) {
     if (cs.display === 'none') return true;
@@ -207,6 +197,32 @@ _READ_JS = r"""
     if (parseFloat(cs.textIndent) <= -999) return true;
     return false;
   }
+"""
+
+# Runs in the page. Walks the live (composed) tree read-only, decides visibility from computed
+# styles and layout boxes, and serialises the visible part straight to strings - no DOM nodes are
+# created, cloned or modified, so no page code is triggered. ``opts.roots`` (elements resolved by
+# Playwright's selector engine, which pierces open shadow roots) limits the output to them.
+_READ_JS = r"""
+(opts) => {
+  const DROP = new Set(['script','style','noscript','template','svg','canvas','frameset',
+    'object','embed','video','audio','source','track','link','meta','head','title','base','map','area',
+    'input','textarea','datalist','param']);
+  const VOID = new Set(['area','base','br','col','embed','hr','img','input','link','meta','source','track','wbr']);
+  const KEEP_ATTRS = ['href','src','alt','title','id','class','role','aria-label','colspan','rowspan','datetime',
+    'lang','dir','name','headers','scope','start','type'];
+  const BLOCK = new Set(['block','flex','grid','list-item','table','flow-root','table-caption','table-row',
+    'table-row-group','table-header-group','table-footer-group','-webkit-box','block flow','block flow-root']);
+""" + _VISIBILITY_JS + r"""
+  let removed = 0, frames = 0, deferred = 0;
+
+  // Text that is hidden only until the page reveals it on scroll (opacity 0 / visibility hidden
+  // below the viewport, e.g. AOS / ScrollTrigger animations): counted, never included.
+  function notRevealedYet(el, cs) {
+    if (!(parseFloat(cs.opacity) === 0 || cs.visibility !== 'visible')) return false;
+    if (!(el.textContent || '').trim()) return false;
+    return el.getBoundingClientRect().top >= vh;
+  }
 
   function absUrl(el, attr) {
     let v = '';
@@ -229,9 +245,18 @@ _READ_JS = r"""
     if (node.nodeType !== 1) return null;            // comments, processing instructions
     const el = node;
     const tag = el.localName;
+    if (tag === 'iframe' || tag === 'frame') {   // frame content is not part of this document
+      if (!hidden(el, getComputedStyle(el))) frames++;
+      removed++;
+      return null;
+    }
     if (DROP.has(tag) || el.namespaceURI === 'http://www.w3.org/2000/svg') { removed++; return null; }
     const cs = getComputedStyle(el);
-    if (hidden(el, cs)) { removed++; return null; }
+    if (hidden(el, cs)) {
+      if (!parentTextHidden && notRevealedYet(el, cs)) deferred++;
+      removed++;
+      return null;
+    }
     const out = {t: tag, a: [], c: [], d: cs.display, ws: cs.whiteSpace || 'normal'};
     if (cs.whiteSpaceCollapse === 'preserve' || cs.whiteSpaceCollapse === 'preserve-breaks') out.ws = cs.whiteSpaceCollapse === 'preserve' ? 'pre' : 'pre-line';
     for (const name of KEEP_ATTRS) {
@@ -246,6 +271,7 @@ _READ_JS = r"""
       return out;
     }
     const tHidden = textHidden(cs);
+    if (tHidden && !parentTextHidden && cs.visibility !== 'visible' && notRevealedYet(el, cs)) deferred++;
     let kids;
     if (tag === 'details' && !el.open) kids = Array.from(el.children).filter(c => c.localName === 'summary').slice(0, 1);
     else if (el.shadowRoot) kids = el.shadowRoot.childNodes;
@@ -309,13 +335,13 @@ _READ_JS = r"""
     return res.split('\n').map(l => l.replace(/[ \t]+$/, '')).join('\n').replace(/\n{3,}/g, '\n\n').trim();
   }
 
+  const deepContains = (a, b) => { for (let n = b; n; n = up(n)) if (n === a) return true; return false; };
   let roots;
-  if (opts.selector) {
-    try { roots = Array.from(document.querySelectorAll(opts.selector)); }
-    catch (e) { return {error: 'invalid_selector', message: String(e && e.message || e)}; }
+  if (opts.roots) {
+    roots = Array.from(opts.roots);
     if (!roots.length) return {error: 'no_match'};
-    // keep only outermost matches
-    roots = roots.filter(r => !roots.some(o => o !== r && o.contains(r)));
+    // keep only outermost matches (also across shadow boundaries)
+    roots = roots.filter(r => !roots.some(o => o !== r && deepContains(o, r)));
   } else if (opts.mainOnly) {
     const main = Array.from(document.querySelectorAll('main, [role="main"]')).find(e => getComputedStyle(e).display !== 'none');
     const articles = Array.from(document.querySelectorAll('article')).filter(e => getComputedStyle(e).display !== 'none');
@@ -326,22 +352,104 @@ _READ_JS = r"""
   const built = [];
   for (const r of roots) {
     // Hidden ancestors hide the root too (e.g. a selector that matches inside a display:none box).
-    let anc = r.parentElement, ancHidden = false;
+    let anc = up(r), ancHidden = false;
     while (anc && anc !== document.documentElement) {
       const cs = getComputedStyle(anc);
       if (cs.display === 'none' || anc.getAttribute('aria-hidden') === 'true' || parseFloat(cs.opacity) === 0) { ancHidden = true; break; }
-      anc = anc.parentElement;
+      anc = up(anc);
     }
     if (ancHidden) { removed++; continue; }
     const b = build(r, 'normal', false);
     if (b) built.push(b);
   }
-  const res = {roots: roots.length, kept: built.length, removed};
+  const res = {roots: roots.length, kept: built.length, removed, frames, deferred};
   if (opts.fmt === 'text') res.text = toText(built);
   else res.html = built.map(toHtml).join('\n');
   return res;
 }
 """
+
+
+# Runs in the page (or a frame). Serialises the document for extraction without what a reader cannot
+# see: hidden elements and hidden text in <body> are skipped using the same rules as _READ_JS, every
+# attribute is kept, <head> stays as it is (meta / JSON-LD), and open shadow roots are inlined as
+# <template shadowrootmode="open"> so CSS selectors match web-component content. Read-only.
+_VISIBLE_HTML_JS = r"""
+() => {
+  const VOID = new Set(['area','base','br','col','embed','hr','img','input','link','meta','source','track','wbr']);
+  const VERBATIM = new Set(['script','style','link','meta','title','base']);   // not rendered: kept as is
+  const WHOLE = new Set(['select','datalist']);    // options have no boxes of their own
+""" + _VISIBILITY_JS + r"""
+  const attrs = (el) => Array.from(el.attributes).map(a => ` ${a.name}="${escAttr(a.value)}"`).join('');
+  function ser(node, textHid, check) {
+    if (node.nodeType === 3) return textHid ? '' : escText(node.data);
+    if (node.nodeType !== 1) return '';
+    const el = node, tag = el.localName;
+    if (VERBATIM.has(tag)) return el.outerHTML;
+    let tHid = textHid;
+    if (check) {
+      const cs = getComputedStyle(el);
+      if (hidden(el, cs)) return '';
+      tHid = textHidden(cs);
+    }
+    const open = `<${tag}${attrs(el)}>`;
+    if (VOID.has(tag)) return open;
+    if (WHOLE.has(tag)) return open + el.innerHTML + `</${tag}>`;
+    if (tag === 'template') return '';
+    const parts = [];
+    if (el.shadowRoot) {
+      const shadow = Array.from(el.shadowRoot.childNodes).map(n => ser(n, tHid, true)).join('');
+      parts.push('<template shadowrootmode="open">' + shadow + '</template>');
+    }
+    for (const c of el.childNodes) parts.push(ser(c, tHid, true));
+    return open + parts.join('') + `</${tag}>`;
+  }
+  const doc = document.documentElement;
+  const head = document.head ? document.head.outerHTML : '';
+  const body = document.body ? ser(document.body, false, false) : '';
+  return `<!DOCTYPE html><html${attrs(doc)}>${head}${body}</html>`;
+}
+"""
+
+# Full document including open shadow roots (Chrome 125+ getHTML); null when there are none.
+_SHADOW_HTML_JS = r"""
+() => {
+  const roots = [];
+  const walk = (r) => { for (const el of r.querySelectorAll('*')) if (el.shadowRoot) { roots.push(el.shadowRoot); walk(el.shadowRoot); } };
+  walk(document);
+  if (!roots.length || typeof Element.prototype.getHTML !== 'function') return null;
+  return '<!DOCTYPE html>' + document.documentElement.getHTML({shadowRoots: roots});
+}
+"""
+
+
+async def _evaluate(target: Any, script: str, arg: Any = None) -> Any:
+    """``target.evaluate`` (page or frame), retried when a navigation destroys the context."""
+    from playwright.async_api import Error as PlaywrightError
+
+    for attempt in range(3):
+        try:
+            return await target.evaluate(script, arg)
+        except PlaywrightError as exc:
+            closed = target.is_closed() if hasattr(target, "is_closed") else target.is_detached()
+            if attempt == 2 or closed or not any(s in str(exc) for s in _NAV_ERRORS):
+                raise
+            try:
+                await target.wait_for_load_state("domcontentloaded", timeout=5000)
+            except PlaywrightError:
+                await asyncio.sleep(0.25)
+    raise AssertionError("unreachable")
+
+
+async def visible_html(target: Any) -> str:
+    """HTML of a page or frame without hidden elements / text (open shadow roots inlined)."""
+    return await _evaluate(target, _VISIBLE_HTML_JS)
+
+
+async def full_html(target: Any) -> str:
+    """HTML of a page or frame including hidden elements (open shadow roots inlined when present)."""
+    html = await _evaluate(target, _SHADOW_HTML_JS)
+    return html if isinstance(html, str) else await target.content()
 
 
 async def read_page(
@@ -353,39 +461,71 @@ async def read_page(
 ) -> str:
     """Readable content of ``page`` as ``markdown``, ``text`` or ``html`` without hidden content.
 
-    ``selector`` (CSS) limits the output to the matching elements (all outermost matches, in
-    document order). ``main_only`` picks ``<main>`` / ``[role=main]`` (or a single ``<article>``)
-    when present, else ``<body>``. Shadow DOM (open roots) is flattened; iframes are not included.
+    ``selector`` (CSS, or any Playwright selector such as ``text=...``; it pierces open shadow
+    roots like the action tools do) limits the output to the matching elements (all outermost
+    matches, in document order). ``main_only`` picks ``<main>`` / ``[role=main]`` (or a single
+    ``<article>``) when present, else ``<body>``. Shadow DOM (open roots) is flattened. Iframe
+    content is not included: a note says how many visible iframes were skipped, and how many hidden
+    text blocks below the viewport are waiting to be revealed on scroll.
     """
     if fmt not in ("markdown", "text", "html"):
         raise ProfilePilotError(f"Unknown format {fmt!r}; use 'markdown', 'text' or 'html'.")
-    opts = {"fmt": "text" if fmt == "text" else "html", "selector": (selector or "").strip() or None,
-            "mainOnly": bool(main_only)}
+    sel = (selector or "").strip() or None
+    opts = {"fmt": "text" if fmt == "text" else "html", "mainOnly": bool(main_only)}
     from playwright.async_api import Error as PlaywrightError
 
     for attempt in range(3):
         try:
-            result = await page.evaluate(_READ_JS, opts)
+            if sel is None:
+                result = await page.evaluate(_READ_JS, opts)
+            else:
+                # Playwright's selector engine (the one browser_click uses): pierces open shadow roots
+                result = await page.locator(sel).evaluate_all(
+                    "(els, o) => (" + _READ_JS + ")(Object.assign({}, o, {roots: els}))", opts
+                )
             break
         except PlaywrightError as exc:
-            if attempt == 2 or page.is_closed() or not any(s in str(exc) for s in _NAV_ERRORS):
+            message = str(exc)
+            if sel is not None and not any(s in message for s in _NAV_ERRORS) and (
+                "selector" in message.lower() or "parsing" in message.lower()
+            ):
+                raise InvalidTargetError(f"Invalid selector {selector!r}: {message.splitlines()[0][:200]}") from None
+            if attempt == 2 or page.is_closed() or not any(s in message for s in _NAV_ERRORS):
                 raise
             try:
                 await page.wait_for_load_state("domcontentloaded", timeout=5000)
             except PlaywrightError:
                 await asyncio.sleep(0.25)
-    if result.get("error") == "invalid_selector":
-        raise InvalidTargetError(f"Invalid CSS selector {selector!r}: {result.get('message', '')[:200]}")
     if result.get("error") == "no_match":
-        raise NotFoundError(f"No element matches the selector {selector!r}.")
+        raise NotFoundError(
+            f"No element matches the selector {selector!r}. (Content inside iframes is not searched; use "
+            "browser_snapshot for it.)"
+        )
     log.debug("read_page: kept %s/%s roots, removed %s hidden/non-content elements",
               result.get("kept"), result.get("roots"), result.get("removed"))
     if fmt == "text":
-        return result.get("text") or ""
-    html = result.get("html") or ""
-    if fmt == "html":
-        return html
-    return html_to_markdown(html)
+        body = result.get("text") or ""
+    else:
+        html = result.get("html") or ""
+        body = html if fmt == "html" else html_to_markdown(html)
+    notes = read_notes(result, fmt)
+    if not notes:
+        return body
+    return (body if body.strip() else "(no visible content)") + notes
+
+
+def read_notes(result: dict[str, Any], fmt: str) -> str:
+    """Fixed notes (never page text) about content :func:`read_page` could not include."""
+    notes = ""
+    deferred = int(result.get("deferred") or 0)
+    if deferred and fmt in ("markdown", "text"):
+        notes += (f"\n\n({deferred} hidden text block(s) below the visible area were omitted - pages often "
+                  "reveal these on scroll; call browser_scroll, then browser_read again, to include them.)")
+    frames = int(result.get("frames") or 0)
+    if frames:
+        notes += (f"\n\n[{frames} iframe(s) not included: use browser_snapshot to see their content "
+                  "(refs like f1eN)]")
+    return notes
 
 
 def html_to_markdown(html: str) -> str:

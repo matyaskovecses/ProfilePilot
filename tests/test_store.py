@@ -142,3 +142,164 @@ def test_launch_option_validation_is_readable(store):
     with pytest.raises(ProfilePilotError, match="invalid language tag"):
         store.create_profile("bad-lang", launch={"lang": "not a lang!"})
     assert store.update_profile("tz", launch={"timezone": ""}).launch.timezone is None
+
+
+# ---------------------------------------------------------------------- delete safety (regressions)
+
+
+def test_delete_refuses_while_the_host_lock_is_held_and_changes_nothing(store):
+    from filelock import FileLock
+
+    p = store.create_profile("starting")
+    lock = FileLock(str(store.profile_dir(p.id) / "host.lock"))
+    lock.acquire(timeout=0)  # a host that holds the lock but has not written runtime.json yet
+    try:
+        with pytest.raises(ProfileRunningError, match="starting or stopping"):
+            store.delete_profile("starting")
+    finally:
+        lock.release()
+    assert [x.id for x in store.list_profiles()] == [p.id]
+    assert store.list_trash() == []
+    assert not store.trash_dir.exists() or not any(store.trash_dir.iterdir())
+    store.delete_profile("starting")  # works once the holder is gone
+    assert store.list_profiles() == []
+
+
+def test_delete_refuses_while_a_browser_holds_the_user_data_dir(store, monkeypatch):
+    import profilepilot.browser.prefs as prefs
+
+    p = store.create_profile("orphan chrome")
+    monkeypatch.setattr(prefs, "profile_in_use", lambda udd: udd == store.user_data_dir(p.id))
+    with pytest.raises(ProfileRunningError, match="open in a browser"):
+        store.delete_profile("orphan chrome")
+    with pytest.raises(ProfileRunningError):
+        store.clone_profile("orphan chrome", "copy", copy_data=True)
+    assert [x.name for x in store.list_profiles()] == ["orphan chrome"]
+
+
+def test_failed_move_leaves_the_profile_intact_and_no_hidden_trash_copy(store, monkeypatch):
+    import profilepilot.store as store_mod
+
+    p = store.create_profile("busy")
+    (store.user_data_dir(p.id) / "Default").mkdir()
+    (store.user_data_dir(p.id) / "Default" / "Cookies").write_text("c")
+
+    def refuse(src, dst):
+        raise PermissionError(32, "The process cannot access the file because it is being used")
+
+    monkeypatch.setattr(store_mod.os, "replace", refuse)
+    monkeypatch.setattr(store_mod.time, "sleep", lambda s: None)
+    with pytest.raises(store_mod.ProfilePilotError, match="in use by another process"):
+        store.delete_profile("busy")
+    monkeypatch.undo()
+    assert store.get_profile("busy").id == p.id  # still listed, data untouched
+    assert (store.user_data_dir(p.id) / "Default" / "Cookies").read_text() == "c"
+    assert not store.trash_dir.exists() or not any(store.trash_dir.iterdir())
+
+
+@pytest.mark.skipif(__import__("sys").platform != "win32", reason="Windows file-handle semantics")
+def test_delete_with_a_file_held_open_on_windows_fails_cleanly(store, monkeypatch):
+    import profilepilot.store as store_mod
+
+    monkeypatch.setattr(store_mod.time, "sleep", lambda s: None)
+    p = store.create_profile("held")
+    log = store.profile_dir(p.id) / "host.log"
+    with open(log, "a", encoding="utf-8") as fh:  # e.g. a log viewer, or a host still shutting down
+        fh.write("x")
+        with pytest.raises(store_mod.ProfilePilotError, match="in use by another process"):
+            store.delete_profile("held")
+        assert store.get_profile("held").id == p.id
+        assert not store.trash_dir.exists() or not any(store.trash_dir.iterdir())
+    entry = store.delete_profile("held")
+    assert store.restore_profile(entry.trash_id).id == p.id
+
+
+def test_stale_runtime_json_with_a_reused_pid_does_not_block_delete(store):
+    import os
+
+    p = store.create_profile("stale")
+    store.runtime_file(p.id).write_text(json.dumps({
+        "profile_id": p.id, "profile_name": "stale", "host_pid": os.getpid(),
+        "started_at": "2000-01-01T00:00:00+00:00",  # our process started long after this file
+    }))
+    assert not store.is_running_on_disk(p.id)
+    store.delete_profile("stale")
+    assert store.list_profiles() == []
+
+
+def test_restore_cleans_a_leftover_folder_with_only_host_files(store):
+    p = store.create_profile("again")
+    entry = store.delete_profile("again")
+    leftover = store.profile_dir(p.id)
+    leftover.mkdir()
+    (leftover / "host.log").write_text("late log line")
+    assert store.restore_profile(entry.trash_id).id == p.id
+    assert store.get_profile("again").id == p.id
+
+    entry = store.delete_profile("again")
+    leftover.mkdir()
+    (leftover / "notes.txt").write_text("user data?")
+    with pytest.raises(ConflictError, match="left over"):
+        store.restore_profile(entry.trash_id)
+    assert (leftover / "notes.txt").exists()
+
+
+def test_late_host_bookkeeping_does_not_recreate_a_deleted_profile(store):
+    p = store.create_profile("gone")
+    store.delete_profile("gone")
+    store.touch_started(p.id)
+    store.add_runtime(p.id, 5)
+    with pytest.raises(NotFoundError):
+        store.downloads_dir(p.id)
+    assert not store.profile_dir(p.id).exists()
+
+
+def test_purge_removes_trash_folders_without_metadata(store):
+    store.trash_dir.mkdir(parents=True, exist_ok=True)
+    orphan = store.trash_dir / "deadbeef-20200101000000"
+    (orphan / "udd").mkdir(parents=True)
+    (orphan / "udd" / "big.bin").write_bytes(b"x" * 10)
+    assert store.list_trash() == []
+    store.purge_trash(older_than_days=0)
+    assert not orphan.exists()
+
+
+def test_read_json_retries_a_sharing_violation(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from profilepilot.errors import ProfilePilotError
+    from profilepilot.jsonio import read_json
+
+    f = tmp_path / "x.json"
+    f.write_text('{"a": 1}')
+    real = Path.read_bytes
+    failures = {"left": 3}
+
+    def flaky(self):
+        if self == f and failures["left"]:
+            failures["left"] -= 1
+            raise PermissionError(32, "being used by another process")
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", flaky)
+    monkeypatch.setattr("profilepilot.jsonio.time.sleep", lambda s: None)
+    assert read_json(f) == {"a": 1}
+    failures["left"] = 1000
+    with pytest.raises(ProfilePilotError, match="locked"):
+        read_json(f)
+
+
+def test_posix_singleton_lock_with_a_reused_pid_is_stale(monkeypatch, tmp_path):
+    import os
+    import socket
+    import time
+
+    from profilepilot.browser import prefs
+
+    me = os.getpid()
+    lock = tmp_path / "SingletonLock"
+    monkeypatch.setattr(prefs.os, "readlink", lambda p: f"{socket.gethostname()}-{me}")
+    monkeypatch.setattr(prefs.os, "lstat", lambda p: type("S", (), {"st_mtime": time.time()})())
+    assert prefs._singleton_lock_in_use(lock)  # written after our process started: in use
+    monkeypatch.setattr(prefs.os, "lstat", lambda p: type("S", (), {"st_mtime": 1_000_000.0})())
+    assert not prefs._singleton_lock_in_use(lock)  # written in 1970: our PID is a reuse, the lock is stale

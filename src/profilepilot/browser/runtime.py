@@ -21,7 +21,6 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -37,6 +36,8 @@ from ..errors import (
 )
 from ..jsonio import lock_for, read_json
 from ..models import Profile, RuntimeInfo, WindowMode
+from ..procs import host_alive as _host_alive
+from ..procs import process_alive
 from ..store import Store
 from .control import ControlCallError, cdp_browser_close, cdp_version, control_call
 
@@ -58,19 +59,6 @@ _REGISTER_WAIT = 15.0
 
 
 # --------------------------------------------------------------------------- process helpers
-
-
-def process_alive(pid: int | None, create_time: float | None = None, *, tolerance: float = 1.0) -> bool:
-    """True if ``pid`` runs and (when given) was created at ``create_time`` (guards PID reuse)."""
-    if not pid:
-        return False
-    try:
-        proc = psutil.Process(int(pid))
-        if not proc.is_running() or proc.status() == psutil.STATUS_ZOMBIE:
-            return False
-        return create_time is None or abs(proc.create_time() - float(create_time)) <= tolerance
-    except (psutil.Error, ValueError, OSError):
-        return False
 
 
 def kill_tree(pid: int, *, create_time: float | None = None, timeout: float = 10.0) -> None:
@@ -95,20 +83,6 @@ def process_tree(pid: int) -> list[psutil.Process]:
         return [root, *root.children(recursive=True)]
     except psutil.Error:
         return []
-
-
-def _host_alive(info: RuntimeInfo) -> bool:
-    """Host PID alive and created no later than the runtime.json it wrote (PID-reuse guard)."""
-    if not info.host_pid or info.host_pid <= 0:
-        return False
-    try:
-        proc = psutil.Process(int(info.host_pid))
-        if not proc.is_running() or proc.status() == psutil.STATUS_ZOMBIE:
-            return False
-        started = info.started_at.timestamp() if isinstance(info.started_at, datetime) else None
-        return started is None or proc.create_time() <= started + 2.0
-    except (psutil.Error, ValueError, OSError):
-        return False
 
 
 def _wait_pid_exit(pid: int, timeout: float) -> bool:
@@ -268,24 +242,29 @@ class RuntimeManager:
         if window is not None and window not in ("normal", "offscreen", "headless"):
             raise ProfilePilotError(f"Invalid window mode {window!r}; use normal, offscreen or headless.")
         deadline = time.monotonic() + timeout
-        current = self._settle(profile, deadline)
-        if current is not None:
-            return current
-
-        with self._start_lock():
-            current = self._settle(profile, deadline)
+        while True:
+            # Never wait for another host's readiness while holding the cross-profile start lock:
+            # that would block every other profile's start behind one slow launch.
+            current = self._settle(profile, deadline)  # raises at the deadline
             if current is not None:
                 return current
-            config = self.store.load_config()
-            others = self._live_hosts(exclude=profile.id)
-            if config.max_running > 0 and len(others) >= config.max_running:
-                names = ", ".join(sorted(i.profile_name for i in others))
-                raise ConflictError(
-                    f"Cannot start '{profile.name}': {len(others)} profiles are already running "
-                    f"(max_running = {config.max_running}: {names}). Stop one first or raise max_running."
-                )
-            proc = self._spawn_host(profile, window)
-            self._wait_registered(profile.id, proc, min(deadline, time.monotonic() + _REGISTER_WAIT))
+            with self._start_lock():
+                info = self._read(profile.id)
+                if info is not None:
+                    if _host_alive(info):
+                        continue  # another client's host registered meanwhile: settle outside the lock
+                    self._clean_stale(profile.id, info)
+                config = self.store.load_config()
+                others = self._live_hosts(exclude=profile.id)
+                if config.max_running > 0 and len(others) >= config.max_running:
+                    names = ", ".join(sorted(i.profile_name for i in others))
+                    raise ConflictError(
+                        f"Cannot start '{profile.name}': {len(others)} profiles are already running "
+                        f"(max_running = {config.max_running}: {names}). Stop one first or raise max_running."
+                    )
+                proc = self._spawn_host(profile, window)
+                self._wait_registered(profile.id, proc, min(deadline, time.monotonic() + _REGISTER_WAIT))
+            break
         return self._wait_running(profile, proc, deadline, timeout)
 
     @contextlib.contextmanager

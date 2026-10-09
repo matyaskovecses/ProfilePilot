@@ -255,6 +255,9 @@ def serve_http(
         plan.app, host=host, port=int(port), log_level="warning", access_log=False, lifespan="on",
         proxy_headers=False, server_header=False,
     )
+    from .app import quiet_http_client_logs
+
+    quiet_http_client_logs()
     anyio.run(uvicorn.Server(config).serve)
 
 

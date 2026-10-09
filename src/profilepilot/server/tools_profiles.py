@@ -19,10 +19,23 @@ from pydantic import Field
 from ..automation.manager import SHARDX_PREFIX, is_shardx_ref
 from ..errors import ConflictError, NotFoundError, ProfilePilotError, RestartRequiredError
 from ..models import Profile, ProxyCheck, ProxyRecord, RuntimeInfo
-from ..proxy.url import ProxyParseError, parse_proxy
-from ..safety import normalize_url
+from ..proxy.url import ProxyEndpoint, ProxyParseError, parse_proxy
+from ..safety import UrlPolicy, normalize_url
 from ..store import Store
-from .app import PROXY_FORMAT_HELP, ProfileArg, add_tool, first_line, get_state, is_blank, run_sync
+from .app import (
+    DEFAULT_MAX_CHARS,
+    PROXY_FORMAT_HELP,
+    MaxCharsArg,
+    NoneOK,
+    OffsetArg,
+    ProfileArg,
+    add_tool,
+    first_line,
+    get_state,
+    is_blank,
+    paginate_text,
+    run_sync,
+)
 
 log = logging.getLogger("profilepilot.server")
 
@@ -44,6 +57,10 @@ BrowserArg = Annotated[
 # (e.g. --renderer-cmd-prefix) would let a model run arbitrary programs. Both stay available in
 # the CLI (``profilepilot profile update --browser PATH --extra-arg ...``), typed by the user.
 
+
+BULK_LIST_LIMIT = 20
+"""proxy_add lists every saved proxy up to this many, beyond it only the first BULK_SHOWN."""
+BULK_SHOWN = 10
 
 # ---------------------------------------------------------------------- formatting helpers
 
@@ -121,24 +138,37 @@ def _looks_like_proxy_spec(value: str) -> bool:
     return "://" in value or "@" in value or ":" in value
 
 
-def resolve_or_save_proxy(store: Store, proxy: str, *, name_hint: str | None, scheme: str) -> ProxyRecord:
+def check_proxy_host(policy: UrlPolicy | None, proxy: ProxyEndpoint | ProxyRecord) -> None:
+    """Remote mode: refuse proxies on loopback / private networks (no LAN scanning, no routing
+    through the user's local proxies). Synchronous DNS: call it from a worker thread."""
+    if policy is not None:
+        policy.check_host(proxy.host, proxy.port)
+
+
+def resolve_or_save_proxy(store: Store, proxy: str, *, name_hint: str | None, scheme: str,
+                          policy: UrlPolicy | None = None) -> ProxyRecord:
     """A saved proxy (id, name or id prefix), or a proxy URL that is saved first.
 
     A new proxy is named after ``name_hint`` (the profile) when that name is free. Parse errors
-    never echo the input (it contains the password).
+    never echo the input (it contains the password). With a ``policy`` the proxy host must pass
+    its private-network rules (remote mode).
     """
     ref = proxy.strip()
     if not ref:
         raise ProfilePilotError("Empty proxy.")
     for record in store.list_proxies():  # exact id / name first (names may contain ':')
         if record.id == ref.lower() or record.name.casefold() == ref.casefold():
+            check_proxy_host(policy, record)
             return record
     if not _looks_like_proxy_spec(ref):
-        return store.get_proxy(ref)
+        record = store.get_proxy(ref)
+        check_proxy_host(policy, record)
+        return record
     try:
         endpoint = parse_proxy(ref, scheme)
     except ProxyParseError:
         raise ProfilePilotError(PROXY_FORMAT_HELP) from None
+    check_proxy_host(policy, endpoint)
     if name_hint:
         try:
             return store.add_proxy(endpoint, name_hint, default_scheme=scheme)
@@ -160,7 +190,9 @@ def _clean_optional(value: str | None) -> str | None:
 
 async def profile_list(
     ctx: Context,
-    tag: Annotated[str | None, Field(description="Only profiles carrying this tag.")] = None,
+    tag: Annotated[str, NoneOK, Field(description="Only profiles carrying this tag.")] = None,
+    max_chars: MaxCharsArg = DEFAULT_MAX_CHARS,
+    offset: OffsetArg = 0,
 ) -> str:
     """List ProfilePilot profiles (isolated Chrome identities) with their proxy and running state.
     Reuse a fitting profile before creating a new one."""
@@ -174,22 +206,22 @@ async def profile_list(
     running = {i.profile_id: i for i in await run_sync(state.runtime.list_running)}
     lines = [f"{len(profiles)} profile(s), {sum(1 for p in profiles if p.id in running)} running:"]
     lines += [profile_line(p, proxies, running.get(p.id)) for p in profiles]
-    return "\n".join(lines)
+    return paginate_text("\n".join(lines), offset, max_chars)
 
 
 async def profile_create(
     ctx: Context,
     name: Annotated[str, Field(description="Unique profile name, e.g. 'shop-us'.")],
-    proxy: Annotated[str | None, Field(
+    proxy: Annotated[str, NoneOK, Field(
         description="Saved proxy name/id, or a proxy URL (scheme://user:pass@host:port, host:port:user:pass, ...) "
                     "which is saved under the profile's name.")] = None,
     tags: TagsArg = None,
-    notes: Annotated[str | None, Field(description="Free-form notes.")] = None,
+    notes: Annotated[str, NoneOK, Field(description="Free-form notes.")] = None,
     window: WindowArg = None,
     browser: BrowserArg = None,
-    lang: Annotated[str | None, Field(description="UI / Accept-Language override, e.g. 'de-DE' (opt-in).")] = None,
-    timezone: Annotated[str | None, Field(description="IANA timezone override, e.g. 'Europe/Berlin' (opt-in).")] = None,
-    start_url: Annotated[str | None, Field(description="Page opened when the profile starts.")] = None,
+    lang: Annotated[str, NoneOK, Field(description="UI / Accept-Language override, e.g. 'de-DE' (opt-in).")] = None,
+    timezone: Annotated[str, NoneOK, Field(description="IANA timezone override, e.g. 'Europe/Berlin' (opt-in).")] = None,
+    start_url: Annotated[str, NoneOK, Field(description="Page opened when the profile starts.")] = None,
     proxy_scheme: SchemeArg = "http",
 ) -> str:
     """Create a profile: a new isolated Chrome identity with its own cookies, storage and optional proxy."""
@@ -204,7 +236,8 @@ async def profile_create(
         clean = (name or "").strip()
         if clean and any(p.name.casefold() == clean.casefold() for p in store.list_profiles()):
             raise ConflictError(f"A profile named '{clean}' already exists. Pick another name or use it.")
-        record = resolve_or_save_proxy(store, proxy, name_hint=clean, scheme=proxy_scheme) if not is_blank(proxy) else None
+        record = resolve_or_save_proxy(store, proxy, name_hint=clean, scheme=proxy_scheme,
+                                       policy=state.policy) if not is_blank(proxy) else None
         launch: dict[str, Any] = {"window": window or store.load_config().default_window}
         if _clean_optional(lang):
             launch["lang"] = _clean_optional(lang)
@@ -233,14 +266,14 @@ async def profile_create(
 async def profile_update(
     ctx: Context,
     profile: ProfileArg,
-    name: Annotated[str | None, Field(description="New name.")] = None,
-    notes: Annotated[str | None, Field(description="New notes ('' clears them).")] = None,
+    name: Annotated[str, NoneOK, Field(description="New name.")] = None,
+    notes: Annotated[str, NoneOK, Field(description="New notes ('' clears them).")] = None,
     tags: TagsArg = None,
     window: WindowArg = None,
     browser: BrowserArg = None,
-    lang: Annotated[str | None, Field(description="Language override; '' removes it.")] = None,
-    timezone: Annotated[str | None, Field(description="Timezone override; '' removes it.")] = None,
-    start_url: Annotated[str | None, Field(description="Start page; '' removes it.")] = None,
+    lang: Annotated[str, NoneOK, Field(description="Language override; '' removes it.")] = None,
+    timezone: Annotated[str, NoneOK, Field(description="Timezone override; '' removes it.")] = None,
+    start_url: Annotated[str, NoneOK, Field(description="Start page; '' removes it.")] = None,
     restore_session: Annotated[bool | None, Field(description="Reopen tabs and keep session cookies across restarts.")] = None,
     webrtc: Annotated[Literal["auto", "proxy_only", "default"] | None, Field(
         description="WebRTC policy: auto (proxy_only when proxied), proxy_only, default.")] = None,
@@ -355,7 +388,7 @@ async def profile_stop(ctx: Context, profile: ProfileArg) -> str:
 
 async def profile_status(
     ctx: Context,
-    profile: Annotated[str | None, Field(description="A profile (default: list every running profile).")] = None,
+    profile: Annotated[str, NoneOK, Field(description="A profile (default: list every running profile).")] = None,
 ) -> str:
     """Show whether a profile is running (window, proxy, relay traffic), or list all running profiles."""
     state = get_state(ctx)
@@ -415,7 +448,7 @@ async def profile_status(
 async def profile_set_proxy(
     ctx: Context,
     profile: ProfileArg,
-    proxy: Annotated[str | None, Field(
+    proxy: Annotated[str, NoneOK, Field(
         description="Saved proxy name/id or a proxy URL; null, '' or 'none' for a direct connection.")] = None,
     proxy_scheme: SchemeArg = "http",
 ) -> str:
@@ -429,7 +462,8 @@ async def profile_set_proxy(
     def apply() -> str:
         store, runtime = state.store, state.runtime
         target = store.get_profile(profile)
-        record = None if direct else resolve_or_save_proxy(store, str(proxy), name_hint=target.name, scheme=proxy_scheme)
+        record = None if direct else resolve_or_save_proxy(store, str(proxy), name_hint=target.name,
+                                                           scheme=proxy_scheme, policy=state.policy)
         updated = store.update_profile(target.id, proxy_id=record.id if record else None)
         saved = f"Profile '{updated.name}' now uses proxy: {proxy_label(record)}."
         if runtime.status(updated.id) is None:
@@ -451,7 +485,9 @@ async def profile_set_proxy(
 
 async def proxy_list(
     ctx: Context,
-    tag: Annotated[str | None, Field(description="Only proxies carrying this tag.")] = None,
+    tag: Annotated[str, NoneOK, Field(description="Only proxies carrying this tag.")] = None,
+    max_chars: MaxCharsArg = DEFAULT_MAX_CHARS,
+    offset: OffsetArg = 0,
 ) -> str:
     """List saved proxies (passwords are never shown) with their last test result."""
     state = get_state(ctx)
@@ -477,7 +513,7 @@ async def proxy_list(
                 if check.get("ok") else f"last test FAILED ({first_line(str(check.get('error', '')), 120)})"
             )
         lines.append(" | ".join(parts))
-    return "\n".join(lines)
+    return paginate_text("\n".join(lines), offset, max_chars)
 
 
 async def proxy_add(
@@ -485,7 +521,7 @@ async def proxy_add(
     url: Annotated[str, Field(
         description="One proxy, or many separated by newlines. Formats: scheme://user:pass@host:port, "
                     "user:pass@host:port, host:port, host:port:user:pass. In a list, '  # name' after a proxy names it.")],
-    name: Annotated[str | None, Field(description="Name for a single proxy (default host:port).")] = None,
+    name: Annotated[str, NoneOK, Field(description="Name for a single proxy (default host:port).")] = None,
     tags: TagsArg = None,
     scheme: SchemeArg = "http",
 ) -> str:
@@ -497,14 +533,18 @@ async def proxy_add(
     if not entries:
         raise ProfilePilotError("No proxy given.")
 
+    def save(spec: str, label: str | None) -> ProxyRecord:
+        endpoint = parse_proxy(spec, scheme)
+        check_proxy_host(state.policy, endpoint)  # remote mode: no loopback / LAN proxies
+        return state.store.add_proxy(endpoint, label, default_scheme=scheme, tags=tags or ())
+
     def add_all() -> tuple[list[ProxyRecord], list[str]]:
-        store = state.store
         if len(entries) == 1:
             spec, label = entries[0], name
             if " #" in spec and not name:
                 spec, _, label = spec.partition(" #")
                 spec, label = spec.strip(), label.strip() or None
-            return [store.add_proxy(spec, label, default_scheme=scheme, tags=tags or ())], []
+            return [save(spec, label)], []
         added: list[ProxyRecord] = []
         errors: list[str] = []
         for lineno, line in enumerate(lines, 1):
@@ -515,7 +555,7 @@ async def proxy_add(
                 spec, _, label = line.partition(" #")
                 spec, label = spec.strip(), label.strip() or None
             try:
-                added.append(store.add_proxy(spec, label, default_scheme=scheme, tags=tags or ()))
+                added.append(save(spec, label))
             except ProxyParseError:
                 errors.append(f"line {lineno}: could not parse the proxy")
             except ProfilePilotError as exc:
@@ -524,6 +564,12 @@ async def proxy_add(
 
     added, errors = await run_sync(add_all)
     out = [f"Saved {len(added)} proxy(ies):"] + [f"- {r.name} (id {r.id}) {r.redacted_url()}" for r in added]
+    if len(added) > BULK_LIST_LIMIT:  # keep bulk imports of thousands of proxies readable
+        tagged = f" tagged {', '.join(tags)}" if tags else ""
+        out = [f"Saved {len(added)} proxy(ies){tagged}; the first {BULK_SHOWN}:"]
+        out += [f"- {r.name} (id {r.id}) {r.redacted_url()}" for r in added[:BULK_SHOWN]]
+        where = f"proxy_list(tag='{tags[0]}')" if tags else "proxy_list"
+        out.append(f"...and {len(added) - BULK_SHOWN} more; see {where}.")
     if errors:
         out.append(f"{len(errors)} line(s) failed:")
         out += [f"- {e}" for e in errors]
@@ -552,8 +598,8 @@ async def proxy_remove(
 
 async def proxy_test(
     ctx: Context,
-    proxy: Annotated[str | None, Field(description="Saved proxy name/id to test.")] = None,
-    profile: Annotated[str | None, Field(
+    proxy: Annotated[str, NoneOK, Field(description="Saved proxy name/id to test.")] = None,
+    profile: Annotated[str, NoneOK, Field(
         description="Test a profile's route instead (its live relay when running, else its saved proxy).")] = None,
     timeout_s: Annotated[float, Field(description="Timeout in seconds.", ge=2, le=60)] = 12.0,
 ) -> str:
@@ -568,6 +614,9 @@ async def proxy_test(
 
     async def test_saved(record: ProxyRecord, label: str) -> str:
         endpoint = await run_sync(store.proxy_endpoint, record.id)
+        # Remote mode: never connect to loopback / LAN hosts (records saved earlier with the CLI, or
+        # names whose DNS answer changed since).
+        await state.policy.acheck_host(endpoint.host, endpoint.port)
         result = await check_proxy(endpoint, timeout=timeout_s)
         await run_sync(store.set_proxy_check, record.id, result)
         return check_text(label, result)
@@ -581,6 +630,9 @@ async def proxy_test(
         target = await run_sync(store.get_profile, str(profile))
         info = await run_sync(state.runtime.status, target.id)
         if info is not None and info.relay_port:
+            if info.proxy_id and state.policy.restricts_private:
+                live = await run_sync(store.get_proxy, info.proxy_id)
+                await state.policy.acheck_host(live.host, live.port)
             result = await check_via_relay(info.http_proxy_url, timeout=timeout_s)
             return check_text(f"profile '{target.name}' (live relay, upstream {info.upstream or 'direct'})", result)
         note = ""

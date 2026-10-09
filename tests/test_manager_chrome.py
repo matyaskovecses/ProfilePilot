@@ -4,6 +4,7 @@ user-data-dir, fixed CDP port). The RuntimeManager and the ShardX client are sma
 import asyncio
 import os
 import re
+import sys
 import time
 from dataclasses import dataclass, field
 
@@ -366,3 +367,47 @@ async def test_shardx_refs_use_the_shardx_client(env: Env):
         await manager.aclose()
     with pytest.raises(ProfilePilotError, match="ShardX integration is not enabled"):
         await env.manager.session("shardx:Work")
+
+
+def _chrome_windows(pid: int) -> list[int]:
+    import win32gui
+    import win32process
+
+    found: list[int] = []
+
+    def visit(hwnd, _arg):
+        if (win32process.GetWindowThreadProcessId(hwnd)[1] == pid and win32gui.GetClassName(hwnd) == "Chrome_WidgetWin_1"
+                and win32gui.IsWindowVisible(hwnd) and win32gui.GetWindowText(hwnd)):
+            found.append(hwnd)
+        return True
+
+    win32gui.EnumWindows(visit, None)
+    return found
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows window management")
+async def test_minimized_window_never_takes_the_focus(env: Env):
+    """Restoring a minimized window (bringToFront, setWindowBounds, even SW_SHOWNOACTIVATE) gives
+    Chrome the keyboard focus: reading works on the hidden page, actions get a clear error."""
+    import win32con
+    import win32gui
+
+    session = await env.manager.session(env.profile_id)
+    page = await session.page()
+    await page.goto(env.origin.url + "/")
+    second = await session.new_tab(env.origin.url + "/other")
+    hwnd = _chrome_windows(env.chrome.proc.pid)[0]
+    win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+    await _wait_for(lambda: second.evaluate("document.visibilityState === 'hidden'"))
+    foreground = win32gui.GetForegroundWindow()
+
+    assert await session.page(interactive=False) is second  # read-only callers work on the hidden page
+    assert await second.title() == "Other"
+    with pytest.raises(ProfilePilotError, match="minimized"):
+        await session.page()
+    assert await session.select_tab(0) is page  # no bringToFront while minimized
+    with pytest.raises(ProfilePilotError, match="minimized"):
+        await session.page(0)
+    await session.close_tab(0)
+    assert win32gui.IsIconic(hwnd)
+    assert win32gui.GetForegroundWindow() == foreground != hwnd

@@ -171,8 +171,11 @@ async def _pipe(r1, w1, r2, w2) -> None:
 class OriginServer:
     """Threaded HTTP origin that serves small pages and echoes request info."""
 
-    def __init__(self, pages: dict[str, str] | None = None) -> None:
+    def __init__(self, pages: dict[str, str] | None = None,
+                 files: dict[str, tuple[str, bytes, dict[str, str]]] | None = None) -> None:
+        """``pages``: path -> HTML. ``files``: path -> (content type, body, extra headers)."""
         self.pages = pages or {}
+        self.files = files or {}
         self.requests: list[dict] = []
         outer = self
 
@@ -180,8 +183,29 @@ class OriginServer:
             def log_message(self, *args):
                 pass
 
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                data = self.rfile.read(length) if length else b""
+                outer.requests.append({"path": self.path, "headers": dict(self.headers), "body": data})
+                body = b"post " + self.path.encode() + b" body=" + data
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
             def do_GET(self):
                 outer.requests.append({"path": self.path, "headers": dict(self.headers)})
+                if self.path in outer.files:
+                    ctype, body, extra = outer.files[self.path]
+                    self.send_response(200)
+                    self.send_header("Content-Type", ctype)
+                    for name, value in extra.items():
+                        self.send_header(name, value)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 if self.path.startswith("/set-session-cookie"):
                     name, _, value = self.path.partition("?")[2].partition("=")
                     body = b"session cookie set"

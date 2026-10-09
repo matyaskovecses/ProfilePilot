@@ -223,3 +223,41 @@ def test_normalize_url(raw, expected):
     assert normalize_url(raw) == expected
     with pytest.raises(PolicyError):
         normalize_url("   ")
+
+
+BS = "\\"
+
+
+@pytest.mark.parametrize("url", [
+    f"http://127.0.0.1:8080{BS}@example.com/any/path?x=1",
+    f"127.0.0.1:8080{BS}@example.com/any/path",
+    f"http:{BS}{BS}127.0.0.1{BS}x",
+    f"http://169.254.169.254{BS}@example.com/",
+    f"https://10.0.0.1{BS}@example.com{BS}",
+])
+def test_backslash_in_the_authority_is_read_like_chrome(url, fake_dns):
+    """WHATWG: '\' is '/' in http(s) URLs, so the checked host must be the one before it."""
+    normalized = normalize_url(url)
+    assert BS not in normalized.split("?")[0]
+    with pytest.raises(PolicyError):
+        REMOTE.check(normalized)
+    with pytest.raises(PolicyError):
+        REMOTE.check(url if "://" in url or url.startswith("http:") else "http://" + url)
+
+
+def test_backslash_paths_on_public_hosts_stay_allowed(fake_dns):
+    assert normalize_url(f"https://good.example{BS}path") == "https://good.example/path"
+    REMOTE.check(normalize_url(f"https://good.example{BS}path"))
+    assert normalize_url(f"https://good.example/a?b={BS}c") == f"https://good.example/a?b={BS}c"  # query untouched
+
+
+def test_proxy_hosts_follow_the_private_network_rules(fake_dns):
+    for host in ("127.0.0.1", "localhost", "::1", "192.168.1.5", "2130706433", "evil.example", "lan.example"):
+        with pytest.raises(PolicyError, match="allow-private-network"):
+            REMOTE.check_host(host, 1080)
+    REMOTE.check_host("good.example", 1080)
+    REMOTE.check_host("93.184.216.34", 8080)
+    LOCAL.check_host("127.0.0.1", 1080)  # local mode: the user's own local proxies are fine
+    REMOTE_PRIVATE_OK.check_host("10.0.0.1", 3128)
+    with pytest.raises(PolicyError):
+        REMOTE.check_host("a.example/@127.0.0.1", 80)

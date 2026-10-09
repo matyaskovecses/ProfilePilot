@@ -6,34 +6,43 @@ credential-free local relay (same exit IP as its browser) with the cookies the b
 would send for each URL (asked from Chrome per request, so redirects get the right cookies), and
 writes ``Set-Cookie`` responses back into the live browser.
 
-In remote (HTTP) mode file paths are confined to the data root, and every request / redirect hop
-goes through the URL policy.
+Cookie files are confined to the exports folders of the data root (remote mode: writes only to
+the profile's own exports folder) unless a local server runs with ``--files-anywhere``; the store's
+own files are never written. In remote (HTTP) mode every request / redirect hop goes through the
+URL policy.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import mimetypes
 import re
 import time
 from datetime import datetime, timezone
+from email.message import Message
 from email.utils import parsedate_to_datetime
 from functools import partial
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from urllib.parse import unquote, urlsplit
 
 import httpx
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
+from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
 
 from ..automation import cookies as cookie_utils
 from ..automation.manager import ProfileSession, is_shardx_ref
 from ..errors import PolicyError, ProfilePilotError
+from ..safety import normalize_url
 from .app import (
     DEFAULT_MAX_CHARS,
     AppState,
     MaxCharsArg,
+    NoneOK,
     OffsetArg,
     ProfileArg,
     add_tool,
@@ -42,8 +51,9 @@ from .app import (
     is_blank,
     paginate_text,
     run_sync,
+    to_tool_error,
 )
-from .tools_browser import check_url
+from .tools_browser import check_url, relay_hint
 
 log = logging.getLogger("profilepilot.server")
 
@@ -66,22 +76,81 @@ def export_dir(state: AppState, session: ProfileSession) -> Path:
     return base
 
 
-def resolve_user_path(state: AppState, base: Path, path: str | None, default_name: str) -> Path:
-    """A user/model supplied path. Relative paths are relative to ``base``; in remote mode the
-    result must stay inside the data root (a remote client must not read or write arbitrary files)."""
+def exports_roots(state: AppState) -> list[Path]:
+    """Every exports folder of the data root: ``exports/`` and ``profiles/<id>/exports/``."""
+    root = Path(state.store.root).resolve()
+    roots = [root / "exports"]
+    profiles = root / "profiles"
+    if profiles.is_dir():
+        roots += [d / "exports" for d in profiles.iterdir() if d.is_dir()]
+    return roots
+
+
+def _inside(path: Path, folders: list[Path]) -> bool:
+    return any(path == f or f in path.parents for f in folders)
+
+
+def resolve_user_path(state: AppState, base: Path, path: str | None, default_name: str, *,
+                      write: bool = False) -> Path:
+    """A user/model supplied cookie-file path. Relative paths are relative to ``base`` (the
+    profile's exports folder).
+
+    * remote mode: writes must stay in ``base`` (the session's own exports folder) and reads in an
+      exports folder of the data root - a remote client must not touch arbitrary files;
+    * local mode: the same exports folders, unless the server runs with ``--files-anywhere``;
+    * every mode: a write never targets the store's own files (config, proxies, secrets, profile
+      and runtime records), only exports folders inside the data root.
+    """
     raw = (path or "").strip()
     candidate = Path(raw).expanduser() if raw else base / default_name
     if not candidate.is_absolute():
         candidate = base / candidate
     candidate = candidate.resolve()
+    root = Path(state.store.root).resolve()
     if state.remote:
-        root = Path(state.store.root).resolve()
-        if candidate != root and root not in candidate.parents:
+        allowed = [base.resolve()] if write else [r.resolve() for r in exports_roots(state)]
+        if not _inside(candidate, allowed):
             raise PolicyError(
-                f"In remote mode cookie files must be inside ProfilePilot's data folder ({root}). "
-                "Give a file name only to use the profile's exports folder."
+                "In remote mode cookie files must be in a profile's exports folder; give a file name only "
+                f"(it is saved in {base})."
             )
+    elif not state.files_anywhere:
+        if not _inside(candidate, [r.resolve() for r in exports_roots(state)]):
+            raise PolicyError(
+                f"Cookie files must be in a profile's exports folder ({base}); give a file name only, or move "
+                "the file there. (The user can start the server with --files-anywhere to allow other folders.)"
+            )
+    if write and (candidate == root or root in candidate.parents) and not _inside(
+        candidate, [r.resolve() for r in exports_roots(state)]
+    ):
+        raise PolicyError(f"Refusing to write {candidate}: ProfilePilot's own data files are off-limits. "
+                          "Use a file name in the profile's exports folder.")
     return candidate
+
+
+def _is_cookie_file(path: Path) -> bool:
+    """True if ``path`` already holds a cookie export (JSON list / {cookies: [...]}, or cookies.txt)."""
+    try:
+        text = path.read_bytes().decode("utf-8-sig")
+    except (OSError, UnicodeDecodeError):
+        return False
+    if cookie_utils.detect_format(text) == "json":
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return False
+        items = data.get("cookies") if isinstance(data, dict) else data
+        return isinstance(items, list) and all(isinstance(c, dict) and "name" in c for c in items)
+    try:
+        cookies = cookie_utils.parse_netscape(text)
+    except cookie_utils.CookieFormatError:
+        return False
+    return bool(cookies) or text.lstrip().startswith(cookie_utils.NETSCAPE_HEADER)
+
+
+def _check_cookie_suffix(path: Path) -> None:
+    if path.suffix.lower() not in COOKIE_FILE_SUFFIXES:
+        raise PolicyError(f"Cookie files must end in {', '.join(COOKIE_FILE_SUFFIXES)} (got {path.name!r}).")
 
 
 # ---------------------------------------------------------------------- cookies
@@ -90,8 +159,8 @@ def resolve_user_path(state: AppState, base: Path, path: str | None, default_nam
 async def cookies_get(
     ctx: Context,
     profile: ProfileArg,
-    url: Annotated[str | None, Field(description="Only cookies the browser would send to this URL.")] = None,
-    domain: Annotated[str | None, Field(description="Only cookies of this domain (and its subdomains).")] = None,
+    url: Annotated[str, NoneOK, Field(description="Only cookies the browser would send to this URL.")] = None,
+    domain: Annotated[str, NoneOK, Field(description="Only cookies of this domain (and its subdomains).")] = None,
     names_only: Annotated[bool, Field(description="Only domain + name (shortest output).")] = False,
     max_chars: MaxCharsArg = DEFAULT_MAX_CHARS,
     offset: OffsetArg = 0,
@@ -99,8 +168,12 @@ async def cookies_get(
     """Show which cookies a profile has (names, domains, expiry, flags). Values are never shown; use
     cookies_export to save them to a file."""
     state = get_state(ctx)
+    target_url = normalize_url(str(url)) if not is_blank(url) else None  # "example.com" -> https://...
+    if target_url is not None and not target_url.lower().startswith(("http://", "https://")):
+        raise ProfilePilotError("url must be an http(s) URL such as https://example.com/; use domain= to filter "
+                                "by domain.")
     session = await state.browsers.session(profile)
-    raw = await (session.context.cookies(str(url).strip()) if not is_blank(url) else session.context.cookies())
+    raw = await (session.context.cookies(target_url) if target_url else session.context.cookies())
     selected = cookie_utils.filter_cookies(raw, domain=domain.strip() if not is_blank(domain) else None)
     if not selected:
         return f"[{session.label}] No cookies" + (f" for {url}" if url else "") + (f" on {domain}" if domain else "") + "."
@@ -136,9 +209,9 @@ async def cookies_set(
 async def cookies_clear(
     ctx: Context,
     profile: ProfileArg,
-    domain: Annotated[str | None, Field(description="Only this domain and its subdomains (default: ALL "
+    domain: Annotated[str, NoneOK, Field(description="Only this domain and its subdomains (default: ALL "
                                                     "cookies).")] = None,
-    name: Annotated[str | None, Field(description="Only cookies with this name.")] = None,
+    name: Annotated[str, NoneOK, Field(description="Only cookies with this name.")] = None,
 ) -> str:
     """Delete cookies (all, or one domain's). This logs the profile out of those sites: confirm with
     the user first."""
@@ -162,25 +235,39 @@ async def cookies_clear(
 async def cookies_export(
     ctx: Context,
     profile: ProfileArg,
-    path: Annotated[str | None, Field(description="Target file (default: the profile's exports folder). "
+    path: Annotated[str, NoneOK, Field(description="Target file (default: the profile's exports folder). "
                                                   ".txt = Netscape cookies.txt, otherwise JSON.")] = None,
     format: Annotated[Literal["json", "netscape"] | None, Field(description="File format (default from the "
                                                                              "file extension).")] = None,
-    domain: Annotated[str | None, Field(description="Only cookies of this domain.")] = None,
+    domain: Annotated[str, NoneOK, Field(description="Only cookies of this domain.")] = None,
+    overwrite: Annotated[bool, Field(description="Replace an existing cookie export of the same name "
+                                                 "(other files are never replaced).")] = False,
 ) -> str:
-    """Save a profile's cookies (with values) to a JSON or Netscape cookies.txt file. The values go
-    to the file only, never into the chat."""
+    """Save a profile's cookies (with values) to a JSON or Netscape cookies.txt file in the profile's
+    exports folder. The values go to the file only, never into the chat. Existing files are only
+    replaced with overwrite=true, and only if they are cookie exports."""
     state = get_state(ctx)
     session = await state.browsers.session(profile)
     raw = await session.context.cookies()
     selected = cookie_utils.filter_cookies(raw, domain=domain.strip() if not is_blank(domain) else None)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     ext = "txt" if format == "netscape" else "json"
-    target = resolve_user_path(state, export_dir(state, session), path, f"cookies-{stamp}.{ext}")
-    if target.exists() and (target.is_dir() or target.suffix.lower() not in COOKIE_FILE_SUFFIXES):
-        raise ProfilePilotError(f"Refusing to overwrite {target}: cookie exports only replace existing "
-                                f"{', '.join(COOKIE_FILE_SUFFIXES)} files. Choose a new file name.")
-    written = await run_sync(cookie_utils.export_cookies, selected, target, format)
+    base = export_dir(state, session)
+    target = resolve_user_path(state, base, path, f"cookies-{stamp}.{ext}", write=True)
+    _check_cookie_suffix(target)
+    if target.is_dir():
+        raise PolicyError(f"{target} is a folder; give a file name.")
+    if target.exists():
+        if not overwrite:
+            raise ProfilePilotError(f"{target} already exists. Choose a new file name, or pass overwrite=true to "
+                                    "replace an earlier cookie export.")
+        if not await run_sync(_is_cookie_file, target):
+            raise PolicyError(f"Refusing to overwrite {target}: it is not a cookie export. Choose a new file name.")
+    if not target.parent.is_dir():
+        if not _inside(target, [r.resolve() for r in exports_roots(state)]):
+            raise ProfilePilotError(f"The folder {target.parent} does not exist.")
+        target.parent.mkdir(parents=True, exist_ok=True)
+    written = await run_sync(partial(cookie_utils.export_cookies, selected, target, format, create_parents=False))
     return f"[{session.label}] Exported {len(selected)} cookie(s) to {written}. The file contains secrets: keep it private."
 
 
@@ -190,10 +277,14 @@ async def cookies_import(
     path: Annotated[str, Field(description="JSON (list, {cookies:[...]}, Cookie-Editor export) or Netscape "
                                            "cookies.txt file.")],
 ) -> str:
-    """Load cookies from a file into a profile's live browser (e.g. to move a login session)."""
+    """Load cookies from a file in an exports folder into a profile's live browser (e.g. to move a
+    login session from another profile's cookies_export)."""
     state = get_state(ctx)
     session = await state.browsers.session(profile)
     source = resolve_user_path(state, export_dir(state, session), path, "cookies.json")
+    _check_cookie_suffix(source)
+    if not source.is_file():
+        raise ProfilePilotError(f"Cookie file not found: {source}")
     params = await run_sync(cookie_utils.load_cookie_file, source)
     if not params:
         return f"[{session.label}] {source} contains no cookies."
@@ -224,6 +315,28 @@ async def browser_user_agent(state: AppState, session: ProfileSession) -> str | 
     if ua:
         state.user_agents[session.key] = ua
     return ua
+
+
+async def browser_accept_language(state: AppState, session: ProfileSession) -> str | None:
+    """``Accept-Language`` as the browser sends it, built from ``navigator.languages`` (cached)."""
+    cached = state.accept_languages.get(session.key)
+    if cached:
+        return cached
+    pages = [p for p in session.context.pages if not p.is_closed()]
+    if not pages:
+        return None
+    try:
+        langs = await asyncio.wait_for(pages[0].evaluate("navigator.languages"), 2.0)
+    except Exception as exc:  # busy page / navigation in flight: try again next time
+        log.debug("could not read navigator.languages: %s", exc)
+        return None
+    langs = [str(x) for x in (langs or []) if isinstance(x, str) and x and re.fullmatch(r"[A-Za-z0-9-]+", x)]
+    if not langs:
+        return None
+    # Chrome's format: the first language without a weight, then q=0.9, 0.8, ... (never below 0.1)
+    header = ",".join([langs[0]] + [f"{lang};q={max(0.1, 1 - 0.1 * i):.1f}" for i, lang in enumerate(langs[1:], 1)])
+    state.accept_languages[session.key] = header
+    return header
 
 
 def _cookie_header(cookies: list[dict[str, Any]]) -> str:
@@ -262,16 +375,32 @@ async def write_back_cookies(session: ProfileSession, response: httpx.Response) 
     if not headers:
         return 0
     request = response.request
-    host = request.url.host
+    host = (request.url.host or "").lower()
     context = session.context
     changed = 0
+    existing: list[dict[str, Any]] | None = None
     for header in headers:  # deletions (Max-Age<=0 / past Expires) are not kept by cookiejar
         name, attrs = _parse_set_cookie(header)
-        if name and _is_deletion(attrs):
-            domain = attrs.get("domain", "").lstrip(".") or host
-            for candidate in {domain, "." + domain}:
-                await context.clear_cookies(name=name, domain=candidate, path=attrs.get("path") or None)
-            changed += 1
+        if not (name and _is_deletion(attrs)):
+            continue
+        spec = attrs.get("domain", "").strip().lstrip(".").lower()
+        if spec:
+            if host != spec and not host.endswith("." + spec):
+                continue  # like a browser: a site may only delete its own (or a parent domain's) cookies
+            if name.startswith("__Host-"):
+                continue  # __Host- cookies never carry a Domain attribute
+            candidates = {spec, "." + spec}
+        else:
+            candidates = {host}  # the host-only cookie of exactly this host
+        if request.url.scheme == "http":
+            # Chrome never lets an insecure response touch a Secure cookie ("leave secure cookies alone")
+            if existing is None:
+                existing = await context.cookies()
+            if any(c.get("name") == name and c.get("domain") in candidates and c.get("secure") for c in existing):
+                continue
+        for candidate in candidates:
+            await context.clear_cookies(name=name, domain=candidate, path=attrs.get("path") or None)
+        changed += 1
     jar = httpx.Cookies()
     jar.extract_cookies(response)  # RFC 6265-ish parsing and domain checks by http.cookiejar
     params = []
@@ -308,6 +437,9 @@ _BLOCK_TAGS = frozenset({
 })
 
 
+_XML_DECL = re.compile(r"^\ufeff?\s*<\?xml[^>]*\?>", re.IGNORECASE)
+
+
 def clean_html(text: str, base_url: str = "") -> Any:
     """Parse HTML and drop what a reader would not see without running the page: scripts, styles,
     ``<head>``, ``hidden`` / ``aria-hidden`` elements and inline ``display:none`` /
@@ -315,7 +447,8 @@ def clean_html(text: str, base_url: str = "") -> Any:
     absolute against ``base_url``."""
     import lxml.html
 
-    root = lxml.html.fromstring(text)
+    # lxml refuses str input that starts with an XML encoding declaration (XHTML pages)
+    root = lxml.html.fromstring(_XML_DECL.sub("", text, count=1))
     for el in root.xpath("//script|//style|//noscript|//template|//head|//*[@hidden]"
                          "|//*[@aria-hidden='true']|//*[@style]"):
         if el.tag in ("html", "body"):
@@ -341,7 +474,7 @@ def render_body(body: bytes, content_type: str, encoding: str | None, fmt: str, 
     ct = (content_type or "").lower()
     if not is_textual(ct):
         return f"(binary response: {content_type or 'unknown type'}, {len(body)} bytes; not shown)"
-    text = body.decode(encoding or "utf-8", errors="replace")
+    text = decode_body(body, ct, encoding)
     if "json" in ct and fmt != "raw":
         try:
             return json.dumps(json.loads(text), ensure_ascii=False, indent=1)
@@ -352,8 +485,9 @@ def render_body(body: bytes, content_type: str, encoding: str | None, fmt: str, 
 
         try:
             root = clean_html(text, base_url)
-        except Exception:  # unparsable markup: show it as it is
-            return text
+        except Exception:  # unparsable markup: never hand over the raw page (scripts, hidden text)
+            log.debug("could not parse an HTML body", exc_info=True)
+            return "(could not parse this HTML; use format='raw' to see the body)"
         if fmt == "html":
             return lxml.html.tostring(root, encoding="unicode")
         if fmt == "markdown":
@@ -369,9 +503,96 @@ def render_body(body: bytes, content_type: str, encoding: str | None, fmt: str, 
     return text
 
 
+_CHARSET_RE = re.compile(r"""charset\s*=\s*["']?\s*([\w.:-]+)""", re.IGNORECASE)
+_META_CHARSET = re.compile(rb"""<meta[^>]+charset\s*=\s*["']?\s*([\w.:-]+)""", re.IGNORECASE)
+_CHARSET_ALIASES = {"utf8mb4": "utf-8", "utf8mb3": "utf-8", "utf8": "utf-8"}
+
+
 def _charset(content_type: str) -> str | None:
-    match = re.search(r"charset=([\w.-]+)", content_type or "", re.IGNORECASE)
+    match = _CHARSET_RE.search(content_type or "")
     return match.group(1) if match else None
+
+
+def decode_body(body: bytes, content_type: str, encoding: str | None) -> str:
+    """Decode a response body like a browser: a UTF-8 BOM, the header charset, then an HTML/XML
+    ``<meta charset>`` prescan; unknown charset names fall through to UTF-8."""
+    ct = (content_type or "").lower()
+    candidates: list[str] = []
+    if body.startswith(b"\xef\xbb\xbf"):
+        candidates.append("utf-8-sig")
+    if encoding:
+        candidates.append(encoding)
+    if "html" in ct or "xml" in ct:
+        match = _META_CHARSET.search(body[:4096])
+        if match:
+            candidates.append(match.group(1).decode("ascii", "ignore"))
+    for name in candidates:
+        name = _CHARSET_ALIASES.get(name.strip().lower(), name.strip())
+        try:
+            return body.decode(name, errors="replace")
+        except LookupError:  # unknown / bogus charset name: try the next candidate, then UTF-8
+            continue
+    return body.decode("utf-8", errors="replace")
+
+
+_PDF_HINT = "Install profilepilot[pdf] (pypdf) to read PDF text."
+
+
+def pdf_text(data: bytes) -> str | None:
+    """Text of a PDF via the optional ``pypdf`` package (None when it is not installed)."""
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return None
+    import io
+
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        pages = [(page.extract_text() or "").strip() for page in reader.pages]
+    except Exception as exc:  # malformed / encrypted PDF
+        log.debug("PDF text extraction failed: %s", exc)
+        return ""
+    return "\n\n".join(f"[page {i}]\n{text}" for i, text in enumerate(pages, 1) if text)
+
+
+def download_name(url: str, content_type: str, disposition: str | None) -> str:
+    """A safe file name for a downloaded body (Content-Disposition, else the URL's last segment)."""
+    name = ""
+    if disposition:
+        msg = Message()
+        msg["content-disposition"] = disposition
+        name = msg.get_filename() or ""
+    if not name:
+        name = unquote(urlsplit(url).path.rsplit("/", 1)[-1])
+    name = re.sub(r"[^A-Za-z0-9._ -]+", "_", name.replace("\\", "/").rsplit("/", 1)[-1]).strip(" .")[:100]
+    if not name:
+        name = "download"
+    if name.split(".", 1)[0].upper() in _RESERVED_NAMES:
+        name = "_" + name  # CON, NUL, COM1, ... are devices on Windows
+    if "." not in name:
+        ext = mimetypes.guess_extension((content_type or "").split(";")[0].strip()) or ""
+        name += ext
+    return name
+
+
+_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(10)), *(f"LPT{i}" for i in range(10))}
+
+
+def save_download(folder: Path, name: str, data: bytes) -> Path:
+    """Write ``data`` to ``folder/name`` without replacing an existing file (``name-1.ext``, ...)."""
+    folder.mkdir(parents=True, exist_ok=True)
+    stem, dot, ext = name.rpartition(".")
+    if not dot:
+        stem, ext = name, ""
+    for n in range(10_000):
+        target = folder / (name if n == 0 else (f"{stem}-{n}.{ext}" if ext else f"{stem}-{n}"))
+        try:
+            with open(target, "xb") as fh:  # exclusive create: concurrent fetches never clobber each other
+                fh.write(data)
+            return target
+        except FileExistsError:
+            continue
+    raise ProfilePilotError(f"Too many files named {name!r} in {folder}.")
 
 
 # ---------------------------------------------------------------------- http_fetch
@@ -384,7 +605,7 @@ async def http_fetch(
     method: Annotated[Literal["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
                       Field(description="HTTP method.")] = "GET",
     headers: Annotated[dict[str, str] | None, Field(description="Extra request headers.")] = None,
-    body: Annotated[str | None, Field(description="Request body (e.g. JSON text) for POST/PUT/PATCH.")] = None,
+    body: Annotated[str, NoneOK, Field(description="Request body (e.g. JSON text) for POST/PUT/PATCH.")] = None,
     format: Annotated[Literal["markdown", "text", "html", "raw"], Field(
         description="markdown/text/html drop scripts and hidden elements of HTML and pretty-print JSON; "
                     "raw returns the body unchanged.")] = "markdown",
@@ -410,13 +631,19 @@ async def http_fetch(
     proxy = info.http_proxy_url if info is not None and info.relay_port else None
     payload = body.encode("utf-8") if body is not None else None
 
-    if engine == "scrapling":
-        result = await _fetch_scrapling(state, session, destination, method, headers, payload, follow_redirects,
-                                        timeout_s)
-    else:
-        result = await _fetch_httpx(state, session, destination, method, headers, payload, follow_redirects,
-                                    timeout_s, proxy)
-    status, reason, final_url, content_type, raw, truncated, cookies_written = result
+    try:
+        if engine == "scrapling":
+            result = await _fetch_scrapling(state, session, destination, method, headers, payload, follow_redirects,
+                                            timeout_s)
+        else:
+            result = await _fetch_httpx(state, session, destination, method, headers, payload, follow_redirects,
+                                        timeout_s, proxy)
+    except (httpx.ProxyError, httpx.TimeoutException) as exc:
+        hint = await relay_hint(state, session) if proxy else ""
+        if hint:  # the relay knows why the proxy failed: say so instead of a bare 502 / timeout
+            raise ToolError(f"{to_tool_error(exc, 'http_fetch')} {hint}") from None
+        raise
+    status, reason, final_url, content_type, raw, truncated, cookies_written, disposition = result
     if state.policy.restricts_private and final_url != destination:
         await state.policy.acheck(final_url)
 
@@ -431,13 +658,37 @@ async def http_fetch(
         lines.append(f"Set-Cookie: {cookies_written} cookie change(s) saved to the profile's browser.")
     if method == "HEAD" or not raw:
         return "\n".join(lines + ["(empty body)"])
+    if not is_textual(content_type):
+        return "\n".join(lines) + "\n\n" + await _binary_body(state, session, raw, content_type, final_url,
+                                                               disposition, truncated, offset, max_chars)
     text = render_body(raw, content_type, _charset(content_type), format, final_url)
     return "\n".join(lines) + "\n\n" + paginate_text(text, offset, max_chars)
 
 
+async def _binary_body(state: AppState, session: ProfileSession, raw: bytes, content_type: str, url: str,
+                       disposition: str | None, truncated: bool, offset: int, max_chars: int) -> str:
+    """Save a binary body to the profile's downloads folder; extract the text of PDFs."""
+    if session.profile is not None:
+        folder = await run_sync(state.store.downloads_dir, session.profile.id)
+    else:
+        folder = export_dir(state, session)
+    name = download_name(url, content_type, disposition)
+    saved = await run_sync(save_download, folder, name, raw)
+    part = " (only the first 5 MB)" if truncated else ""
+    note = f"(binary response: {content_type or 'unknown type'}, {len(raw)} bytes; saved to {saved}{part})"
+    if "pdf" in content_type.lower() or raw.startswith(b"%PDF"):
+        text = None if truncated else await run_sync(pdf_text, raw)
+        if text is None:
+            return note + ("\nThe PDF is incomplete, so its text cannot be read." if truncated else "\n" + _PDF_HINT)
+        if not text.strip():
+            return note + "\nThe PDF has no extractable text (it may be scanned images)."
+        return note + "\nPDF text:\n" + paginate_text(text, offset, max_chars)
+    return note
+
+
 async def _fetch_httpx(state: AppState, session: ProfileSession, url: str, method: str,
                        headers: dict[str, str] | None, payload: bytes | None, follow_redirects: bool,
-                       timeout_s: float, proxy: str | None) -> tuple[int, str, str, str, bytes, bool, int]:
+                       timeout_s: float, proxy: str | None) -> tuple[int, str, str, str, bytes, bool, int, str | None]:
     user_headers = {str(k): str(v) for k, v in (headers or {}).items()}
     manual_cookie = any(k.lower() == "cookie" for k in user_headers)
     written = 0
@@ -465,6 +716,9 @@ async def _fetch_httpx(state: AppState, session: ProfileSession, url: str, metho
     ua = await browser_user_agent(state, session)
     if ua:
         default_headers["User-Agent"] = ua
+    languages = await browser_accept_language(state, session)
+    if languages:
+        default_headers["Accept-Language"] = languages
     async with httpx.AsyncClient(
         proxy=proxy, trust_env=False, follow_redirects=follow_redirects, max_redirects=MAX_REDIRECTS,
         timeout=timeout_s, headers=default_headers,
@@ -482,12 +736,13 @@ async def _fetch_httpx(state: AppState, session: ProfileSession, url: str, metho
                     break
             raw = b"".join(chunks)[:MAX_BODY_BYTES]
             return (response.status_code, response.reason_phrase, str(response.url),
-                    response.headers.get("content-type", ""), raw, truncated, written)
+                    response.headers.get("content-type", ""), raw, truncated, written,
+                    response.headers.get("content-disposition"))
 
 
 async def _fetch_scrapling(state: AppState, session: ProfileSession, url: str, method: str,
                            headers: dict[str, str] | None, payload: bytes | None, follow_redirects: bool,
-                           timeout_s: float) -> tuple[int, str, str, str, bytes, bool, int]:
+                           timeout_s: float) -> tuple[int, str, str, str, bytes, bool, int, str | None]:
     try:
         from ..client import ProfilePilot
         from ..integrations.scrapling import fetcher_session
@@ -514,7 +769,7 @@ async def _fetch_scrapling(state: AppState, session: ProfileSession, url: str, m
     truncated = len(raw) > MAX_BODY_BYTES
     final_url = str(getattr(response, "url", "") or url)
     return (int(response.status), str(response.reason or ""), final_url, resp_headers.get("content-type", ""),
-            raw[:MAX_BODY_BYTES], truncated, 0)
+            raw[:MAX_BODY_BYTES], truncated, 0, resp_headers.get("content-disposition"))
 
 
 # ---------------------------------------------------------------------- registration
@@ -527,7 +782,7 @@ def register(server: MCPServer) -> None:
              open_world=False, invoking="Setting cookies…", invoked="Cookies set")
     add_tool(server, cookies_clear, title="Clear cookies", read_only=False, destructive=True, idempotent=True,
              open_world=False, invoking="Deleting cookies…", invoked="Cookies deleted")
-    add_tool(server, cookies_export, title="Export cookies", read_only=False, destructive=False, idempotent=True,
+    add_tool(server, cookies_export, title="Export cookies", read_only=False, destructive=True, idempotent=False,
              open_world=False, invoking="Exporting cookies…", invoked="Cookies exported")
     add_tool(server, cookies_import, title="Import cookies", read_only=False, destructive=False, idempotent=True,
              open_world=False, invoking="Importing cookies…", invoked="Cookies imported")
@@ -535,4 +790,4 @@ def register(server: MCPServer) -> None:
              open_world=True, invoking="Fetching…", invoked="Fetched")
 
 
-__all__ = ["register", "write_back_cookies", "render_body", "resolve_user_path"]
+__all__ = ["register", "write_back_cookies", "render_body", "decode_body", "resolve_user_path"]

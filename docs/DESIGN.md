@@ -181,7 +181,11 @@ class ProfileSession:
 On attach: `connect_over_cdp(cdp_http_url, no_defaults=True)`, use `browser.contexts[0]`; apply
 `Browser.setDownloadBehavior(behavior="allow", downloadPath=<profile downloads>, eventsEnabled=True)`;
 if `launch.timezone` set, `Emulation.setTimezoneOverride` on each page (+ `context.on("page")`).
-Track the active page per profile (new popups become active).
+Track the active page per profile (new popups become active; tools report a tab switch).
+A **minimized** window is never restored or brought to the front: `bringToFront`,
+`Browser.setWindowBounds` and even `ShowWindow(SW_SHOWNOACTIVATE)` give Chrome the keyboard focus
+(verified on Windows 11 / Chrome 154). Read-only tools work on the hidden page
+(`page(interactive=False)`); actions report that the window is minimized.
 
 ### 3.7 `automation/content.py` (B)
 ```python
@@ -189,7 +193,13 @@ async def snapshot(page, *, depth: int | None, ref: str | None, boxes: bool) -> 
 async def read_page(page, *, fmt: Literal["markdown","text","html"], selector: str | None, main_only: bool) -> str
     # Hidden content (display:none, visibility:hidden, aria-hidden, zero-size, <template>, offscreen
     # tricks) is removed IN THE BROWSER using computed styles before serialising — prompt-injection
-    # hygiene. markdown via `markdownify`; text via innerText of the cleaned clone.
+    # hygiene. markdown via `markdownify`; text via innerText of the cleaned clone. The selector is
+    # resolved by Playwright's engine (pierces open shadow roots, like the action tools). Fixed notes
+    # (never page text) report skipped visible iframes and opacity:0 / visibility:hidden text blocks
+    # below the viewport that a page reveals on scroll (they stay excluded: browser_scroll, then read).
+async def visible_html(page_or_frame) -> str   # for browser_extract: same visibility rules, all
+    # attributes, <head> kept, open shadow roots inlined as <template shadowrootmode="open">;
+    # browser_extract(include_hidden=true) uses full_html() instead. Both also run in visible iframes.
 def extract(html: str, url: str, *, css: str | None, xpath: str | None, attr: str | None, limit: int) -> list[str]
     # Uses scrapling.parser.Selector (supports ::text and ::attr(x)); falls back to lxml if missing.
 def paginate(text: str, *, offset: int, max_chars: int) -> tuple[str, int | None]   # returns (chunk, next_offset)
@@ -213,6 +223,9 @@ Also `async def check_via_relay(http_proxy_url)` for running profiles (uses the 
 Always block: `file:`, `chrome:`, `chrome-extension:`, `devtools:`, `view-source:`, `javascript:`.
 In remote mode (HTTP server) unless `allow_private`: block hostnames resolving to loopback/private/
 link-local/reserved addresses and `localhost`. Local stdio mode allows localhost (dev servers).
+`\` counts as `/` before the query of http(s) URLs (WHATWG, as in Chrome), both when checking and in
+`normalize_url`, so the checked host is the one Chrome contacts. `check_host(host, port)` applies the
+same rules to upstream proxy hosts (proxy_add / profile_create / profile_set_proxy / proxy_test).
 
 ### 3.11 `integrations/shardx.py` (C)
 `ShardXClient(base_url="http://127.0.0.1:40325", token=None, *, token_provider=None)` using httpx:
@@ -282,9 +295,16 @@ Browser: `browser_navigate(profile, url | "back" | "forward" | "reload", wait_un
 `browser_tabs(profile, action: list|new|select|close, index?, url?)`.
 
 Data: `cookies_get(profile, url?, names_only?)`, `cookies_set(profile, cookies)`, `cookies_clear(profile, domain?)` (destructive),
-`cookies_export(profile, path?, format?)`, `cookies_import(profile, path)`,
+`cookies_export(profile, path?, format?, overwrite?)`, `cookies_import(profile, path)` — files live in the
+exports folders of the data root (local mode: `serve --files-anywhere` allows other folders; the
+store's own files are never written; only cookie files are replaced, and only with `overwrite`),
 `http_fetch(profile, url, method?, headers?, body?, format?, engine: auto|httpx|scrapling)` — HTTP request
-through the profile's proxy with its cookies (and writes Set-Cookie back to the browser).
+through the profile's proxy with its cookies (and writes Set-Cookie back to the browser; deletions
+only for the responding host's domain, like a browser). Binary bodies are saved to the profile's
+downloads folder (PDF text via the optional `profilepilot[pdf]` extra).
+
+Optional free-text parameters are annotated as plain `str` (default None): the MCP SDK `json.loads`
+every other string argument, which turned `'{"a": 1}'` into a dict and `'null'` into None.
 
 ShardX (only registered when enabled): `shardx_status`, `shardx_profiles`, `shardx_start(profile)`, `shardx_stop(profile)`.
 
@@ -295,5 +315,9 @@ ShardX (only registered when enabled): `shardx_status`, `shardx_profiles`, `shar
 * `--auth token`: static bearer via `TokenVerifier` (Claude Code / Codex `--header`). `--auth secret-path`
   (default for ChatGPT): path becomes `/mcp/<32-byte urlsafe token>`; print the full URL once.
   Refuse `--auth none` unless `--host` is loopback **and** `--i-understand` is passed.
-* `UrlPolicy(remote=True)` blocks local/private targets unless `--allow-private-network`.
+* `UrlPolicy(remote=True)` blocks local/private targets unless `--allow-private-network`: before
+  navigation, before any browser tool acts on a tab, and again before its output is returned (a page
+  can move itself to a blocked address with scripts, timers, meta refresh or popups); blocked tabs
+  are navigated to about:blank (`browser_tabs` blanks them all). Proxy hosts are checked too.
+* Cookie files: writes only to the session's own exports folder, reads from any exports folder.
 * Recommended for ChatGPT: OpenAI Secure MCP Tunnel launching `profilepilot serve` over stdio (no public URL).
