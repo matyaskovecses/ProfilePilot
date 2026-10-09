@@ -24,6 +24,17 @@
   - They're redacted from everything the AI reads back.
 - **ShardX backend (optional):** drive ShardX/ShardBrowser profiles with the same tools.
 
+### ProfilePilot Manager and human handoff
+- **ProfilePilot Manager** (`profilepilot ui`) is a local app window for profiles, proxies, identities, activity and connections.
+  - **Profiles:** live thumbnails, start/stop/focus, and opening a page in a profile.
+  - **Proxies:** bulk import and testing, with latency history.
+  - **Identities:** write-only sensitive fields.
+  - **Activity:** a live feed of every tool call the AI makes.
+  - **Connections:** one-click client registration.
+  - **Look and setup:** light and dark themes, first-run guide, Desktop/Start-menu shortcut.
+- **Take control / Hand back:** while a profile is paused, the AI's browser tools are refused with a clear message.
+- **`profile_request_help`:** the AI asks you for a CAPTCHA, login, 2FA or payment step in the Manager, then waits.
+
 ### Clients
 - **Claude Desktop:** an `.mcpb` bundle or one-command config.
 - **Claude Code:** a plugin and marketplace, or `claude mcp add`.

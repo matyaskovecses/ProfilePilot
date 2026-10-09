@@ -314,7 +314,7 @@ and act on the active tab unless `tab` is given. Outputs are text-first and pagi
 (`max_chars` default 12000, `offset`, returning `next_offset`). Annotations: set
 `read_only_hint`, `destructive_hint`, `idempotent_hint`, `open_world_hint` on every tool.
 
-Profiles & proxies: `profile_list`, `browser_list`, `profile_create(name, proxy?, tags?, notes?, window?, browser?, lang?, timezone?)`,
+Profiles & proxies: `profile_list`, `browser_list`, `profile_request_help(profile, message, kind)`, `profile_create(name, proxy?, tags?, notes?, window?, browser?, lang?, timezone?)`,
 `profile_update(profile, …)`, `profile_delete(profile)` (to trash; destructive), `profile_clone(profile, new_name, copy_data?)`,
 `profile_start(profile, window?)`, `profile_stop(profile)`, `profile_status(profile?)`,
 `proxy_list`, `proxy_add(url, name?, tags?)` (+ bulk: newline-separated), `proxy_remove(proxy, force?)`,
@@ -376,3 +376,20 @@ ShardX (only registered when enabled): `shardx_status`, `shardx_profiles`, `shar
 * `form_autofill_sensitive` is not registered unless `--allow-sensitive-autofill` (remote clients cannot be relied on to
   ask the user before each call); the allow-listed-origin check applies on top.
 * Recommended for ChatGPT: OpenAI Secure MCP Tunnel launching `profilepilot serve` over stdio (no public URL).
+
+
+### Human handoff and the Apps panel
+
+* `profile_request_help(profile, message, kind=captcha|login|verification|payment|other)` asks the user in
+  ProfilePilot Manager (and the in-chat panel) and pauses the profile. While a profile is paused (by a help
+  request, or because the user clicked **Take control**), every browser, form, cookie and http tool, plus
+  `profile_stop` / `profile_set_proxy`, is refused with a message telling the model to wait and check
+  `profile_status`, which reports the pause and the help requests. Every tool call is logged (scrubbed) to
+  `<root>/activity.jsonl` and shown live in the Manager (`control.py`, `server/tools_control.py`, `ui/`).
+* Apps panel (`server/apps_ui.py`): `profiles_dashboard()` renders `ui://profilepilot/dashboard.html` in MCP
+  Apps hosts (ChatGPT, Claude) and returns a text overview elsewhere; `dashboard_action(action, profile,
+  request_id?, token)` is app-only (`_meta.ui.visibility = ["app"]`) and needs a per-process token the model
+  never sees.
+* `serve --http --auth oauth`: OAuth 2.1 + PKCE S256, dynamic client registration and client ID metadata
+  documents, refresh and revoke, RFC 8707 resource binding, RFC 9207 `iss`, consent with a rotating pairing
+  code (token hashes in `<root>/oauth.json`). Recommended for ChatGPT: `profilepilot connect chatgpt`.

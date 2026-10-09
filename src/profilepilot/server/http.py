@@ -46,7 +46,7 @@ from ..store import Store
 
 log = logging.getLogger("profilepilot.server.http")
 
-AuthMode = Literal["secret-path", "token", "none"]
+AuthMode = Literal["secret-path", "token", "oauth", "none"]
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8931
 DEFAULT_PATH = "/mcp"
@@ -133,6 +133,8 @@ class HttpPlan:
     token_generated: bool = False
     urls: list[str] = field(default_factory=list)
     sensitive_autofill: bool = False
+    oauth: Any = None
+    """:class:`profilepilot.server.oauth.OAuthSetup` when ``auth == "oauth"``."""
 
 
 def build_http_app(
@@ -155,8 +157,8 @@ def build_http_app(
     """Build the Starlette app of the remote server (validating the auth choice)."""
     from .app import create_server
 
-    if auth not in ("secret-path", "token", "none"):
-        raise ProfilePilotError("auth must be 'secret-path', 'token' or 'none'.")
+    if auth not in ("secret-path", "token", "oauth", "none"):
+        raise ProfilePilotError("auth must be 'secret-path', 'token', 'oauth' or 'none'.")
     if not 0 < int(port) < 65536:
         raise ProfilePilotError(f"Invalid port {port}.")
     publics = [normalize_public_host(h) for h in public_hosts]
@@ -167,6 +169,7 @@ def build_http_app(
 
     verifier: StaticTokenVerifier | None = None
     auth_settings: AuthSettings | None = None
+    oauth_setup: Any = None
     generated = False
     endpoint = base_path
     if auth == "none":
@@ -186,13 +189,20 @@ def build_http_app(
         verifier = StaticTokenVerifier(token)
         issuer = f"http://{'127.0.0.1' if host in ('0.0.0.0', '::', '') else host}:{port}"
         auth_settings = AuthSettings(issuer_url=issuer, resource_server_url=None, validate_token_resource=False)
+    elif auth == "oauth":
+        from .oauth import build_oauth, public_base_url
+
+        # issuer = https://<first public host>; without one http://127.0.0.1:<port> (local clients only)
+        oauth_setup = build_oauth(store, public_base_url(host, port, publics), mcp_path=base_path)
+        auth_settings = oauth_setup.settings
     else:  # secret-path
         endpoint = f"{base_path}/{path_secret(store, rotate=new_secret)}"
 
     server = create_server(
         store=store, runtime=runtime, remote=True, allow_private=allow_private,
         allow_sensitive_autofill=allow_sensitive_autofill,
-        token_verifier=verifier, auth=auth_settings, log_level=log_level.upper(),  # type: ignore[arg-type]
+        token_verifier=verifier, auth_server_provider=oauth_setup.provider if oauth_setup else None,
+        auth=auth_settings, log_level=log_level.upper(),  # type: ignore[arg-type]
     )
     app = server.streamable_http_app(
         streamable_http_path=endpoint,
@@ -201,10 +211,13 @@ def build_http_app(
         transport_security=transport_security(publics),
         host=host,
     )
+    if oauth_setup is not None:
+        app = oauth_setup.wrap(app)  # consent page, discovery documents, RFC 9207 iss
     local_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else (f"[{host}]" if ":" in host else host)
     urls = [f"http://{local_host}:{port}{endpoint}"] + [f"https://{h}{endpoint}" for h in publics]
     return HttpPlan(app=app, server=server, host=host, port=int(port), path=endpoint, auth=auth, token=token,
-                    token_generated=generated, urls=urls, sensitive_autofill=allow_sensitive_autofill)
+                    token_generated=generated, urls=urls, sensitive_autofill=allow_sensitive_autofill,
+                    oauth=oauth_setup)
 
 
 def describe_plan(plan: HttpPlan) -> str:
@@ -214,6 +227,11 @@ def describe_plan(plan: HttpPlan) -> str:
         lines.append("Auth: secret path. Treat these URLs like passwords:")
     elif plan.auth == "token":
         lines.append("Auth: bearer token (send 'Authorization: Bearer <token>').")
+    elif plan.auth == "oauth":
+        lines += plan.oauth.describe()
+        if not any(u.startswith("https://") for u in plan.urls):
+            lines.append("No --public-host: only local clients can sign in. For ChatGPT run "
+                         "'profilepilot connect chatgpt'.")
     else:
         lines.append("Auth: NONE (loopback only).")
     lines += [f"  {u}" for u in plan.urls]

@@ -87,9 +87,12 @@ def proxy_label(record: ProxyRecord | None) -> str:
 
 
 def profile_line(profile: Profile, proxies: dict[str, ProxyRecord], info: RuntimeInfo | None,
-                 identities: dict[str, str] | None = None) -> str:
+                 identities: dict[str, str] | None = None, pause: Any = None) -> str:
     parts = [f"- {profile.name} (id {profile.id})"]
     parts.append(f"running, {info.window} window" if info else "stopped")
+    if pause is not None:
+        parts.append("PAUSED: the user has control" if getattr(pause, "by", "user") == "user"
+                     else "waiting for the user's help")
     if profile.proxy_id:
         record = proxies.get(profile.proxy_id)
         parts.append("proxy " + (proxy_label(record) if record else f"{profile.proxy_id} (missing)"))
@@ -249,8 +252,16 @@ async def profile_list(
     proxies = {p.id: p for p in await run_sync(state.store.list_proxies)}
     running = {i.profile_id: i for i in await run_sync(state.runtime.list_running)}
     identities = {i.id: i.name for i in await run_sync(IdentityStore(state.store).list)}
+
+    def pauses() -> dict[str, Any]:
+        from ..control import ControlStore
+
+        control = ControlStore(state.store)
+        return {p.id: control.state_by_id(p.id).effective for p in profiles}
+
+    paused = await run_sync(pauses)
     lines = [f"{len(profiles)} profile(s), {sum(1 for p in profiles if p.id in running)} running:"]
-    lines += [profile_line(p, proxies, running.get(p.id), identities) for p in profiles]
+    lines += [profile_line(p, proxies, running.get(p.id), identities, paused.get(p.id)) for p in profiles]
     return paginate_text("\n".join(lines), offset, max_chars)
 
 
@@ -455,8 +466,12 @@ async def profile_status(
         running = await run_sync(state.runtime.list_running)
         if not running:
             return "No profiles are running."
+        from .tools_control import control_lines
+
         labels = await run_sync(lambda: [live_proxy_label(state.store, i) for i in running])
-        return "\n\n".join(runtime_text(i.profile_name, i, label) for i, label in zip(running, labels))
+        controls = await run_sync(lambda: [control_lines(state.store, i.profile_id) for i in running])
+        return "\n\n".join("\n".join([runtime_text(i.profile_name, i, label), *extra])
+                           for i, label, extra in zip(running, labels, controls))
     assert profile is not None
     if is_shardx_ref(profile):
         if state.shardx is None:
@@ -485,7 +500,11 @@ async def profile_status(
         return target, info, stats, record, live
 
     target, info, stats, record, live = await run_sync(collect)
+    from .tools_control import control_lines
+
+    control = await run_sync(control_lines, state.store, target.id)
     lines = [f"Profile '{target.name}' (id {target.id}); saved proxy: {proxy_label(record)}."]
+    lines += control  # pause, open help requests, recently handled requests ([] when nothing pending)
     if info is None:
         lines.append("Not running. Browser tools start it automatically.")
         return "\n".join(lines)
@@ -680,6 +699,7 @@ async def proxy_test(
         await state.policy.acheck_host(endpoint.host, endpoint.port)
         result = await check_proxy(endpoint, timeout=timeout_s)
         await run_sync(store.set_proxy_check, record.id, result)
+        await run_sync(_record_history, store, record.id, result)  # Manager latency sparklines
         return check_text(label, result)
 
     if not is_blank(proxy):
@@ -726,6 +746,15 @@ async def browser_list(ctx: Context) -> str:
     lines.append("Pick one with profile_create(browser=...) or profile_update(browser=...); "
                  "default 'auto' uses the first of these.")
     return "\n".join(lines)
+
+
+def _record_history(store: Store, proxy_id: str, result: ProxyCheck) -> None:
+    try:
+        from ..ui.api import record_proxy_history
+
+        record_proxy_history(store, proxy_id, result)
+    except Exception as exc:  # the Manager's history is a nicety; never fail the tool for it
+        log.debug("proxy history not recorded: %s", exc)
 
 
 # ---------------------------------------------------------------------- registration

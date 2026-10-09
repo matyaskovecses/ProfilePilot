@@ -522,7 +522,7 @@ def test_skill_frontmatter_and_tool_names():
 
 def test_license_is_mit():
     text = (ROOT / "LICENSE").read_text(encoding="utf-8")
-    assert text.startswith("MIT License") and "Copyright (c) 2026 matyaskovecses" in text
+    assert text.startswith("MIT License") and "Copyright (c) 2026 Matyas Kovecses" in text
 
 
 # --------------------------------------------------------------------------- MCPB bundle

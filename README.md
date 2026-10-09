@@ -1,89 +1,162 @@
+<div align="center">
+
 # ProfilePilot
 
 **Many isolated browser profiles for your AI agent, running in your real, native Chrome.**
 
-ProfilePilot is an MCP plugin for **Claude** (Desktop and Code) and **ChatGPT** (plus Codex and Cursor).
-It lets the AI browse and scrape through any number of **profiles**. Each profile is a separate
-Chrome identity with its own cookies, logins, history, local storage, cache, and **its own
-proxy** (HTTP, HTTPS, SOCKS4 or SOCKS5, with or without username and password).
+[![CI](https://github.com/matyaskovecses/ProfilePilot/actions/workflows/ci.yml/badge.svg)](https://github.com/matyaskovecses/ProfilePilot/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.10%E2%80%933.13-blue)
+![MCP](https://img.shields.io/badge/MCP-Claude%20%C2%B7%20ChatGPT%20%C2%B7%20Codex%20%C2%B7%20Cursor-6E56CF)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-The idea comes from anti-detect browsers like ShardX/ShardBrowser and Linken Sphere, with one
-big difference: **ProfilePilot does no fingerprint spoofing.** No fake user agents, no canvas
-noise and no patched engine. Each profile is your machine's genuine Chrome, exactly like a person
-using it (and like Claude's built-in browser). On Chrome 154 we checked that `navigator.webdriver`
-is `false`, the user agent is the real one, and no automation banners or flags appear.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/manager/profiles-dark.png">
+  <img alt="ProfilePilot Manager: profile cards with live thumbnails, an AI help request and take-control buttons" src="docs/img/manager/profiles-light.png" width="860">
+</picture>
+
+</div>
+
+ProfilePilot gives **Claude** (Desktop and Code), **ChatGPT**, Codex and Cursor a fleet of browser
+**profiles**. Each profile is a separate identity of the real Chrome (or Edge or Brave) on your
+computer, with its own:
+- cookies, logins, history, storage and cache;
+- **proxy**: HTTP, HTTPS, SOCKS4 or SOCKS5, with or without username and password.
+
+The AI browses, scrapes and fills forms through the profiles. **ProfilePilot Manager** lets you see
+everything and take over whenever a human is needed.
+
+The idea comes from anti-detect browsers such as [ShardX/ShardBrowser](https://github.com/ProxyShard/ShardBrowser)
+and Linken Sphere, with one deliberate difference: **ProfilePilot spoofs nothing.** There are no fake user
+agents, no canvas noise and no patched engine. Every profile is your genuine browser, just as a
+person uses it. A [fingerprint audit](docs/FINGERPRINT-AUDIT.md) against 18 public bot and fingerprint
+detectors checks exactly that.
 
 ```
-ChatGPT ─┐                                   ┌─ profile "shop-us"  → Chrome window → SOCKS5 proxy (US)
-Claude  ─┼─ MCP ─► ProfilePilot ─ CDP ───────┼─ profile "shop-de"  → Chrome window → HTTP proxy (DE)
-Codex   ─┘                                   └─ profile "research" → Chrome window → direct
+ChatGPT ─┐                                     ┌─ profile "shop-us"   → Chrome window → SOCKS5 proxy (US)
+Claude  ─┼─ MCP ─► ProfilePilot ─ DevTools ────┼─ profile "shop-de"   → Edge window   → HTTP proxy (DE)
+Codex   ─┘              ▲                      └─ profile "research"  → Chrome window → direct
+                        └── ProfilePilot Manager (you: take control, solve CAPTCHAs, manage proxies)
 ```
 
-## Features
+## Highlights
 
-- **Isolated profiles.** Each profile gets its own Chrome user-data directory, so nothing is shared between them: cookies, sessions, history, storage, cache and extensions.
-- **Per-profile proxies, including authenticated SOCKS5.** Stock Chrome can't log in to SOCKS5 proxies, so every proxied profile gets a small local relay that handles the login for it.
-  - DNS is resolved at the proxy, not on your machine.
-  - WebRTC is restricted to the proxy, so your real IP can't leak.
-  - If the relay stops, traffic stops; it never quietly falls back to a direct connection.
-- **Live proxy switching.** Give a running profile a new proxy or rotate it without restarting Chrome.
+- **Isolated native profiles.** Every profile has its own browser data directory, and nothing is shared between profiles. Each one can run in any installed Chromium-family browser: Chrome, Edge, Brave, Chromium, and the Beta, Dev and Canary channels. Each sends exactly that browser's genuine identity.
+- **Real proxies, including authenticated SOCKS5.** Stock Chrome can't log in to SOCKS5 proxies, so a local relay does it for the browser.
+  - **No leaks:** DNS is resolved at the proxy, WebRTC can't leak your IP, and if the relay stops, traffic stops; it never silently goes direct. You can also switch proxies live.
+  - **Credentials** stay in the OS keyring and never reach the AI.
 - **Built for AI agents.**
-  - Accessibility snapshots mark elements with refs such as `[ref=e12]`; click and type by ref.
-  - Page reading outputs markdown, text or HTML, with hidden prompt-injection text removed.
-  - Scrapling-powered CSS/XPath extraction.
-  - Screenshots, tabs, cookies, and HTTP requests made with a profile's cookies and proxy.
-- **Human-like input and form autofill.** Type key by key with realistic timing, or paste through the real system clipboard (a genuine, trusted paste event). Fill sign-up, address and checkout forms (including card fields in Stripe-style iframes) from identities *you* entered; card numbers and SSNs stay in the OS keyring and are only filled on sites you allow.
-- **Shared by all your AI clients.** Profiles keep running in the background, so Claude, ChatGPT, the CLI and your Python scripts can all attach to the same live profile.
-- **Scrapling integration.** Point Scrapling's fetchers and spiders at a profile and they reuse its cookies, logins and proxy (see [docs/SCRAPLING.md](docs/SCRAPLING.md)).
-- **Optional ShardX backend.** Drive profiles from ShardX/ShardBrowser through its local API with the same tools. These profiles are labelled as a spoofed engine.
-- **Safe defaults.**
-  - Proxy passwords are stored in the OS keyring (Windows Credential Manager) and never shown to the AI.
-  - Remote (ChatGPT) mode blocks `file://` and private-network URLs.
+  - **Reading pages:** accessibility snapshots with element refs (`[ref=e12]`), and page reading in markdown, text or HTML with hidden prompt-injection text stripped.
+  - **Doing things:** CSS/XPath extraction (via [Scrapling](https://github.com/D4Vinci/Scrapling)), screenshots, tabs and cookies, plus HTTP requests that carry the profile's own cookies and browser identity.
+- **Human-like input and autofill.**
+  - **Typing:** humanized typing, and type-paste (a real Ctrl/⌘+Shift+V paste).
+  - **Autofill:** fills sign-up, address and checkout forms from details *you* entered. Card fields in Stripe-style iframes are included.
+  - **Sensitive values:** card numbers, CVVs, SSNs and passwords stay in the OS keyring, are filled only on sites you allow, and only after you approve.
+- **You stay in charge.** **ProfilePilot Manager** is a desktop window for your profiles, proxies and identities, with live thumbnails of what the AI is doing.
+  - Click **Take control** to pause the AI on a profile.
+  - When the AI hits a CAPTCHA, a login or a 2FA code, it asks you for help instead of guessing.
+- **Works with every major AI client.**
+  - **Claude Desktop and Claude Code:** one-command setup.
+  - **Codex and the ChatGPT desktop app:** a `config.toml` entry.
+  - **ChatGPT on the web:** a guided `connect chatgpt` that uses an OAuth sign-in you approve with a pairing code.
+  - **In ChatGPT and Claude:** an interactive profiles panel right in the chat.
+- **Shared and persistent.** Profiles keep running in the background. Claude, ChatGPT, the CLI and your Python and Scrapling scripts can all use the same live profile.
 
-## Install
+## Quick start
 
-Requirements: Python 3.10 or newer, and Google Chrome (or Edge, Brave or Chromium). Node.js is not
-needed, and no extra browser download is needed.
+You need **Python 3.10+** and **Google Chrome** (or Edge, Brave or Chromium). No Node.js and no extra browser downloads.
 
 ```bash
 git clone https://github.com/matyaskovecses/ProfilePilot && cd ProfilePilot
 python -m venv .venv
-.venv\Scripts\python -m pip install -e ".[scrapling]"
+.venv/Scripts/python -m pip install -e ".[scrapling]"
 ```
 
-Then register it with your AI clients. The command makes a backup of each config file before
-changing it:
+On macOS and Linux use `.venv/bin/...` instead of `.venv/Scripts/...`.
+
+Open the Manager. Its first-run guide connects your AI app in one click:
 
 ```bash
-.venv\Scripts\profilepilot install claude-desktop
+.venv/Scripts/profilepilot ui
+```
+
+Or register from the terminal. Each config file is backed up first:
+
+```bash
+.venv/Scripts/profilepilot install claude-desktop
 ```
 
 ```bash
-.venv\Scripts\profilepilot install claude-code
+.venv/Scripts/profilepilot install claude-code
 ```
 
 ```bash
-.venv\Scripts\profilepilot install codex
+.venv/Scripts/profilepilot install codex
 ```
 
-`profilepilot install print` shows the config snippets without changing anything. For ChatGPT,
-which needs a remote connection, see [docs/CLIENTS.md](docs/CLIENTS.md). It covers OpenAI's Secure
-MCP Tunnel and the `serve --http` mode. That file also has setup steps for each client.
+Restart the AI app and ask it something like:
 
-## Quick start (talking to your AI)
+> Create a profile "us-1" with proxy `socks5://user:pass@1.2.3.4:1080`, open example-shop.com in it, search for
+> "usb-c hub" and give me the first 20 product names and prices.
 
-> Create two profiles: "us-1" using proxy `socks5://user:pass@1.2.3.4:1080` and "de-1" using `http://5.6.7.8:3128`.
-> In us-1, open example-shop.com, search for "usb-c hub" and extract the first 20 product names and prices.
-> Then do the same in de-1 and compare the prices.
+The AI does this:
+1. Creates the profile.
+2. Calls `browser_navigate`, then `browser_snapshot`.
+3. Clicks and types by ref.
+4. Calls `browser_extract`.
 
-What the AI does:
-1. `profile_create` creates the profiles.
-2. `browser_navigate` opens the site.
-3. `browser_snapshot` takes an accessibility snapshot.
-4. `browser_type` types the search, and `browser_click` clicks results by ref.
-5. `browser_extract` (CSS selectors) or `browser_read` (markdown) pulls out the data.
+If a CAPTCHA appears, it calls `profile_request_help`. The Manager shows "Claude needs you in us-1"
+with a **Focus window** button. You solve it, click **Done**, and the AI carries on.
 
-Each profile keeps its own cookies, so logins and carts stay separate.
+## ProfilePilot Manager: manage everything by hand
+
+Not everything can be automated. `profilepilot ui` opens **ProfilePilot Manager** in its own app window.
+`profilepilot ui --install-shortcut` adds it to the Desktop and the Start menu.
+
+- **Profiles:**
+  - live thumbnails of every running browser, with an "AI working" badge while the AI acts;
+  - start/stop, and **Focus**, which brings the window to the front;
+  - open a page in a profile;
+  - **Take control / Hand back to AI**;
+  - bulk start, stop, tag and proxy assignment.
+- **Help requests:** when the AI needs a human (CAPTCHA, login, 2FA, payment confirmation), a banner and a desktop notification appear. You act in the profile's window and click **Done**.
+- **Proxies:** paste hundreds at once (`host:port:user:pass`, `socks5://…`). Test the exit IP, country and latency, with a history sparkline, and see which profiles use each proxy. Passwords go into the OS keyring and are never shown again.
+- **Identities:** your details for autofill. Card numbers, CVVs, SSNs and passwords are write-only, and you choose which sites may receive them.
+- **Activity:** a live feed of every tool call the AI makes and of everything you did.
+- **Connections:** one-click setup for Claude Desktop, Claude Code, Codex and Cursor, and the ChatGPT connection status with its pairing code.
+
+| | |
+|---|---|
+| ![Proxies](docs/img/manager/proxies-light.png) | ![Profile details with a help request](docs/img/manager/drawer-profile-light.png) |
+| ![Identities](docs/img/manager/identities-light.png) | ![Activity](docs/img/manager/activity-dark.png) |
+| ![Add proxies](docs/img/manager/dialog-import-proxies-light.png) | ![Connections](docs/img/manager/connections-dark.png) |
+
+The Manager listens on 127.0.0.1 only, requires a one-time code from its launcher, and never shows stored
+secrets. The same controls are on the command line: `profilepilot profile pause|resume`, `profilepilot help list|resolve`.
+
+## Use with ChatGPT
+
+ChatGPT on the web can only use MCP servers on the internet. ProfilePilot opens a secure tunnel to
+your PC, protected by a sign-in that only you can approve:
+
+```bash
+profilepilot connect chatgpt
+```
+
+It prints a URL and a **pairing code**. In ChatGPT:
+1. Open chatgpt.com/plugins (Settings → Apps & Connectors).
+2. Choose **+ → Add custom MCP server**.
+3. Paste the URL and pick **OAuth**.
+4. Enter the pairing code on the ProfilePilot sign-in page.
+
+Keep the window open while you use ChatGPT. Ctrl+C, or `profilepilot connect stop`, ends sharing. The
+Manager's **Connections** view shows the URL and code while the connection runs.
+
+There's also an option with no public URL, OpenAI's Secure MCP Tunnel. That option, plan availability
+and troubleshooting are covered in [docs/CHATGPT.md](docs/CHATGPT.md). Setup for every other client is in
+[docs/CLIENTS.md](docs/CLIENTS.md).
+
+In ChatGPT and Claude, *"show my profiles"* opens an interactive panel with start/stop and **Take control**,
+right in the chat.
 
 ## Typing, paste & autofill
 
@@ -93,21 +166,19 @@ Each profile keeps its own cookies, so logins and carts stay separate.
 |---|---|---|
 | `fill` (default) | the value appears at once, with an `input` event but no key events | most fields |
 | `type` | one key event per character, at a fixed pace | fields that react to each key (search suggestions, masks) |
-| `human` | key by key with human timing: varied intervals, longer pauses after spaces and punctuation, Shift held for capitals | sites that look at how people type |
+| `human` | key by key with human timing: varied intervals, pauses after spaces and punctuation, Shift held for capitals | sites that look at how people type |
 | `paste` | a real paste from the system clipboard with Ctrl+Shift+V (⌘⇧V on macOS): a trusted `paste` event and `insertFromPaste` input | long text, and fields that expect pasting |
 
-`browser_paste(profile, ref, text)` is the same as `method="paste"`. While the text is on the clipboard,
-ProfilePilot holds a lock (so two profiles never paste at the same time), keeps the text out of Windows
-clipboard history and cloud sync, and then puts your own clipboard content back. If the page
-refuses the paste, the text is typed instead.
+Pasting with `browser_paste` or `method="paste"`:
+- holds a lock, so two profiles never paste at the same time;
+- keeps the text out of Windows clipboard history and cloud sync;
+- puts your own clipboard back afterwards.
 
-**Identities.** An identity is a named set of your details: name, email, phone, address, date of
-birth, company. Nothing is ever generated: you (or the AI, from what you tell it) enter the values.
-Card number, expiry, CVV, SSN and password are *sensitive*: they are stored only in the OS keyring,
-you enter them yourself in a terminal, and the AI only ever sees them masked (`visa •••• 4242`): page
-snapshots mask such fields, and once they are filled every page read of that profile shows them as
-`[redacted]`. Screenshots are pixels and cannot be redacted (remote servers refuse screenshots and
-JavaScript on such a page).
+**Identities** are named sets of your details: name, email, phone, address, date of birth, company.
+Nothing is ever generated. Card number, expiry, CVV, SSN and password are *sensitive*:
+- you enter them yourself, in a terminal or the Manager;
+- they're stored only in the OS keyring;
+- the AI only ever sees them masked (`visa •••• 4242`), and they're redacted from everything it reads back.
 
 ```bash
 profilepilot identity create "Jane" --set first_name=Jane --set last_name=Doe --set email=jane@example.com --set zip=94105
@@ -121,68 +192,30 @@ profilepilot identity secret "Jane" card_number
 profilepilot identity allow "Jane" https://shop.example.com
 ```
 
-```bash
-profilepilot profile update shop-us --identity "Jane"
-```
+**Autofill tools:**
+- `form_detect` lists a page's fields, including those in cross-origin iframes such as Stripe's card fields.
+- `form_autofill` fills text fields, selects, dates, radios, and split phone, SSN and card fields.
+- `form_autofill_sensitive` fills card, SSN and password fields. It needs your approval for every call and only works on allow-listed sites. Card fields can also go into known payment processors' iframes.
 
-`identity secret` asks for the value without showing it (twice for card numbers, SSNs and
-passwords) and never takes it from the command line; `--stdin` reads one line instead. `identity
-allow` lists the sites where sensitive fields may be filled.
-
-**Autofill.** `form_detect` lists the fields of the current page (also inside cross-origin iframes
-such as Stripe's card fields). `form_autofill` fills the non-sensitive ones from the profile's
-identity: text fields, selects (countries, states, months, years), date inputs, gender radios and
-split fields (phone 3-3-4, SSN 3-2-4, card 4×4). `form_autofill_sensitive` fills card, SSN and
-password fields, with three safeguards:
-
-- you approve every call (Claude asks; the tool is marked destructive for ChatGPT);
-- the page's site must be on the identity's allow-list. That is checked before any secret is read,
-  and filling stops if the page moves to another site. Iframes of other sites get nothing, except
-  card fields in the frames of known payment processors (Stripe, Braintree, Adyen, Checkout.com,
-  PayPal, Square) and frames whose origin you allow-listed too;
-- a remote (`serve --http`) server only offers it when started with `--allow-sensitive-autofill`.
-
-Hidden fields (zero-size, clipped, transparent, covered by another element) are never filled, so
-a page cannot collect your details in fields you cannot see. Nothing is submitted for you, and tool
-output never contains the values.
+Hidden or covered fields are never filled, nothing is submitted for you, and tool output never
+contains the values.
 
 ## Command line
 
-```bash
-profilepilot profile create shop-us --proxy "socks5://user:pass@1.2.3.4:1080" --tag shop
-```
+| Command | What it does |
+|---|---|
+| `profilepilot ui` | ProfilePilot Manager |
+| `profilepilot profile create shop-us --proxy "socks5://u:p@1.2.3.4:1080" --browser edge` | new profile (any installed browser: `profilepilot browsers`) |
+| `profilepilot profile start shop-us` / `stop` / `pause` / `resume` | run it, or take control of it |
+| `profilepilot proxy import proxies.txt --scheme socks5` | bulk import: `scheme://user:pass@host:port`, `host:port:user:pass`, `user:pass@host:port`, `host:port` (append `  # name`) |
+| `profilepilot proxy test shop-us` | exit IP, country and latency of a proxy or a profile's route |
+| `profilepilot status` | running profiles |
+| `profilepilot help list` | open help requests from the AI |
+| `profilepilot connect chatgpt` | share ProfilePilot with ChatGPT |
+| `profilepilot doctor` | check the installation |
 
-```bash
-profilepilot profile start shop-us
-```
-
-```bash
-profilepilot status
-```
-
-```bash
-profilepilot proxy import proxies.txt --scheme socks5
-```
-
-```bash
-profilepilot proxy test shop-us
-```
-
-```bash
-profilepilot profile stop shop-us
-```
-
-```bash
-profilepilot identity list
-```
-
-```bash
-profilepilot doctor
-```
-
-`proxy import` takes one proxy per line, in any of these formats: `scheme://user:pass@host:port`,
-`host:port:user:pass`, `user:pass@host:port` or `host:port`. Add `  # name` at the end of a line to
-name that proxy.
+Add `--json` to any command for machine-readable output. Secrets are never printed. Proxy specs and
+tokens can be read from stdin (`-`), so they never appear in the process list.
 
 ## Python and Scrapling
 
@@ -190,73 +223,119 @@ name that proxy.
 from profilepilot import ProfilePilot
 
 pp = ProfilePilot()
-info = pp.start("shop-us")          # launches (or reuses) the profile's real Chrome
-print(info.cdp_http_url)            # CDP endpoint; attach Playwright, Puppeteer or Scrapling
+info = pp.start("shop-us")          # launches (or reuses) the profile's real browser
+print(info.cdp_http_url)            # DevTools endpoint: attach Playwright, Puppeteer or Scrapling
 print(info.http_proxy_url)          # the profile's proxy as a credential-free local URL
 
-from profilepilot.integrations.scrapling import AsyncProfileSession
-async with AsyncProfileSession("shop-us") as session:   # reuses the profile's cookies and logins
+from profilepilot.integrations.scrapling import AsyncProfileSession, fetcher_session
+async with AsyncProfileSession("shop-us") as session:   # Scrapling inside the profile: its cookies, logins, proxy
     page = await session.fetch("https://example.com/account")
     print(page.css("h1::text").get())
+
+with fetcher_session("shop-us") as s:                   # fast HTTP with the profile's identity and cookies
+    print(s.get("https://example.com/api/items").json())
 ```
 
-More recipes, including `FetcherSession` with profile cookies and spiders, are in
-[docs/SCRAPLING.md](docs/SCRAPLING.md).
+More recipes (spiders, cookie write-back) are in [docs/SCRAPLING.md](docs/SCRAPLING.md).
 
 ## MCP tools
 
 | Group | Tools |
 |---|---|
-| Profiles | `profile_list`, `profile_create`, `profile_update`, `profile_clone`, `profile_delete`, `profile_start`, `profile_stop`, `profile_status`, `profile_set_proxy` |
-| Proxies | `proxy_list`, `proxy_add` (accepts a whole list at once), `proxy_remove`, `proxy_test` |
-| Browser | `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type` (fill, type, human or paste), `browser_paste`, `browser_press_key`, `browser_select_option`, `browser_hover`, `browser_scroll`, `browser_wait_for`, `browser_screenshot`, `browser_read`, `browser_extract`, `browser_evaluate`, `browser_tabs` |
-| Identities | `identity_list`, `identity_show` (sensitive values masked), `identity_create`, `identity_update` (non-sensitive values only) |
-| Forms | `form_detect`, `form_autofill`, `form_autofill_sensitive` (card, SSN, password: needs your approval and an allowed site) |
+| Profiles | `profile_list`, `profile_create`, `profile_update`, `profile_clone`, `profile_delete`, `profile_start`, `profile_stop`, `profile_status`, `profile_set_proxy`, `browser_list` |
+| Human handoff | `profile_request_help` (asks you in the Manager and pauses the profile), `profiles_dashboard` (interactive panel in ChatGPT/Claude) |
+| Proxies | `proxy_list`, `proxy_add` (many at once), `proxy_remove`, `proxy_test` |
+| Browser | `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_paste`, `browser_press_key`, `browser_select_option`, `browser_hover`, `browser_scroll`, `browser_wait_for`, `browser_screenshot`, `browser_read`, `browser_extract`, `browser_evaluate`, `browser_tabs` |
+| Identities & forms | `identity_list`, `identity_show`, `identity_create`, `identity_update`, `form_detect`, `form_autofill`, `form_autofill_sensitive` |
 | Data | `cookies_get`, `cookies_set`, `cookies_clear`, `cookies_export`, `cookies_import`, `http_fetch` |
-| ShardX (optional) | `shardx_status`, `shardx_profiles`, `shardx_start`, `shardx_stop`. Every browser tool also accepts `profile="shardx:<name>"`. |
+| ShardX (optional) | `shardx_status`, `shardx_profiles`, `shardx_start`, `shardx_stop`; any browser tool also takes `profile="shardx:<name>"` |
 
 ## How it works
 
-Each running profile is a small **host process** that owns two things:
-- a real `chrome.exe`, started with only the flags a normal user could pass (its own `--user-data-dir` and a fixed DevTools port);
-- the local proxy relay for that profile.
+Each running profile is a small **host process** that owns:
+- the real browser, started with the flags a normal user could pass: its own `--user-data-dir` and a fixed DevTools port;
+- the profile's local proxy relay.
 
-The MCP server attaches to that Chrome over the Chrome DevTools Protocol (CDP), the same mechanism
-Claude's built-in browser uses. Because the hosts are separate processes, a profile keeps running
-when an AI client restarts, and several clients can use it at the same time. If a host process
-dies, Windows closes its Chrome too (a job object), so there are no orphaned browsers on a dead
-proxy. The full design and the facts it was checked against are in [docs/DESIGN.md](docs/DESIGN.md).
+Tools attach to it over the Chrome DevTools Protocol using [patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright-python).
+That driver never enables the `Runtime` domain, and it evaluates in an isolated world. ProfilePilot
+also patches out two automation artifacts patchright adds: forced focus emulation and synthetic user
+activation.
 
-### Native by design: what ProfilePilot does and doesn't change
+A profile keeps running when an AI client restarts, and several clients can share it. If a host dies,
+its browser goes with it, so no browser is left running on a dead proxy. The design and the facts it
+was checked against are in [docs/DESIGN.md](docs/DESIGN.md).
 
-| ProfilePilot does | ProfilePilot never does |
+### Native by design: what the fingerprint audit found
+
+[docs/FINGERPRINT-AUDIT.md](docs/FINGERPRINT-AUDIT.md) compares three setups: plain Chrome, a ProfilePilot
+profile, and a ProfilePilot profile behind a real residential proxy. It uses a local probe of about 40
+signals and 18 public detectors.
+
+| Check | Result |
 |---|---|
-| Separate user-data dir per profile | Spoof the user agent, client hints, screen, GPU, fonts or canvas |
-| Proxy via a local relay, with DNS resolved at the proxy | Use `--enable-automation`, `--headless` (unless you ask for it), `--no-sandbox` or `--disable-blink-features` |
-| WebRTC limited to the proxy when one is set | Inject stealth scripts |
-| Language/timezone override, only if you turn it on | Solve CAPTCHAs |
+| Static fingerprint (UA, client hints, screen, WebGL/WebGPU, canvas, audio, fonts, globals) | identical to plain Chrome |
+| `navigator.webdriver`, automation infobars, CDP side channels (`prepareStackTrace`, console timing, workers) | identical to plain Chrome |
+| deviceandbrowserinfo, fingerprint.com, pixelscan bot check, rebrowser bot detector | same verdict as plain Chrome; these flagged earlier Playwright-based builds |
+| sannysoft, CreepJS, BrowserScan, incolumitas, whoer, browserleaks, reCAPTCHA v3 score | same as plain Chrome |
+| Through SOCKS5 and HTTP proxies: IP, DNS, WebRTC, IPv6 | no leak; plain Chrome on the same proxy leaks your IP over WebRTC |
+| TLS (JA4) and HTTP/2 fingerprint | byte-identical to plain Chrome |
 
-**Know the limit:** every profile shares your machine's real hardware fingerprint (GPU, fonts,
-screen). Sites see different cookies and different IPs, but an advanced fingerprinting system
-could still tell that the profiles come from the same computer. That's the price of being native.
-If you really need unlinkable identities, use the ShardX backend for those profiles.
+**Known limits.**
+- Every profile shares your machine's hardware fingerprint (GPU, fonts, screen), so a fingerprinting vendor can tell that profiles come from the same computer.
+- The timezone follows your OS. Aligning it with the proxy is opt-in.
+- The back/forward cache is off.
+- `offscreen` windows are detectable; `normal` windows aren't.
+
+That's the price of being native. If you need unlinkable identities, use the ShardX backend for those profiles.
+
+**Browsers.** Chrome, Edge, Brave, Chromium and the Chrome/Edge Beta, Dev and Canary channels.
+- Opera and Vivaldi aren't supported.
+- Safari/WebKit is planned as a macOS `safaridriver` backend. On Windows there's no native Safari, and a WebKit build would not be native.
+
+## Security & privacy
+
+- **Prompt injection:** ProfilePilot assumes the AI can be prompt-injected by the pages it reads.
+- **Secrets:** proxy passwords, tokens and identity secrets live in the OS keyring and are never shown to the AI.
+- **Remote mode:** blocks local and private-network targets.
+- **Sensitive autofill:** needs your approval and an allow-listed site.
+
+The full model and private vulnerability reporting are in [SECURITY.md](SECURITY.md).
 
 ## Using it responsibly
 
-ProfilePilot is a tool for legitimate automation and scraping. Respect websites' terms of service
-and robots.txt, rate-limit your requests, and only log in to accounts you're allowed to use.
+ProfilePilot is for legitimate automation and scraping:
+- Respect websites' terms and robots.txt.
+- Rate-limit your requests.
+- Only use accounts and details you're entitled to.
+
+It does not solve CAPTCHAs or bypass access controls; those go to you.
 
 ## Development
 
 ```bash
-.venv\Scripts\python -m pytest
+.venv/Scripts/python -m pip install -e ".[test,scrapling]"
 ```
 
 ```bash
-.venv\Scripts\python -m pytest -m chrome
+.venv/Scripts/python -m pytest -m "not chrome"
 ```
 
-The first command runs the fast unit and integration tests. The second runs the real-Chrome
-end-to-end tests: windows open off-screen, and only processes the tests started are closed.
+```bash
+.venv/Scripts/python -m pytest
+```
 
-License: MIT.
+The second command runs the fast tests. The third runs everything, including the real-browser tests,
+whose windows open off-screen. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Credits
+
+ProfilePilot stands on the shoulders of two open-source projects:
+
+- **[ShardBrowser / ShardX](https://github.com/ProxyShard/ShardBrowser)** by the **ProxyShard** team (MIT). Its profile and proxy management, launch handling and local API design were the blueprint, and ProfilePilot can drive ShardX profiles directly.
+- **[Scrapling](https://github.com/D4Vinci/Scrapling)** by **Karim Shoair** ([@D4Vinci](https://github.com/D4Vinci)) (BSD-3-Clause). It powers extraction, Scrapling sessions inside profiles, curl_cffi fetching, and the patterns of ProfilePilot's MCP server.
+
+Also built with Playwright, patchright, the MCP Python SDK, python-socks, curl_cffi and more; see [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md).
+
+## License
+
+[MIT](LICENSE) © 2026 Matyas Kovecses

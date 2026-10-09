@@ -198,6 +198,10 @@ connects to MCP servers in two ways: through **OpenAI Secure MCP Tunnel**, or th
 HTTPS URL**. It cannot send API keys or bearer tokens: its only authentication options are "No
 auth" and OAuth.
 
+**Easiest:** run `profilepilot connect chatgpt`. It starts a tunnel and the server with an OAuth
+sign-in that you approve with a pairing code, and prints exactly what to paste into ChatGPT. The full
+walkthrough is in [CHATGPT.md](CHATGPT.md). The manual options are below.
+
 **Plans and workspaces.** Custom MCP servers are not available on every ChatGPT plan, and a
 workspace admin may have to allow them. OpenAI describes full MCP support for Business, Enterprise
 and Edu workspaces; check what your own account offers under chatgpt.com/plugins before you set
@@ -231,6 +235,10 @@ your machine. Nothing is exposed to the internet.
 Keep `tunnel-client run` running while you use ChatGPT. Run only one tunnel client per tunnel id.
 
 ### Option B: public HTTPS URL
+
+Prefer `profilepilot connect chatgpt`, which uses `--auth oauth`: ChatGPT signs in with OAuth, and you
+approve it with a rotating pairing code that only you can see. The secret-path setup described below
+still works for clients that can't do OAuth.
 
 > **Security warning.** Anyone who knows the URL can drive your browser profiles: use their logins
 > and cookies, spend your proxy traffic and read pages as you. ChatGPT cannot send a password, so

@@ -3,7 +3,11 @@
 Commands::
 
     serve [--http ...]                       MCP server (stdio by default; --http for remote clients)
-    profile list|create|show|start|stop|delete|restore|clone|update
+    ui [--install-shortcut]                  ProfilePilot Manager (local app window)
+    connect chatgpt|status|stop              share ProfilePilot with ChatGPT (tunnel + sign-in)
+    profile list|create|show|start|stop|pause|resume|delete|restore|clone|update
+    help list|resolve                        requests from the AI for you (CAPTCHA, login, 2FA)
+    browsers                                 installed browsers a profile can run in
     identity list|show|create|set|secret|clear|allow|disallow|delete|fields
     proxy list|add|import|remove|test
     status | stop-all
@@ -761,6 +765,12 @@ def cmd_proxy_test(args: argparse.Namespace) -> int:
         endpoint = store.proxy_endpoint(record.id)
         result = anyio.run(lambda: check_proxy(endpoint, timeout=args.timeout))
         store.set_proxy_check(record.id, result)
+        try:  # the Manager's latency sparklines
+            from .ui.api import record_proxy_history
+
+            record_proxy_history(store, record.id, result)
+        except Exception:
+            pass
     else:
         result = anyio.run(lambda: check_proxy(None, timeout=args.timeout))
     emit(args, result.model_dump(mode="json"), _check_text(label, result))
@@ -823,6 +833,70 @@ def _version_of(dist: str) -> str | None:
         return metadata.version(dist)
     except metadata.PackageNotFoundError:
         return None
+
+
+def cmd_ui(args: argparse.Namespace) -> int:
+    from .ui.launcher import main as ui_main
+
+    argv: list[str] = []
+    if args.home:
+        argv += ["--home", str(args.home)]
+    if args.port:
+        argv += ["--port", str(args.port)]
+    for flag in ("no_window", "keep_running", "install_shortcut", "remove_shortcut"):
+        if getattr(args, flag):
+            argv.append("--" + flag.replace("_", "-"))
+    return ui_main(argv)
+
+
+def cmd_profile_pause(args: argparse.Namespace) -> int:
+    from .control import ActivityEvent, ActivityLog, ControlStore
+
+    store = _store(args)
+    profile = store.get_profile(args.profile)
+    info = ControlStore(store).pause(profile.id, note=args.note or "")
+    ActivityLog(store.root).append(ActivityEvent(profile_id=profile.id, profile_name=profile.name, source="cli",
+                                                 tool="take control", summary=f"Paused '{profile.name}' for the AI."))
+    emit(args, info.model_dump(mode="json"),
+         f"The AI won't act on '{profile.name}' until you run: profilepilot profile resume \"{profile.name}\"")
+    return 0
+
+
+def cmd_profile_resume(args: argparse.Namespace) -> int:
+    from .control import ActivityEvent, ActivityLog, ControlStore
+
+    store = _store(args)
+    profile = store.get_profile(args.profile)
+    closed = ControlStore(store).resume(profile.id)
+    ActivityLog(store.root).append(ActivityEvent(profile_id=profile.id, profile_name=profile.name, source="cli",
+                                                 tool="hand back", summary=f"Handed '{profile.name}' back to the AI."))
+    emit(args, {"resolved": [r.model_dump(mode="json") for r in closed]},
+         f"Handed '{profile.name}' back to the AI" + (f" (closed {len(closed)} help request(s))." if closed else "."))
+    return 0
+
+
+def cmd_help_list(args: argparse.Namespace) -> int:
+    from .control import KIND_LABELS, ControlStore, clock
+
+    store = _store(args)
+    names = {p.id: p.name for p in store.list_profiles()}
+    reqs = ControlStore(store).help_requests(open_only=not args.all)
+    rows = [(r.id, names.get(r.profile_id, r.profile_id), KIND_LABELS.get(r.kind, r.kind), r.status,
+             clock(r.created_at), r.message) for r in reqs]
+    emit(args, [r.model_dump(mode="json") for r in reqs],
+         lambda: table(rows, ["ID", "PROFILE", "KIND", "STATUS", "ASKED", "MESSAGE"]) if rows
+         else "No open help requests.")
+    return 0
+
+
+def cmd_help_resolve(args: argparse.Namespace) -> int:
+    from .control import ControlStore
+
+    store = _store(args)
+    req = ControlStore(store).resolve_help(args.profile, args.request_id,
+                                           status="dismissed" if args.dismiss else "done", note=args.note or "")
+    emit(args, req.model_dump(mode="json"), f"Help request {req.id} is {req.status}.")
+    return 0
 
 
 def cmd_browsers(args: argparse.Namespace) -> int:
@@ -1051,8 +1125,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--path", default="/mcp", help="endpoint path (default /mcp)")
     p.add_argument("--public-host", action="append", metavar="HOST",
                    help="public host name of a tunnel (repeatable); allowed in Host/Origin headers")
-    p.add_argument("--auth", choices=["secret-path", "token", "none"], default=None,
-                   help="secret-path (default; for ChatGPT), token (bearer) or none (loopback only)")
+    p.add_argument("--auth", choices=["secret-path", "token", "oauth", "none"], default=None,
+                   help="secret-path (default), token (bearer), oauth (sign-in with a pairing code; what "
+                        "'connect chatgpt' uses) or none (loopback only)")
     p.add_argument("--token", default=None, help="bearer token for --auth token ('-' = read from stdin; "
                                                  "default PROFILEPILOT_TOKEN or a generated one)")
     p.add_argument("--allow-private-network", action="store_true",
@@ -1093,6 +1168,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = add(psub, "stop", "stop a profile's Chrome", cmd_profile_stop)
     p.add_argument("profile")
     p.add_argument("--timeout", type=float, default=20.0)
+    p = add(psub, "pause", "take control: the AI won't act on the profile until 'resume'", cmd_profile_pause)
+    p.add_argument("profile")
+    p.add_argument("--note", help="shown to the AI, e.g. 'logging in'")
+    p = add(psub, "resume", "hand the profile back to the AI (closes its open help requests)", cmd_profile_resume)
+    p.add_argument("profile")
     p = add(psub, "delete", "move a stopped profile to the trash", cmd_profile_delete)
     p.add_argument("profile")
     p = add(psub, "restore", "restore a profile from the trash (no id: list the trash)", cmd_profile_restore)
@@ -1200,6 +1280,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true")
 
     add(sub, "browsers", "list the installed browsers a profile can run in", cmd_browsers)
+    p = add(sub, "ui", "open ProfilePilot Manager: manage profiles, proxies and identities, take over from the AI",
+            cmd_ui)
+    p.add_argument("--port", type=int, default=0, help="port on 127.0.0.1 (default: a free one)")
+    p.add_argument("--no-window", action="store_true", help="only run the server")
+    p.add_argument("--keep-running", action="store_true", help="keep running after the window closes")
+    p.add_argument("--install-shortcut", action="store_true", help="create Desktop and Start-menu shortcuts")
+    p.add_argument("--remove-shortcut", action="store_true", help="remove those shortcuts")
+    hlp = sub.add_parser("help", help="requests from the AI for you (CAPTCHA, login, 2FA)", parents=[common])
+    hsub = hlp.add_subparsers(dest="action", metavar="<action>", required=True)
+    p = add(hsub, "list", "list open help requests", cmd_help_list)
+    p.add_argument("--all", action="store_true", help="include handled and dismissed requests")
+    p = add(hsub, "resolve", "mark a help request as done (or dismissed)", cmd_help_resolve)
+    p.add_argument("profile")
+    p.add_argument("request_id")
+    p.add_argument("--dismiss", action="store_true")
+    p.add_argument("--note")
+    from .connect import add_cli as add_connect_cli
+
+    add_connect_cli(sub, common)  # connect chatgpt | status | stop
     add(sub, "doctor", "check the installation", cmd_doctor)
 
     shx = sub.add_parser("shardx", help="optional ShardX launcher backend", parents=[common])

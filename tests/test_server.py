@@ -31,7 +31,7 @@ from profilepilot.store import Store
 from .fakes import FakeSocks5Server, OriginServer
 
 PROFILE_TOOLS = {
-    "profile_list", "browser_list", "profile_create", "profile_update", "profile_delete", "profile_clone", "profile_start",
+    "profile_list", "browser_list", "profile_create", "profile_request_help", "profiles_dashboard", "dashboard_action", "profile_update", "profile_delete", "profile_clone", "profile_start",
     "profile_stop", "profile_status", "profile_set_proxy", "proxy_list", "proxy_add", "proxy_remove", "proxy_test",
 }
 BROWSER_TOOLS = {

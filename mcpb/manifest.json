@@ -26,6 +26,9 @@
   },
   "tools": [
     {"name": "profile_list", "description": "List browser profiles with their proxy and running state."},
+    {"name": "profile_request_help", "description": "Ask the user to solve a CAPTCHA, log in or enter a code in a profile's window; pauses the profile until they hand it back."},
+    {"name": "profiles_dashboard", "description": "Show your profiles as an interactive panel (status, start/stop, take control)."},
+    {"name": "dashboard_action", "description": "The panel's buttons (used by the panel only)."},
     {"name": "browser_list", "description": "List the installed browsers (Chrome, Edge, Brave, Chromium, Beta/Dev/Canary) a profile can run in."},
     {"name": "profile_create", "description": "Create an isolated profile, optionally with a proxy, tags, language or timezone."},
     {"name": "profile_update", "description": "Change a profile's name, tags, notes or launch options."},

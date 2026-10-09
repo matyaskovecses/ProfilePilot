@@ -7,6 +7,8 @@ Chrome 154.0.8037.98 (branded), Windows 11, one machine, October 2026. The plan 
 Raw results are in [docs/audit/raw/](audit/raw/) and the harness scripts in [docs/audit/scripts/](audit/scripts/).
 Screenshots are in `docs/audit/img/` and are local only: they are git-ignored because they can show the machine's region.
 
+**Machine-specific values** (GPU model, hardware counts, screen size, the OS timezone and fingerprint hashes) are replaced by placeholders (`the machine's GPU`, `OS_TIMEZONE`, `HASH_A` …) in the published report; only *equality* between configurations matters for the verdicts.
+
 **Redaction:** the machine's real public IP appears as `REAL_IP` everywhere in this document and the raw files.
 The proxy exit IP appears as `PROXY_EXIT_IP`. The proxy host, user name and password appear nowhere. Proxies are referred to by
 their audit names, `audit-socks5` and `audit-http`. Both are the same upstream endpoint, used as SOCKS5 and as HTTP.

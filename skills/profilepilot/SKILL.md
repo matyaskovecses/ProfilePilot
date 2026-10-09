@@ -136,9 +136,17 @@ opens, selects and closes tabs. New popups become the active tab.
 - **Go slowly.** Fetch one page at a time per site and leave a few seconds between requests. Stop
   and back off on HTTP 429 or 503, and honour `Retry-After`. Never rotate proxies or profiles to
   get around a rate limit or a ban.
-- **Never solve, bypass or farm out CAPTCHAs** or other bot checks. When you hit one, stop and tell
-  the user. They can solve it themselves in the profile's visible Chrome window, and you can
-  continue afterwards.
+- **Never solve, bypass or farm out CAPTCHAs** or other bot checks, and never guess 2FA codes. When a
+  page needs a human (a CAPTCHA, a 2FA / e-mail / SMS code, a login with the user's own password, a
+  payment confirmation), call `profile_request_help(profile, message, kind)` with one plain sentence
+  ("Solve the CAPTCHA on the sign-in page, then click Done."). The user is asked in ProfilePilot
+  Manager and the profile is paused until they hand it back; check `profile_status` every minute or
+  so (it says when the request was handled or dismissed) and tell the user in chat what you are
+  waiting for.
+- **If a tool says the user has taken control of a profile**, stop using that profile and wait;
+  `profile_status` shows when they hand it back.
+- To show the user their profiles in ChatGPT or Claude, call `profiles_dashboard` (an interactive
+  panel). Never call `dashboard_action`: it is the panel's own button tool.
 - **Logins:** prefer that the user logs in by hand in the profile's window. The session then stays
   in that profile. Type credentials only when the user explicitly asks you to for that specific
   site.
