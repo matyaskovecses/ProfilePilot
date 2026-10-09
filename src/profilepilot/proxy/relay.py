@@ -41,6 +41,17 @@ class UpstreamError(Exception):
     """The upstream proxy refused or failed the connection."""
 
 
+def upstream_failure(exc: BaseException, upstream: ProxyEndpoint | None) -> str:
+    """``Type: message`` of a failed upstream connection, with the upstream proxy's address replaced by
+    ``<upstream proxy>`` (python-socks names it: "Couldn't connect to proxy HOST:PORT"). The text is the
+    relay's ``last_error``, which tools show to the model (docs/FINGERPRINT-AUDIT.md F10)."""
+    text = f"{type(exc).__name__}: {exc}"
+    if upstream is not None:
+        for host in dict.fromkeys((f"[{upstream.host}]", upstream.host)):
+            text = text.replace(f"{host}:{upstream.port}", "<upstream proxy>").replace(host, "<upstream proxy>")
+    return text
+
+
 @dataclass
 class RelayStats:
     connections_total: int = 0
@@ -136,7 +147,7 @@ class LocalRelay:
             stream = await proxy.connect(dest_host=host, dest_port=port, timeout=self.connect_timeout)
             return stream.reader, stream.writer
         except (asyncio.TimeoutError, OSError, Exception) as exc:  # python-socks raises its own types
-            raise UpstreamError(f"{type(exc).__name__}: {exc}") from exc
+            raise UpstreamError(upstream_failure(exc, self.upstream)) from exc
 
     # ------------------------------------------------------------------ inbound
 

@@ -18,6 +18,7 @@ Async code should still prefer ``await anyio.to_thread.run_sync(...)`` to keep i
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import queue
 import threading
@@ -32,6 +33,7 @@ from .proxy.url import ProxyParseError
 from .store import Store
 
 if TYPE_CHECKING:
+    from .automation.http_identity import HttpIdentity
     from .browser.runtime import RuntimeManager
 
 log = logging.getLogger("profilepilot.client")
@@ -244,8 +246,8 @@ class ProfilePilot:
         """
         info = self.ensure_running(ref, start=start)
         urls = [url] if isinstance(url, str) else (list(url) if url else None)
-        cdp = self._cdp_endpoint(info)
-        return _run_isolated(lambda: _cdp_get_cookies(cdp, urls, timeout), timeout + 15,
+        cdp, driver = self._cdp_endpoint(info), self._driver()
+        return _run_isolated(lambda: _cdp_get_cookies(cdp, urls, timeout, driver), timeout + 15,
                              f"read cookies of profile '{info.profile_name}'")
 
     def set_cookies(self, ref: str, cookies: Iterable[Mapping[str, Any]], *, start: bool = True,
@@ -256,10 +258,31 @@ class ProfilePilot:
         if not items:
             return 0
         info = self.ensure_running(ref, start=start)
-        cdp = self._cdp_endpoint(info)
-        _run_isolated(lambda: _cdp_add_cookies(cdp, items, timeout), timeout + 15,
+        cdp, driver = self._cdp_endpoint(info), self._driver()
+        _run_isolated(lambda: _cdp_add_cookies(cdp, items, timeout, driver), timeout + 15,
                       f"write cookies of profile '{info.profile_name}'")
         return len(items)
+
+    # ------------------------------------------------------------------ identity (CDP)
+
+    def http_identity(self, ref: str, *, start: bool = True, timeout: float = 30.0) -> "HttpIdentity":
+        """The identity of the profile's running browser for HTTP clients: its user agent
+        (``Browser.getVersion``), client hints (``navigator.userAgentData``, read in an isolated world)
+        and languages. Send :meth:`HttpIdentity.headers` with requests made next to the browser
+        (:func:`profilepilot.integrations.scrapling.fetcher_session` does)."""
+        info = self.ensure_running(ref, start=start)
+        cdp, driver = self._cdp_endpoint(info), self._driver()
+        what = f"read the browser identity of profile '{info.profile_name}'"
+        identity = _run_isolated(lambda: asyncio.run(_cdp_http_identity(cdp, timeout, driver)), timeout + 15, what)
+        if identity is None:
+            raise LaunchError(f"Could not {what}: the browser did not answer Browser.getVersion.")
+        return identity
+
+    def _driver(self) -> str:
+        """The CDP driver for this store (see :mod:`profilepilot.automation.driver`)."""
+        from .automation.driver import select_driver
+
+        return select_driver(self.store.load_config())
 
     @staticmethod
     def _cdp_endpoint(info: RuntimeInfo) -> str:
@@ -296,10 +319,10 @@ def _run_isolated(fn: Callable[[], T], timeout: float, what: str) -> T:
     raise LaunchError(f"Could not {what} over CDP: {type(value).__name__}: {first_line}") from None
 
 
-def _with_profile_context(cdp_url: str, timeout: float, fn: Callable[[Any], T]) -> T:
-    from playwright.sync_api import sync_playwright
+def _with_profile_context(cdp_url: str, timeout: float, fn: Callable[[Any], T], driver: str | None = None) -> T:
+    from .automation.driver import sync_playwright
 
-    with sync_playwright() as pw:
+    with sync_playwright(driver) as pw:
         browser = pw.chromium.connect_over_cdp(cdp_url, timeout=timeout * 1000, no_defaults=True)
         try:
             if not browser.contexts:
@@ -309,15 +332,24 @@ def _with_profile_context(cdp_url: str, timeout: float, fn: Callable[[Any], T]) 
             browser.close()  # a CDP connection: this only disconnects, Chrome keeps running
 
 
-def _cdp_get_cookies(cdp_url: str, urls: list[str] | None, timeout: float) -> list[dict[str, Any]]:
+async def _cdp_http_identity(cdp_url: str, timeout: float, driver: str | None = None) -> "HttpIdentity | None":
+    """Read over a short raw CDP connection of its own (no Playwright attach, no ``Runtime.enable``)."""
+    from .automation.http_identity import read_http_identity, websocket_url
+
+    del timeout, driver  # read_http_identity bounds every call itself and needs no CDP driver
+    return await read_http_identity(await websocket_url(cdp_url))
+
+
+def _cdp_get_cookies(cdp_url: str, urls: list[str] | None, timeout: float,
+                     driver: str | None = None) -> list[dict[str, Any]]:
     def read(context: Any) -> list[dict[str, Any]]:
         return [dict(c) for c in (context.cookies(urls) if urls else context.cookies())]
 
-    return _with_profile_context(cdp_url, timeout, read)
+    return _with_profile_context(cdp_url, timeout, read, driver)
 
 
-def _cdp_add_cookies(cdp_url: str, cookies: list[dict[str, Any]], timeout: float) -> None:
-    _with_profile_context(cdp_url, timeout, lambda context: context.add_cookies(cookies))
+def _cdp_add_cookies(cdp_url: str, cookies: list[dict[str, Any]], timeout: float, driver: str | None = None) -> None:
+    _with_profile_context(cdp_url, timeout, lambda context: context.add_cookies(cookies), driver)
 
 
 __all__ = ["ProfilePilot"]

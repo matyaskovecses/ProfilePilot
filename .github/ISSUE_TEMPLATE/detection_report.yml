@@ -1,0 +1,20 @@
+name: Detection / fingerprint difference
+description: A site detects a ProfilePilot profile but not your normal Chrome
+labels: [fingerprint]
+body:
+  - type: markdown
+    attributes:
+      value: ProfilePilot aims to be indistinguishable from the same machine's normal Chrome. Differences from plain Chrome are bugs.
+  - type: input
+    id: site
+    attributes:
+      label: Site or detector
+    validations:
+      required: true
+  - type: textarea
+    id: diff
+    attributes:
+      label: What differs
+      description: Result in plain Chrome vs. in a ProfilePilot profile (which tools were used, proxy or not, window mode).
+    validations:
+      required: true

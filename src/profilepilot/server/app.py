@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from mcp.server.auth.provider import TokenVerifier
     from mcp.server.auth.settings import AuthSettings
 
+    from ..automation.http_identity import HttpIdentity
     from ..automation.manager import BrowserManager
     from ..browser.runtime import RuntimeManager
     from ..integrations.shardx import AsyncShardXClient
@@ -143,10 +144,9 @@ class AppState:
     sensitive_autofill: bool = True
     """``form_autofill_sensitive`` is registered (always locally; remote only with
     ``--allow-sensitive-autofill``)."""
-    user_agents: dict[str, str] = field(default_factory=dict)
-    """Cached ``navigator.userAgent`` per session key (used by ``http_fetch``)."""
-    accept_languages: dict[str, str] = field(default_factory=dict)
-    """Cached ``Accept-Language`` header (from ``navigator.languages``) per session key."""
+    http_identities: dict[str, "HttpIdentity"] = field(default_factory=dict)
+    """The HTTP identity (user agent, client hints, languages) of each running browser, keyed by
+    :func:`~profilepilot.automation.http_identity.identity_key` (used by ``http_fetch``)."""
     filled_secrets: dict[str, set[str]] = field(default_factory=dict, repr=False)
     """Per session key (survives CDP reconnects): the card numbers, SSNs and passwords (and their
     common renderings) that ``form_autofill_sensitive`` put into this profile's pages. Every
@@ -427,10 +427,10 @@ def playwright_message(exc: BaseException) -> str:
 
 def to_tool_error(exc: BaseException, tool: str) -> ToolError:
     """Map an exception raised inside a tool to a :class:`ToolError` with an actionable message."""
-    try:
-        from playwright.async_api import Error as PlaywrightError
-        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-    except Exception:  # pragma: no cover - playwright is a hard dependency
+    try:  # tuples: the error classes of every installed driver (patchright and/or Playwright)
+        from ..automation.driver import Error as PlaywrightError
+        from ..automation.driver import TimeoutError as PlaywrightTimeoutError
+    except Exception:  # pragma: no cover - a driver is a hard dependency
         PlaywrightError = PlaywrightTimeoutError = ()  # type: ignore[assignment,misc]
 
     if isinstance(exc, ToolError):
@@ -499,9 +499,30 @@ def tool_guard(fn: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
         try:
             return await fn(*args, **kwargs)
         except Exception as exc:  # cancellation (a BaseException) passes through untouched
-            raise to_tool_error(exc, fn.__name__) from None
+            crash = await _crash_instead(exc, kwargs)
+            raise to_tool_error(crash or exc, fn.__name__) from None
 
     return wrapper
+
+
+async def _crash_instead(exc: BaseException, kwargs: dict[str, Any]) -> BaseException | None:
+    """When a tool lost its browser connection because the profile's Chrome *crashed* (the host's
+    ``last_exit.json``), the crash error to report instead of "the tab or browser was closed"."""
+    from ..errors import ProfileNotRunningError
+
+    try:
+        from ..automation.driver import Error as DriverError
+    except Exception:  # pragma: no cover - a driver is a hard dependency
+        DriverError = ()  # type: ignore[assignment]
+    profile, ctx = kwargs.get("profile"), kwargs.get("ctx")
+    if not isinstance(exc, (ProfileNotRunningError, *DriverError)) or not isinstance(profile, str) or ctx is None:
+        return None
+    try:
+        browsers = getattr(get_state(ctx), "browsers", None)
+    except Exception:
+        return None
+    crash_error = getattr(browsers, "crash_error", None)
+    return await crash_error(profile) if crash_error is not None else None
 
 
 # ---------------------------------------------------------------------- small utilities

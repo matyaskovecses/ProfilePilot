@@ -70,7 +70,7 @@ from ..errors import ProfilePilotError
 from .clipboard import ClipboardUnavailable, async_clipboard_text, paste_shortcut, plain_paste_shortcut
 
 if TYPE_CHECKING:
-    from playwright.async_api import ElementHandle, Locator, Page
+    from .driver import ElementHandle, Locator, Page
 
     Target = Union[Locator, ElementHandle]
 
@@ -315,7 +315,7 @@ async def _click_own_label(page: "Page", target: "Target") -> bool:
     """When the field's own ``<label>`` covers its centre (a floating label without
     ``pointer-events: none``), click there: the label activates its control like a person's click
     would (trusted click, focus). False when something else covers the field."""
-    from playwright.async_api import Error as PlaywrightError
+    from .driver import Error as PlaywrightError
 
     try:
         if not await _evaluate(target, _OWN_LABEL_AT_CENTRE_JS):
@@ -334,7 +334,7 @@ async def _focus_by_click(page: "Page", target: "Target") -> None:
     timeout): it is clicked through its own floating label, else focused with focus(). Raises
     :class:`TextEntryError` unless the field really has the focus afterwards, so no key meant for it
     can land in whatever had the focus before (a disabled, hidden or covered field)."""
-    from playwright.async_api import Error as PlaywrightError
+    from .driver import Error as PlaywrightError
 
     try:
         await target.click(trial=True, timeout=CLICK_PROBE_TIMEOUT_MS)  # actionability checks only
@@ -387,7 +387,7 @@ async def enter_text(
     clipboard content as concealed (paste). Date/time inputs always get ``fill``; selects,
     checkboxes, radios, files, ranges and colours raise :class:`NotTypeableError`.
     """
-    from playwright.async_api import Error as PlaywrightError
+    from .driver import Error as PlaywrightError
 
     if method not in TYPE_METHODS:
         raise ValueError(f"method must be one of {', '.join(TYPE_METHODS)}")

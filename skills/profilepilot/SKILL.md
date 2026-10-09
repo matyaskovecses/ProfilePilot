@@ -19,7 +19,8 @@ they appear as `mcp__plugin_profilepilot_profilepilot__browser_navigate` and so 
 1. **Pick a profile.** Call `profile_list` first and reuse a profile that fits the task. Create one
    with `profile_create(name, proxy?, tags?, lang?, timezone?)` only when none fits.
 2. **Open the page** with `browser_navigate(profile, url)`. Browser tools start the profile
-   automatically. Call `profile_start(profile)` yourself only to choose a window mode.
+   automatically; a stopped profile opens the URL itself as it starts ("Opened at launch", without
+   an HTTP status). Call `profile_start(profile)` yourself only to choose a window mode.
 3. **Look at it** with `browser_snapshot(profile)`. It returns the accessibility tree, and every
    element you can act on carries a ref such as `[ref=e12]`.
 4. **Act by ref**: `browser_click(profile, ref="e12")`, `browser_type(profile, ref="e7",
@@ -55,7 +56,8 @@ opens, selects and closes tabs. New popups become the active tab.
 | A page that needs JavaScript, a login or clicks | `browser_navigate` → `browser_snapshot` → act |
 | Reading content | `browser_read` (markdown) |
 | Repeated fields (prices, titles, links) | `browser_extract` |
-| A value only the page's JavaScript knows | `browser_evaluate(profile, expression)`, sparingly |
+| A value from the DOM that the other tools miss | `browser_evaluate(profile, expression)`, sparingly. It runs in an isolated world: it sees the DOM, not the page's own variables, and the page cannot see it. It has no user gesture: to open a popup or anything else that needs a click, use `browser_click` |
+| A value only the page's JavaScript knows (e.g. `window.__NEXT_DATA__`) | `browser_evaluate(profile, expression, world="main")`, only when needed: the page can detect main-world code |
 
 ## Typing, pasting and filling forms
 
@@ -166,6 +168,7 @@ Pass the mode as `profile_start(profile, window=...)`, or set it per profile wit
 | "The window ... is minimized" | Ask the user to restore the profile's window (ProfilePilot never restores it: that would take their keyboard focus), or switch the profile to `offscreen` |
 | `browser_read` says hidden blocks below the visible area were omitted | The page reveals them on scroll: `browser_scroll`, then `browser_read` again |
 | The profile won't start | Read the error. Another Chrome may be using that profile's folder, or the browser executable was not found |
+| "Chrome crashed while this page was open" | The profile was not restarted. Tell the user which page it was. The next browser call starts the profile again without the crashed tabs; opening that page again may crash it again |
 | Every page fails through a proxy | Run `proxy_test`. Then fix or replace the proxy with `profile_set_proxy` |
 | `localhost` or private URLs are blocked | The server runs in remote (ChatGPT) mode, which blocks them on purpose |
 | The output is cut off | Continue with `offset=next_offset`, or narrow it with `selector=` or `ref=` |

@@ -1,6 +1,6 @@
 """Browser tools against the real Chrome (off-screen profiles in a temporary data root; every process
 started here is stopped again). Regression tests for selector, wait, scroll, screenshot, read,
-extract, popup, download and remote-mode behaviour."""
+extract, popup, download and remote-mode behaviour, with each CDP driver (patchright, playwright)."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from mcp.types import ImageContent, TextContent
 from profilepilot.server.app import create_server
 from profilepilot.store import Store
 
+from .chrome_helper import cdp_driver  # noqa: F401 - a fixture
 from .fakes import OriginServer
 
 pytestmark = [pytest.mark.chrome, pytest.mark.asyncio]
@@ -27,6 +28,7 @@ pytestmark = [pytest.mark.chrome, pytest.mark.asyncio]
 MAIN = """<!doctype html><html><head><title>Tools page</title></head><body>
 <nav style="display:none"><a href="/next">Sign in</a><span>Results ready</span></nav>
 <header><a id="signin" href="/next">Sign in</a></header>
+<button id="popup" onclick="window.open('/next')">Open popup</button>
 <p>Results ready</p>
 <input id="q" aria-label="Search">
 <select id="s"><option value="a">Alpha</option><option value="b">Beta</option></select>
@@ -85,7 +87,7 @@ def _kill_leftovers(marker: Path) -> None:
 
 
 @pytest.fixture
-def home(tmp_path) -> Iterator[Store]:
+def home(tmp_path, cdp_driver) -> Iterator[Store]:
     from tests.chrome_helper import find_test_browser
 
     find_test_browser()
@@ -177,11 +179,14 @@ async def test_read_and_extract_cover_shadow_dom_frames_and_hidden_content(home,
         assert "drop ::text" in await call(client, "browser_extract", {"profile": "p", "css": "header::text"})
 
 
-async def test_popups_downloads_pdfs_and_data_urls(home, origin):
+async def test_popups_downloads_pdfs_and_data_urls(home, origin, cdp_driver):
     p = home.create_profile("p")
     async with Client(create_server(store=home)) as client:
         await call(client, "browser_navigate", {"profile": "p", "url": origin.url + "/"})
-        out = await call(client, "browser_evaluate", {"profile": "p", "expression": "window.open('/next'); 1"})
+        if cdp_driver == "patchright":  # evaluates carry no user gesture: the popup blocker stops this
+            out = await call(client, "browser_evaluate", {"profile": "p", "expression": "window.open('/next') === null"})
+            assert "Result:\ntrue" in out and "new tab" not in out
+        out = await call(client, "browser_click", {"profile": "p", "selector": "#popup"})  # a real click can
         assert "A new tab opened (tab 1) and is now the active tab." in out
         tabs = await call(client, "browser_tabs", {"profile": "p"})
         assert "* 1: Next page" in tabs
@@ -216,7 +221,11 @@ async def test_remote_mode_never_returns_content_of_pages_that_moved_to_private_
         tabs = await call(client, "browser_tabs", {"profile": "r"})
         assert "127.0.0.1" not in tabs
 
-        await call(client, "browser_evaluate", {"profile": "r", "expression": f"setTimeout(() => window.open('{target}'), 500); 1"})
+        # a popup that opens later (a real click's activation lasts a few seconds; evaluates have none)
+        await call(client, "browser_evaluate", {"profile": "r", "expression": (
+            "document.body.innerHTML = '<button id=\"later\" onclick=\"setTimeout(() => window.open(\\'" + target
+            + "\\'), 500)\">later</button>'; 1")})
+        await call(client, "browser_click", {"profile": "r", "selector": "#later"})
         await asyncio.sleep(2.5)
         tabs = await call(client, "browser_tabs", {"profile": "r"})
         assert "were blanked" in tabs and "127.0.0.1" not in tabs and "Tools page" not in tabs

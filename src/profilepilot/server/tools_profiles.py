@@ -3,7 +3,11 @@
 Model-facing output never contains secrets: proxies are shown through
 :meth:`ProxyRecord.summary` / :meth:`ProxyRecord.redacted_url` (password masked, never loaded),
 running profiles through :meth:`RuntimeInfo.public` fields (no control token), and proxy parse
-errors are replaced by a generic format hint because the parser may quote its input.
+errors are replaced by a generic format hint because the parser may quote its input. The profile
+tools name a profile's proxy by its saved name and scheme (:func:`proxy_label`, and
+:func:`live_proxy_label` for the one a running profile uses), never by the host, port or user name of
+the record or of ``RuntimeInfo.upstream``, which is kept for logs (docs/FINGERPRINT-AUDIT.md F10); only
+the proxy tools (``proxy_list``, ``proxy_add``, ``proxy_test(proxy=)``) show a record's redacted URL.
 """
 
 from __future__ import annotations
@@ -51,8 +55,10 @@ SchemeArg = Annotated[
 ]
 TagsArg = Annotated[list[str] | None, Field(description="Tags, e.g. ['shop', 'us'].")]
 BrowserArg = Annotated[
-    Literal["auto", "chrome", "edge", "brave", "chromium"] | None,
-    Field(description="Which installed browser to use (default auto: Chrome, then Edge, Brave, Chromium)."),
+    Literal["auto", "chrome", "edge", "brave", "chromium", "chrome-beta", "chrome-dev", "chrome-canary",
+            "edge-beta", "edge-dev", "edge-canary"] | None,
+    Field(description="Which INSTALLED browser runs the profile (see browser_list); its genuine identity is what "
+                      "sites see - nothing is spoofed. Default auto: Chrome, then Edge, Brave, Chromium."),
 ]
 IdentityLinkArg = Annotated[
     str,
@@ -73,9 +79,11 @@ BULK_SHOWN = 10
 
 
 def proxy_label(record: ProxyRecord | None) -> str:
+    """A profile's saved proxy as the profile tools show it: its name and scheme, never its host or user
+    (docs/FINGERPRINT-AUDIT.md F10). The proxy tools (proxy_list, proxy_add) show the records themselves."""
     if record is None:
         return "none (direct connection)"
-    return f"{record.name} ({record.redacted_url()})"
+    return f"'{record.name}' ({record.scheme})"
 
 
 def profile_line(profile: Profile, proxies: dict[str, ProxyRecord], info: RuntimeInfo | None,
@@ -103,8 +111,24 @@ def profile_line(profile: Profile, proxies: dict[str, ProxyRecord], info: Runtim
     return " | ".join(parts)
 
 
-def runtime_text(profile_name: str, info: RuntimeInfo) -> str:
-    """Model-safe description of a running profile (built from public fields only)."""
+def live_proxy_label(store: Store, info: RuntimeInfo) -> str | None:
+    """The upstream proxy a running profile's relay uses, for the model: ``'<saved name>' (<scheme>)``;
+    None when the browser connects directly. Never its host, port or user (F10). Reads the store."""
+    if not info.relay_port or info.upstream is None:
+        return None
+    if info.proxy_id:
+        try:
+            record = store.get_proxy(info.proxy_id)
+            return f"'{record.name}' ({record.scheme})"
+        except ProfilePilotError:
+            pass
+    scheme = info.upstream.split("://", 1)[0] if "://" in info.upstream else "proxy"
+    return f"an unsaved {scheme} proxy"  # switched live to a proxy URL (CLI)
+
+
+def runtime_text(profile_name: str, info: RuntimeInfo, proxy: str | None = None) -> str:
+    """Model-safe description of a running profile (built from public fields only). ``proxy``: its
+    :func:`live_proxy_label`."""
     pub = info.public()
     version = f"{pub.get('browser_version')}" if pub.get("browser_version") else "browser"
     lines = [
@@ -112,9 +136,8 @@ def runtime_text(profile_name: str, info: RuntimeInfo) -> str:
         f"started {info.started_at.isoformat()})."
     ]
     if info.relay_port:
-        upstream = info.upstream or "direct"
         lines.append(
-            f"Proxy: {upstream} through the local relay {info.http_proxy_url} "
+            f"Proxy: {proxy or 'direct'} through the local relay {info.http_proxy_url} "
             "(credential-free; same exit IP as the browser)."
         )
     else:
@@ -397,7 +420,7 @@ async def profile_start(ctx: Context, profile: ProfileArg, window: WindowArg = N
     target = await run_sync(state.store.get_profile, profile)
     before = await run_sync(state.runtime.status, target.id)
     info = await run_sync(partial(state.runtime.start, target.id, window=window))
-    text = runtime_text(target.name, info)
+    text = runtime_text(target.name, info, await run_sync(live_proxy_label, state.store, info))
     if before is not None:
         text = "Already running. " + text
         if window and window != info.window:
@@ -432,7 +455,8 @@ async def profile_status(
         running = await run_sync(state.runtime.list_running)
         if not running:
             return "No profiles are running."
-        return "\n\n".join(runtime_text(i.profile_name, i) for i in running)
+        labels = await run_sync(lambda: [live_proxy_label(state.store, i) for i in running])
+        return "\n\n".join(runtime_text(i.profile_name, i, label) for i, label in zip(running, labels))
     assert profile is not None
     if is_shardx_ref(profile):
         if state.shardx is None:
@@ -442,9 +466,10 @@ async def profile_status(
         name = resolved.get("name") or resolved.get("id")
         return f"ShardX profile '{name}' is {'running (attachable)' if cdp else 'not running (or not attachable)'}."
 
-    def collect() -> tuple[Profile, RuntimeInfo | None, dict | None, ProxyRecord | None]:
+    def collect() -> tuple[Profile, RuntimeInfo | None, dict | None, ProxyRecord | None, str | None]:
         target = state.store.get_profile(profile)
         info = state.runtime.status(target.id)
+        live = live_proxy_label(state.store, info) if info is not None else None
         stats = None
         if info is not None and info.relay_port:
             try:
@@ -457,14 +482,14 @@ async def profile_status(
                 record = state.store.get_proxy(target.proxy_id)
             except NotFoundError:
                 record = None
-        return target, info, stats, record
+        return target, info, stats, record, live
 
-    target, info, stats, record = await run_sync(collect)
+    target, info, stats, record, live = await run_sync(collect)
     lines = [f"Profile '{target.name}' (id {target.id}); saved proxy: {proxy_label(record)}."]
     if info is None:
         lines.append("Not running. Browser tools start it automatically.")
         return "\n".join(lines)
-    lines.append(runtime_text(target.name, info))
+    lines.append(runtime_text(target.name, info, live))
     if stats:
         from .app import _scrub
 
@@ -670,18 +695,37 @@ async def proxy_test(
                 live = await run_sync(store.get_proxy, info.proxy_id)
                 await state.policy.acheck_host(live.host, live.port)
             result = await check_via_relay(info.http_proxy_url, timeout=timeout_s)
-            return check_text(f"profile '{target.name}' (live relay, upstream {info.upstream or 'direct'})", result)
+            live = await run_sync(live_proxy_label, store, info)
+            return check_text(f"profile '{target.name}' (live relay, {f'proxy {live}' if live else 'direct'})", result)
         note = ""
         if info is not None and target.proxy_id:
             note = "\nNote: the profile is running WITHOUT its proxy (started before it was set); restart it to apply."
         if target.proxy_id:
             record = await run_sync(store.get_proxy, target.proxy_id)
-            return await test_saved(record, f"profile '{target.name}' saved proxy '{record.name}' "
-                                            f"({record.redacted_url()})") + note
+            return await test_saved(record, f"profile '{target.name}' saved proxy {proxy_label(record)}") + note
         result = await check_proxy(None, timeout=timeout_s)
         return check_text(f"profile '{target.name}' has no proxy: direct connection", result)
     result = await check_proxy(None, timeout=timeout_s)
     return check_text("direct connection of this computer (no proxy)", result)
+
+
+async def browser_list(ctx: Context) -> str:
+    """List the browsers installed on this computer that can run a profile (Chrome, Edge, Brave,
+    Chromium and installed Chrome/Edge Beta, Dev or Canary channels). A profile always shows sites the
+    real identity of the browser that runs it, so choosing a browser is how a profile gets a different
+    (but genuine) user agent. Use the kind with profile_create / profile_update browser=."""
+    from ..paths import BROWSER_LABELS, list_browsers
+
+    browsers = await run_sync(list_browsers)
+    if not browsers:
+        return ("No supported browser is installed. Install Google Chrome (or Edge / Brave / Chromium); "
+                "ProfilePilot never spoofs another browser's identity.")
+    lines = ["Installed browsers a profile can use (each is the real browser - nothing is spoofed):"]
+    for info in browsers:
+        lines.append(f"- {info.kind}: {BROWSER_LABELS.get(info.kind, info.kind)} {info.version or '(version unknown)'}")
+    lines.append("Pick one with profile_create(browser=...) or profile_update(browser=...); "
+                 "default 'auto' uses the first of these.")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------- registration
@@ -690,6 +734,8 @@ async def proxy_test(
 def register(server: MCPServer) -> None:
     add_tool(server, profile_list, title="List profiles", read_only=True, destructive=False, idempotent=True,
              open_world=False, invoking="Listing profiles…", invoked="Profiles listed")
+    add_tool(server, browser_list, title="List installed browsers", read_only=True, destructive=False,
+             idempotent=True, open_world=False, invoking="Looking for browsers…", invoked="Browsers listed")
     add_tool(server, profile_create, title="Create profile", read_only=False, destructive=False, idempotent=False,
              open_world=False, invoking="Creating profile…", invoked="Profile created")
     add_tool(server, profile_update, title="Update profile", read_only=False, destructive=False, idempotent=True,
@@ -717,4 +763,4 @@ def register(server: MCPServer) -> None:
              open_world=True, invoking="Testing the route…", invoked="Route tested")
 
 
-__all__ = ["register", "resolve_or_save_proxy", "runtime_text", "check_text", "proxy_label"]
+__all__ = ["register", "resolve_or_save_proxy", "runtime_text", "check_text", "proxy_label", "live_proxy_label"]

@@ -34,7 +34,7 @@ from urllib.parse import urlsplit
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
-from playwright.async_api import Locator, Page
+from ..automation.driver import Locator, Page
 from pydantic import Field
 
 from ..automation.autofill import (

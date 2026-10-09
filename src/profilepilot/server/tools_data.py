@@ -4,17 +4,19 @@ Cookie *values* are secrets: tool output only shows names, scopes and value leng
 write values to files (never into the chat). ``http_fetch`` sends requests through the profile's
 credential-free local relay (same exit IP as its browser) with the cookies the browser itself
 would send for each URL (asked from Chrome per request, so redirects get the right cookies), and
-writes ``Set-Cookie`` responses back into the live browser.
+writes ``Set-Cookie`` responses back into the live browser. Both engines send the identity of the
+profile's running browser - its user agent, client hints and languages, whichever Chromium-family
+browser it is (:mod:`profilepilot.automation.http_identity`, docs/FINGERPRINT-AUDIT.md F9).
 
 Cookie files are confined to the exports folders of the data root (remote mode: writes only to
 the profile's own exports folder) unless a local server runs with ``--files-anywhere``; the store's
 own files are never written. In remote (HTTP) mode every request / redirect hop goes through the
-URL policy.
+URL policy - without local DNS resolution when the profile's traffic leaves through an upstream proxy
+(docs/FINGERPRINT-AUDIT.md F8).
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import mimetypes
@@ -35,6 +37,9 @@ from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
 
 from ..automation import cookies as cookie_utils
+from ..automation.http_identity import (
+    HttpIdentity, identity_key, impersonate_target, read_http_identity, websocket_url,
+)
 from ..automation.manager import ProfileSession, is_shardx_ref
 from ..errors import PolicyError, ProfilePilotError
 from ..safety import normalize_url
@@ -53,7 +58,8 @@ from .app import (
     run_sync,
     to_tool_error,
 )
-from .tools_browser import check_url, relay_hint
+from .tools_browser import check_url, profile_proxied, relay_hint, routes_through_proxy
+from .tools_profiles import live_proxy_label
 
 log = logging.getLogger("profilepilot.server")
 
@@ -297,46 +303,24 @@ async def cookies_import(
 # ---------------------------------------------------------------------- http_fetch helpers
 
 
-async def browser_user_agent(state: AppState, session: ProfileSession) -> str | None:
-    """The browser's genuine user agent (cached per session)."""
-    cached = state.user_agents.get(session.key)
-    if cached:
+async def browser_identity(state: AppState, session: ProfileSession) -> HttpIdentity | None:
+    """The HTTP identity of the profile's running browser (user agent, client hints, languages; see
+    :mod:`profilepilot.automation.http_identity`), cached per running browser once complete. None
+    when the browser does not answer over CDP."""
+    key = identity_key(session.key, session.runtime, session)
+    cached = state.http_identities.get(key)
+    if cached is not None:
         return cached
-    try:
-        cdp = await session.browser.new_browser_cdp_session()
-        try:
-            info = await cdp.send("Browser.getVersion")
-        finally:
-            await cdp.detach()
-        ua = str(info.get("userAgent") or "") or None
-    except Exception as exc:  # pragma: no cover - best effort
-        log.debug("could not read the user agent: %s", exc)
-        ua = None
-    if ua:
-        state.user_agents[session.key] = ua
-    return ua
+    ws = await websocket_url(getattr(session, "endpoint", None), getattr(session, "runtime", None))
+    identity = await read_http_identity(ws)
+    if identity is not None and identity.has_client_hints and identity.languages:
+        state.http_identities[key] = identity
+    return identity
 
 
-async def browser_accept_language(state: AppState, session: ProfileSession) -> str | None:
-    """``Accept-Language`` as the browser sends it, built from ``navigator.languages`` (cached)."""
-    cached = state.accept_languages.get(session.key)
-    if cached:
-        return cached
-    pages = [p for p in session.context.pages if not p.is_closed()]
-    if not pages:
-        return None
-    try:
-        langs = await asyncio.wait_for(pages[0].evaluate("navigator.languages"), 2.0)
-    except Exception as exc:  # busy page / navigation in flight: try again next time
-        log.debug("could not read navigator.languages: %s", exc)
-        return None
-    langs = [str(x) for x in (langs or []) if isinstance(x, str) and x and re.fullmatch(r"[A-Za-z0-9-]+", x)]
-    if not langs:
-        return None
-    # Chrome's format: the first language without a weight, then q=0.9, 0.8, ... (never below 0.1)
-    header = ",".join([langs[0]] + [f"{lang};q={max(0.1, 1 - 0.1 * i):.1f}" for i, lang in enumerate(langs[1:], 1)])
-    state.accept_languages[session.key] = header
-    return header
+def fetch_target(identity: HttpIdentity) -> str:
+    """The curl_cffi impersonation target for ``engine="scrapling"`` (TLS and HTTP/2 settings)."""
+    return impersonate_target(identity.family, identity.major)
 
 
 def _cookie_header(cookies: list[dict[str, Any]]) -> str:
@@ -610,7 +594,8 @@ async def http_fetch(
         description="markdown/text/html drop scripts and hidden elements of HTML and pretty-print JSON; "
                     "raw returns the body unchanged.")] = "markdown",
     engine: Annotated[Literal["auto", "httpx", "scrapling"], Field(
-        description="auto/httpx = plain HTTP client; scrapling = curl_cffi with a browser-like TLS fingerprint.")] = "auto",
+        description="auto/httpx = plain HTTP client; scrapling = curl_cffi with a browser-like TLS fingerprint. Both "
+                    "send the profile browser's own user agent, client hints and languages.")] = "auto",
     follow_redirects: Annotated[bool, Field(description="Follow redirects.")] = True,
     timeout_s: Annotated[float, Field(description="Timeout in seconds.", ge=1, le=120)] = 30.0,
     max_chars: MaxCharsArg = DEFAULT_MAX_CHARS,
@@ -623,21 +608,24 @@ async def http_fetch(
     if is_shardx_ref(profile):
         raise ProfilePilotError("http_fetch is not available for ShardX profiles (ShardX manages their proxy); "
                                 "use the browser tools instead.")
-    destination = await check_url(state, url)
+    destination = await check_url(state, url, proxied=await profile_proxied(state, profile))
     if not destination.lower().startswith(("http://", "https://")):
         raise ProfilePilotError("http_fetch needs an http:// or https:// URL.")
     session = await state.browsers.session(profile)
     info = session.runtime
     proxy = info.http_proxy_url if info is not None and info.relay_port else None
+    proxied = routes_through_proxy(info)  # names are resolved at the proxy: no local DNS in the URL checks
     payload = body.encode("utf-8") if body is not None else None
+
+    identity = await browser_identity(state, session)  # the running browser's own, never a made-up one (F9)
 
     try:
         if engine == "scrapling":
             result = await _fetch_scrapling(state, session, destination, method, headers, payload, follow_redirects,
-                                            timeout_s)
+                                            timeout_s, identity=identity)
         else:
             result = await _fetch_httpx(state, session, destination, method, headers, payload, follow_redirects,
-                                        timeout_s, proxy)
+                                        timeout_s, proxy, proxied=proxied, identity=identity)
     except (httpx.ProxyError, httpx.TimeoutException) as exc:
         hint = await relay_hint(state, session) if proxy else ""
         if hint:  # the relay knows why the proxy failed: say so instead of a bare 502 / timeout
@@ -645,14 +633,19 @@ async def http_fetch(
         raise
     status, reason, final_url, content_type, raw, truncated, cookies_written, disposition = result
     if state.policy.restricts_private and final_url != destination:
-        await state.policy.acheck(final_url)
+        await state.policy.acheck(final_url, resolve=not proxied)
 
-    route = f"via the profile's proxy ({info.upstream})" if proxy and info and info.upstream else (
+    # the proxy's saved name and scheme, never its host or user (docs/FINGERPRINT-AUDIT.md F10)
+    live = await run_sync(live_proxy_label, state.store, info) if proxy and info is not None else None
+    route = f"via the profile's proxy {live}" if live else (
         "via the profile's relay" if proxy else "direct (the profile has no proxy)")
+    used = "httpx" if engine == "auto" else engine
+    if used == "scrapling" and identity is not None:
+        used += f" (headers of {identity.describe()}, TLS of curl_cffi's {fetch_target(identity)})"
     lines = [
         f"[{session.label}] HTTP {status}{' ' + reason if reason else ''} — {final_url}",
         f"content-type: {content_type or 'unknown'}; {len(raw)} bytes{' (truncated at 5 MB)' if truncated else ''}; "
-        f"{route}; engine {engine if engine != 'auto' else 'httpx'}",
+        f"{route}; engine {used}",
     ]
     if cookies_written:
         lines.append(f"Set-Cookie: {cookies_written} cookie change(s) saved to the profile's browser.")
@@ -688,14 +681,15 @@ async def _binary_body(state: AppState, session: ProfileSession, raw: bytes, con
 
 async def _fetch_httpx(state: AppState, session: ProfileSession, url: str, method: str,
                        headers: dict[str, str] | None, payload: bytes | None, follow_redirects: bool,
-                       timeout_s: float, proxy: str | None) -> tuple[int, str, str, str, bytes, bool, int, str | None]:
+                       timeout_s: float, proxy: str | None, *, proxied: bool = False,
+                       identity: HttpIdentity | None = None) -> tuple[int, str, str, str, bytes, bool, int, str | None]:
     user_headers = {str(k): str(v) for k, v in (headers or {}).items()}
     manual_cookie = any(k.lower() == "cookie" for k in user_headers)
     written = 0
 
     async def on_request(request: httpx.Request) -> None:
         if state.policy.restricts_private:
-            await state.policy.acheck(str(request.url))  # every redirect hop
+            await state.policy.acheck(str(request.url), resolve=not proxied)  # every redirect hop
         if manual_cookie:
             return
         jar = await session.context.cookies([str(request.url)])
@@ -713,12 +707,8 @@ async def _fetch_httpx(state: AppState, session: ProfileSession, url: str, metho
             log.warning("could not write cookies back: %s", type(exc).__name__)
 
     default_headers: dict[str, str] = {"Accept": "*/*"}
-    ua = await browser_user_agent(state, session)
-    if ua:
-        default_headers["User-Agent"] = ua
-    languages = await browser_accept_language(state, session)
-    if languages:
-        default_headers["Accept-Language"] = languages
+    if identity is not None:  # the browser's user agent, client hints and languages (user headers win)
+        default_headers.update(identity.headers())
     async with httpx.AsyncClient(
         proxy=proxy, trust_env=False, follow_redirects=follow_redirects, max_redirects=MAX_REDIRECTS,
         timeout=timeout_s, headers=default_headers,
@@ -742,7 +732,8 @@ async def _fetch_httpx(state: AppState, session: ProfileSession, url: str, metho
 
 async def _fetch_scrapling(state: AppState, session: ProfileSession, url: str, method: str,
                            headers: dict[str, str] | None, payload: bytes | None, follow_redirects: bool,
-                           timeout_s: float) -> tuple[int, str, str, str, bytes, bool, int, str | None]:
+                           timeout_s: float, *,
+                           identity: HttpIdentity | None = None) -> tuple[int, str, str, str, bytes, bool, int, str | None]:
     try:
         from ..client import ProfilePilot
         from ..integrations.scrapling import fetcher_session
@@ -753,13 +744,15 @@ async def _fetch_scrapling(state: AppState, session: ProfileSession, url: str, m
         raise ProfilePilotError("engine='scrapling' needs a ProfilePilot profile.")
     if method not in ("GET", "POST", "PUT", "DELETE"):
         raise ProfilePilotError("engine='scrapling' supports GET, POST, PUT and DELETE; use engine='httpx'.")
+    if identity is None:  # never fall back to curl_cffi's own identity (a macOS Chrome)
+        raise ProfilePilotError("engine='scrapling' could not read the identity of the profile's browser (it did not "
+                                "answer over CDP); try again, or use engine='httpx'.")
     pilot = ProfilePilot(store=state.store, runtime=state.runtime)
+    # session headers: the browser's identity (read by this server), then the user's headers, which win
     fetcher = await run_sync(partial(fetcher_session, session.profile.id, pilot=pilot, write_back=True,
-                                     autostart=False))
+                                     autostart=False, identity=identity, headers=dict(headers or {})))
     redirects: Any = ("safe" if state.policy.restricts_private else True) if follow_redirects else False
     kwargs: dict[str, Any] = {"follow_redirects": redirects, "timeout": timeout_s}
-    if headers:
-        kwargs["headers"] = dict(headers)
     if payload is not None and method in ("POST", "PUT"):
         kwargs["data"] = payload
     async with fetcher as client:

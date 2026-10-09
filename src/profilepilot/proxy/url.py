@@ -72,10 +72,12 @@ class ProxyEndpoint:
         return f"{scheme}://{auth}{self._host_for_url()}:{self.port}"
 
     def redacted(self) -> str:
-        """URL safe to show to a model or a log: credentials are masked."""
+        """URL for logs and diagnostics: the credentials are masked entirely (no part of the user name
+        is kept). Model-facing text names a proxy by its saved name and scheme instead, never its host
+        (docs/FINGERPRINT-AUDIT.md F10)."""
         if not self.username:
             return self.to_url(with_auth=False)
-        return f"{self.scheme}://{self.username[:3]}***:***@{self._host_for_url()}:{self.port}"
+        return f"{self.scheme}://***:***@{self._host_for_url()}:{self.port}"
 
 
 def parse_proxy(value: str, default_scheme: str = "http") -> ProxyEndpoint:

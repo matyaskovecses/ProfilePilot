@@ -3,6 +3,7 @@
 Started detached by :class:`profilepilot.browser.runtime.RuntimeManager` as::
 
     python -m profilepilot.browser.host <profile_id> [--root PATH] [--window normal|offscreen|headless]
+                                       [--start-url=URL]
 
 It holds the profile lock, runs the credential-free proxy relay and the token-protected control
 API, launches the user's real Chrome with a fixed DevTools port, publishes ``runtime.json`` and
@@ -34,20 +35,28 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import psutil
 from filelock import FileLock, Timeout
 
 from ..errors import LaunchError, NotFoundError, ProfilePilotError
 from ..jsonio import read_json, write_json
-from ..models import Profile, RuntimeInfo, WindowMode
+from ..models import LaunchOptions, Profile, RuntimeInfo, WindowMode
 from ..paths import BrowserInfo, find_browser
 from ..proxy.relay import LocalRelay
 from ..proxy.url import ProxyEndpoint, ProxyParseError, parse_proxy
 from ..store import Store
 from .control import ControlError, ControlServer, async_cdp_browser_close, async_cdp_version
 from .flags import build_chrome_args
-from .prefs import has_saved_session, prepare_user_data_dir, profile_in_use
+from .prefs import (
+    MAX_USER_DATA_DIR_CHARS,
+    has_saved_session,
+    long_path_hint,
+    prepare_user_data_dir,
+    profile_in_use,
+    user_data_dir_too_long,
+)
 from .runtime import (
     EXIT_ALREADY_RUNNING,
     EXIT_FAILED,
@@ -56,9 +65,13 @@ from .runtime import (
     EXIT_OK,
     EXIT_USAGE,
     HOST_LOCK_NAME,
+    LAST_EXIT_NAME,
     LEAVE_CLIENT_JOB_ENV,
+    crash_description,
     kill_tree,
     process_tree,
+    read_last_exit,
+    write_last_exit,
 )
 from .winjob import in_foreign_kill_on_close_job, process_in_job, put_self_in_kill_on_close_job
 
@@ -160,6 +173,49 @@ async def wait_for_devtools(
         await asyncio.sleep(0.1)
 
 
+def launch_start_urls(launch: LaunchOptions, start_url: str | None, *, session_exists: bool) -> list[str]:
+    """The URLs to put on Chrome's command line.
+
+    A client's ``--start-url`` (its first destination) is always opened: next to a restored session it
+    becomes a new, active tab. The profile's own ``launch.start_url`` is only opened when no saved
+    session is restored (else a new tab would pile up on every restart)."""
+    if start_url:
+        return [start_url]
+    return [] if session_exists else ([launch.start_url] if launch.start_url else [])
+
+
+def launch_after(launch: LaunchOptions, last_exit: dict[str, Any] | None) -> LaunchOptions:
+    """The launch options of this run: after a *crash* of the previous run (``last_exit.json``) the
+    session is not restored (``--restore-last-session`` would reopen the tab that crashed the browser
+    and crash it again, in a loop; Chrome itself does not restore by itself after a crash). The
+    profile's own setting is unchanged and applies again from the next start."""
+    if launch.restore_session and last_exit and last_exit.get("crashed"):
+        return launch.model_copy(update={"restore_session": False})
+    return launch
+
+
+def redact_launch_args(args: list[str]) -> list[str]:
+    """Chrome's argv for the log, with every URL cut down to its origin (start URLs can carry paths,
+    queries and tokens; the log may be shared)."""
+    out: list[str] = []
+    for arg in args:
+        if arg.startswith("-") or "://" not in arg:
+            out.append(arg)
+            continue
+        try:
+            parts = urlsplit(arg)
+            host = parts.hostname or ""
+            if ":" in host:
+                host = f"[{host}]"
+            port = f":{parts.port}" if parts.port else ""
+        except ValueError:
+            out.append("<url>")
+            continue
+        out.append(f"{parts.scheme}://{host}{port}/…" if (parts.path not in ("", "/") or parts.query
+                                                          or parts.fragment) else f"{parts.scheme}://{host}{port}/")
+    return out
+
+
 def _quiet_connection_resets(loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
     """Peers (Chrome, proxies) resetting relay sockets are routine: log them at DEBUG, not as
     ERROR tracebacks from the proactor's ``_call_connection_lost``."""
@@ -190,10 +246,11 @@ class ProfileHost:
     """Runs one profile: relay + control API + Chrome, until Chrome exits or a stop is requested."""
 
     def __init__(self, store: Store, profile: Profile, window: WindowMode | None = None, *,
-                 client_job: bool = False) -> None:
+                 client_job: bool = False, start_url: str | None = None) -> None:
         self.store = store
         self.profile = profile
         self.client_job = client_job
+        self.start_url = start_url
         self.launch = profile.launch.model_copy(deep=True)
         if window:
             self.launch.window = window
@@ -287,6 +344,7 @@ class ProfileHost:
             ("GET", "/status"): self._route_status,
             ("POST", "/stop"): self._route_stop,
             ("POST", "/upstream"): self._route_upstream,
+            ("POST", "/open"): self._route_open,
         })
         await self.control.start(0)
 
@@ -299,6 +357,7 @@ class ProfileHost:
             host_pid=os.getpid(),
             browser_path=self.browser.path,
             browser_version=self.browser.version,
+            browser_kind=self.browser.kind,
             cdp_port=cdp_port,
             relay_port=self.relay.port if self.relay else None,
             proxy_id=profile.proxy_id,
@@ -307,12 +366,22 @@ class ProfileHost:
             control_token=token,
             window=launch.window,
             client_job=True if self.client_job else None,
+            start_url=self.start_url,
         )
         self._write_info()
 
-        prepare_user_data_dir(self.udd, launch)
+        last_exit = read_last_exit(self.store, profile.id)
+        launch = launch_after(launch, last_exit)
+        if launch.restore_session != self.launch.restore_session:
+            log.warning("the previous run crashed (%s): its tabs are not restored this time, like Chrome after a "
+                        "crash, so the page that crashed it does not reopen by itself", (last_exit or {}).get("crash"))
+        prepare_user_data_dir(self.udd, launch, proxied=self.relay is not None)  # Secure DNS off when proxied
+        if user_data_dir_too_long(self.udd):
+            log.warning("the data directory path is %d characters long (more than %d): Chrome crashes on some pages "
+                        "with it (see browser/prefs.py); use a shorter PROFILEPILOT_HOME",
+                        len(str(self.udd.absolute())), MAX_USER_DATA_DIR_CHARS)
         session = launch.restore_session and has_saved_session(self.udd)
-        start_urls = [] if session else ([launch.start_url] if launch.start_url else [])
+        start_urls = launch_start_urls(launch, self.start_url, session_exists=session)
         try:
             args = build_chrome_args(
                 browser=self.browser, user_data_dir=self.udd, cdp_port=cdp_port, launch=launch,
@@ -320,7 +389,7 @@ class ProfileHost:
             )
         except ProfilePilotError as exc:
             raise HostError(str(exc)) from exc
-        log.info("launching %s %s", self.browser.path, " ".join(args))
+        log.info("launching %s %s", self.browser.path, " ".join(redact_launch_args(args)))
         try:
             self.proc = subprocess.Popen(
                 [self.browser.path, *args],
@@ -367,7 +436,23 @@ class ProfileHost:
             log.info("stop requested")
             await self._close_browser()
             break
-        log.info("browser exited (code %s)", self.proc.poll())
+        self._record_exit(self.proc.poll(), requested=self._stop.is_set())
+
+    def _record_exit(self, code: int | None, *, requested: bool) -> None:
+        """Log how Chrome exited and write ``last_exit.json``, so clients can tell a crash (for example
+        0xC0000005, which some pages cause: see browser/prefs.py) from a normal close."""
+        crash = None if requested else crash_description(code)
+        if crash:
+            hint = long_path_hint(self.udd)
+            log.error("browser exited (code %s): it crashed (%s)%s", code, crash, f". {hint}" if hint else "")
+        else:
+            log.info("browser exited (code %s)", code)
+        try:
+            write_last_exit(self.store, self.profile.id, code=code, requested=requested,
+                            chrome_pid=self.proc.pid if self.proc else None,
+                            chrome_create_time=self.info.chrome_create_time if self.info else None)
+        except Exception as exc:  # never let the record keep the host from cleaning up
+            log.warning("could not write %s: %s", LAST_EXIT_NAME, exc)
 
     async def _close_browser(self) -> None:
         """Browser.close via CDP -> WM_CLOSE (taskkill without /F) -> kill the process tree."""
@@ -462,6 +547,44 @@ class ProfileHost:
             "chrome_pid": self.proc.pid if self.proc else None,
         }
 
+    async def _route_open(self, body: Any) -> dict[str, Any]:
+        """Hand an http(s) URL to the running Chrome through its command line
+        (``chrome.exe --user-data-dir=<udd> --profile-directory=Default <url>``): it opens in a new,
+        active tab like a link opened from another app (no CDP navigation; FIX-PLAN step 8). The
+        short-lived chrome.exe only passes the URL on and exits 0. Should the browser have died
+        meanwhile, that process would become a new browser: it gets the relay's proxy switches (it
+        could never connect directly) and is killed."""
+        url = body.get("url") if isinstance(body, dict) else None
+        if (not isinstance(url, str) or not url.lower().startswith(("http://", "https://"))
+                or any(ch in url for ch in "\x00\r\n")):
+            raise ControlError(400, 'Body must be {"url": "http(s)://..."}.')
+        if self.proc is None or self.proc.poll() is not None or self.browser is None or self.info is None \
+                or self.info.state != "running":
+            raise ControlError(409, "The browser is not running.")
+        if self.launch.window == "headless":
+            raise ControlError(409, "A headless browser takes no URLs from its command line.")
+        argv = [self.browser.path, f"--user-data-dir={self.udd.resolve()}", "--profile-directory=Default"]
+        if self.relay is not None:
+            argv += [f"--proxy-server=socks5://127.0.0.1:{self.relay.port}",
+                     "--webrtc-ip-handling-policy=disable_non_proxied_udp", "--disable-quic"]
+        argv.append(url)
+        try:
+            proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, creationflags=_CREATE_NO_WINDOW if _WINDOWS else 0,
+                                    close_fds=True)
+        except OSError as exc:
+            raise ControlError(500, f"Could not run the browser: {exc}") from exc
+        try:
+            code = await asyncio.to_thread(proc.wait, HANDOFF_WINDOW)
+        except subprocess.TimeoutExpired:
+            await asyncio.to_thread(kill_tree, proc.pid)
+            log.warning("the URL hand-off did not reach the running browser; the extra process was killed")
+            raise ControlError(409, "The running browser did not take the URL over.") from None
+        if code != 0:
+            raise ControlError(502, f"The browser exited with code {code} instead of passing the URL on.")
+        log.info("handed %s to the running browser", redact_launch_args([url])[0])
+        return {"opened": True}
+
     async def _route_stop(self, _body: Any) -> dict[str, Any]:
         self._stop.set()
         return {}
@@ -507,7 +630,7 @@ class ProfileHost:
 
 
 def run_host(profile_id: str, root: Path | None = None, *, window: WindowMode | None = None,
-             client_job: bool = False) -> int:
+             client_job: bool = False, start_url: str | None = None) -> int:
     """Run the host for ``profile_id`` until its browser exits. Returns the process exit code."""
     try:
         store = Store(root)
@@ -527,7 +650,7 @@ def run_host(profile_id: str, root: Path | None = None, *, window: WindowMode | 
         log.info("host starting for profile %s (%s), pid %s, window=%s", profile.name, profile.id, os.getpid(),
                  window or profile.launch.window)
         try:
-            return asyncio.run(ProfileHost(store, profile, window, client_job=client_job).run())
+            return asyncio.run(ProfileHost(store, profile, window, client_job=client_job, start_url=start_url).run())
         finally:
             handler.flush()
     finally:
@@ -535,11 +658,14 @@ def run_host(profile_id: str, root: Path | None = None, *, window: WindowMode | 
 
 
 def main(argv: list[str] | None = None) -> int:
-    """CLI entry: ``python -m profilepilot.browser.host <profile_id> [--root PATH] [--window MODE]``."""
+    """CLI entry: ``python -m profilepilot.browser.host <profile_id> [--root PATH] [--window MODE]
+    [--start-url=URL]``."""
     parser = argparse.ArgumentParser(prog="profilepilot host", description="Run one ProfilePilot profile host.")
     parser.add_argument("profile_id")
     parser.add_argument("--root", type=Path, default=None, help="ProfilePilot data root")
     parser.add_argument("--window", choices=["normal", "offscreen", "headless"], default=None)
+    parser.add_argument("--start-url", default=None,
+                        help="open this URL at launch (also next to a restored session), instead of launch.start_url")
     parser.add_argument("--stderr", type=Path, default=None, help="append stderr to this file (no inherited handle)")
     try:
         args = parser.parse_args(argv)
@@ -552,7 +678,7 @@ def main(argv: list[str] | None = None) -> int:
     client_job = in_foreign_kill_on_close_job()
     if client_job and os.environ.get(LEAVE_CLIENT_JOB_ENV) == "1":
         return EXIT_IN_CLIENT_JOB
-    return run_host(args.profile_id, args.root, window=args.window, client_job=client_job)
+    return run_host(args.profile_id, args.root, window=args.window, client_job=client_job, start_url=args.start_url)
 
 
 def _redirect_stderr(path: Path) -> None:

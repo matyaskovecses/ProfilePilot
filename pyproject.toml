@@ -21,6 +21,7 @@ classifiers = [
 dependencies = [
   "mcp>=2.3,<3",
   "playwright>=1.63,<1.64",
+  "patchright==1.63.*",
   "pydantic>=2.7",
   "python-socks[asyncio]>=2.5",
   "psutil>=6.0",

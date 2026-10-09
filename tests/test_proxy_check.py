@@ -185,7 +185,9 @@ async def test_unreachable_upstream_and_overall_timeout():
         # nothing listens on this port: the relay reports the upstream failure
         dead = ProxyEndpoint("socks5", "127.0.0.1", 9, "u", "p")
         result = await check_proxy(dead, timeout=3, providers=[GeoProvider("x", "http://example.invalid/", kind="ipapi.co")])
-        assert not result.ok and "upstream proxy socks5://u***:***@127.0.0.1:9 failed" in result.error
+        # (FIX-PLAN step 9: no part of the user name; the relay's own error text no longer names the proxy)
+        assert not result.ok and "upstream proxy socks5://***:***@127.0.0.1:9 failed" in result.error
+        assert "<upstream proxy>" in result.error and result.error.count("127.0.0.1:9") == 1
     finally:
         server.close()
         await server.wait_closed()

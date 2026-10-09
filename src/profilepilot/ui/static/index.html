@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en" data-theme="system">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>ProfilePilot Manager</title>
+  <link rel="icon" href="/static/logo.svg" type="image/svg+xml">
+  <link rel="icon" href="/icon-32.png" type="image/png" sizes="32x32">
+  <link rel="apple-touch-icon" href="/icon-180.png">
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/theme.js"></script>
+  <script type="module" src="/static/app.js"></script>
+</head>
+<body>
+  <div id="app" class="app" aria-busy="true">
+    <aside class="sidebar" aria-label="Main navigation">
+      <div class="brand"><img src="/static/logo.svg" alt="" width="28" height="28"><div class="brand-text"><span class="brand-name">ProfilePilot</span><span class="brand-sub">Manager</span></div></div>
+    </aside>
+    <main class="main" id="main">
+      <div class="boot"><div class="spinner" role="status" aria-label="Loading"></div></div>
+    </main>
+  </div>
+  <div id="toasts" class="toasts" role="status" aria-live="polite" aria-atomic="false"></div>
+  <noscript><p class="noscript">ProfilePilot Manager needs JavaScript.</p></noscript>
+</body>
+</html>

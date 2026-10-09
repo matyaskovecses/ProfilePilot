@@ -1,0 +1,33 @@
+name: Bug report
+description: Something doesn't work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report! Please **remove proxy credentials, cookies, tokens and personal data** from anything you paste.
+        Security problems: please use private vulnerability reporting instead (see SECURITY.md).
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: Steps to reproduce, what you expected and what you got (tool call + output, or CLI command + output).
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: AI client
+      placeholder: Claude Desktop / Claude Code / ChatGPT (tunnel) / Codex / CLI only
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      description: Output of `profilepilot doctor --json` is ideal (it contains no secrets).
+      placeholder: Windows 11, Python 3.11, Chrome 154, ProfilePilot 0.1.0
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: profiles/<id>/host.log or the client's MCP log (redact anything sensitive).
+      render: text

@@ -1,5 +1,6 @@
 """BrowserManager / ProfileSession against a real Chrome launched by the test (off-screen, isolated
-user-data-dir, fixed CDP port). The RuntimeManager and the ShardX client are small stubs."""
+user-data-dir, fixed CDP port). The RuntimeManager and the ShardX client are small stubs. Every test
+runs with each CDP driver (patchright, playwright: see profilepilot.automation.driver)."""
 
 import asyncio
 import os
@@ -14,11 +15,12 @@ import pytest_asyncio
 
 from profilepilot.automation.content import InvalidTargetError, RefNotFoundError, snapshot
 from profilepilot.automation.cookies import to_playwright_list, to_portable
+from profilepilot.automation.driver import driver_of
 from profilepilot.automation.manager import BrowserManager, ProfileSession
 from profilepilot.errors import NotFoundError, ProfileNotRunningError, ProfilePilotError
 from profilepilot.models import RuntimeInfo
 
-from .chrome_helper import launch_chrome
+from .chrome_helper import cdp_driver, launch_chrome  # noqa: F401 - cdp_driver is a fixture
 from .fakes import OriginServer
 
 pytestmark = [pytest.mark.chrome, pytest.mark.asyncio]
@@ -89,6 +91,7 @@ class Env:
     origin: OriginServer
     profile_id: str
     store: object
+    driver: str
 
 
 def _runtime_info(profile, chrome) -> RuntimeInfo:
@@ -102,7 +105,7 @@ def _runtime_info(profile, chrome) -> RuntimeInfo:
 
 
 @pytest_asyncio.fixture
-async def env(store):
+async def env(store, cdp_driver):
     profile = store.create_profile("Work", launch={"timezone": "Asia/Tokyo"})
     pages = {"/": MAIN, "/popup": "<title>Popup</title><p>popup page</p>", "/other": "<title>Other</title><p>other</p>",
              "/download": '<a download="hello.txt" href="data:text/plain,hello%20download">Get file</a>'}
@@ -113,7 +116,7 @@ async def env(store):
         manager = BrowserManager(store, runtime)  # type: ignore[arg-type]
         try:
             async with manager:
-                yield Env(manager, runtime, chrome, origin, profile.id, store)
+                yield Env(manager, runtime, chrome, origin, profile.id, store, cdp_driver)
         finally:
             await manager.aclose()
 
@@ -132,10 +135,12 @@ async def _wait_for(predicate, timeout: float = 10.0):
 async def test_attach_snapshot_click_type_and_native_webdriver(env: Env):
     session = await env.manager.session("work")  # name lookup is case-insensitive
     assert isinstance(session, ProfileSession)
+    assert env.manager.driver == env.driver  # PROFILEPILOT_DRIVER picks the driver
     assert env.runtime.starts == 0
     assert session.key == env.profile_id and session.label == "Work"
     assert session.context is session.browser.contexts[0]
     page = await session.page()
+    assert driver_of(page) == env.driver
     await page.goto(env.origin.url + "/")
     assert await page.evaluate("navigator.webdriver") is False
     assert await page.evaluate("document.visibilityState") == "visible"
@@ -180,6 +185,9 @@ async def test_tabs_new_select_close(env: Env):
     await first.goto(env.origin.url + "/")
     second = await session.new_tab(env.origin.url + "/other")
     assert await session.page() is second
+    # A background tab is hidden and unfocused, as in a Chrome nobody automates: patchright's focus
+    # emulation (every attached tab visible and focused) is patched out (automation/driver.py).
+    await _wait_for(lambda: first.evaluate("document.visibilityState === 'hidden' && !document.hasFocus()"))
     tabs = await session.tabs()
     assert [t["active"] for t in tabs] == [False, True]
     assert tabs[0]["title"] == "Main page" and tabs[1]["title"] == "Other"

@@ -1,0 +1,16 @@
+[
+  {
+    "file": "coreBundle.js",
+    "name": "focus-emulation-no-defaults",
+    "why": "Upstream Playwright skips Emulation.setFocusEmulationEnabled on the default context of connect_over_cdp(no_defaults=True); patchright 1.63 sends it to every page, so every attached tab reports visibilityState 'visible' and document.hasFocus() true (background tabs and minimized windows included).",
+    "find": "if (this._isMainFrame() && !this._crPage._browserContext._options.focusControl)",
+    "replace": "if (this._isMainFrame() && !skipDefaultOverrides && !this._crPage._browserContext._options.focusControl)"
+  },
+  {
+    "file": "coreBundle.js",
+    "name": "evaluate-without-user-gesture",
+    "why": "Every evaluate (Runtime.callFunctionOn in CRExecutionContext.evaluateWithArguments) is sent with userGesture: true, which gives the page sticky user activation (navigator.userActivation.hasBeenActive, a running AudioContext) without any input event: ProfilePilot's own visibility checks, page.title() and every reading tool would activate the page within the first tool call. On the default context of connect_over_cdp(no_defaults=True) (ProfilePilot's connections) evaluates are sent without it, so only real (CDP Input) clicks and key presses activate a page, as for a person; other connections keep upstream's behaviour.",
+    "find": "userGesture: true",
+    "replace": "userGesture: !((ctx) => { const c = ctx && ctx.frame && ctx.frame._page && ctx.frame._page.browserContext; return !!(c && c._browser && c._browser.options && c._browser.options.noDefaults && c === c._browser._defaultContext); })(utilityScript._context)"
+  }
+]

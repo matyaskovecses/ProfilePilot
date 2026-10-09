@@ -37,3 +37,27 @@ def test_round_trip_and_redaction():
     assert ep.to_url(remote_dns=True).startswith("socks5h://")
     assert "p@ss" not in ep.redacted() and "p%40ss" not in ep.redacted()
     assert ProxyEndpoint("socks5", "::1", 1).to_url() == "socks5://[::1]:1"
+
+
+def test_redacted_hides_the_whole_user():
+    """FIX-PLAN step 9 (F10): no part of the user name survives (it used to keep 3 characters)."""
+    ep = ProxyEndpoint("socks5", "gate.example", 7000, "customer-alice-zone-us", "se:cret")
+    assert ep.redacted() == "socks5://***:***@gate.example:7000"
+    for part in ("cus", "alice", "zone", "se:cret", "cret"):
+        assert part not in ep.redacted()
+    assert ProxyEndpoint("http", "::1", 8080, "u").redacted() == "http://***:***@[::1]:8080"
+    assert ProxyEndpoint("http", "h.example", 8080).redacted() == "http://h.example:8080"  # nothing to hide
+
+
+def test_relay_errors_do_not_name_the_upstream_proxy():
+    """The relay's last_error reaches the model (relay hints, profile_status): the upstream's address is
+    replaced, the reason is kept."""
+    from profilepilot.proxy.relay import upstream_failure
+
+    ep = ProxyEndpoint("socks5", "gate.example", 7000, "alice", "pw")
+    exc = ConnectionRefusedError("Couldn't connect to proxy gate.example:7000 [Connection refused]")
+    assert upstream_failure(exc, ep) == ("ConnectionRefusedError: Couldn't connect to proxy <upstream proxy> "
+                                         "[Connection refused]")
+    v6 = ProxyEndpoint("http", "2001:db8::5", 3128)
+    assert "2001:db8::5" not in upstream_failure(OSError("proxy [2001:db8::5]:3128 timed out"), v6)
+    assert upstream_failure(OSError("no route to x.example:443"), None) == "OSError: no route to x.example:443"

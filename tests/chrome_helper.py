@@ -18,8 +18,27 @@ from pathlib import Path
 import psutil
 import pytest
 
+from profilepilot.automation.driver import DRIVER, DRIVERS, ENV_DRIVER, installed
 from profilepilot.errors import BrowserNotFoundError
 from profilepilot.paths import BrowserInfo, find_browser
+
+
+DRIVER_PARAMS = [pytest.param(name, marks=pytest.mark.skipif(not installed(name), reason=f"{name} is not installed"))
+                 for name in DRIVERS]
+
+
+@pytest.fixture(params=DRIVER_PARAMS)
+def cdp_driver(request, monkeypatch) -> str:
+    """Each CDP driver in turn (patchright, playwright): ``PROFILEPILOT_DRIVER`` is set for the test,
+    so BrowserManager / the MCP server use it. Import this fixture into a test module to use it."""
+    monkeypatch.setenv(ENV_DRIVER, request.param)
+    return request.param
+
+
+def default_driver_only(driver: str, why: str) -> None:
+    """Skip the other drivers' run of a test that should run once (e.g. it uses the user's clipboard)."""
+    if driver != DRIVER:
+        pytest.skip(f"{why}: run with the default driver ({DRIVER}) only")
 
 
 def find_test_browser() -> BrowserInfo:

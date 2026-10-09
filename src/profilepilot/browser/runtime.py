@@ -34,7 +34,7 @@ from ..errors import (
     ProfilePilotError,
     RestartRequiredError,
 )
-from ..jsonio import lock_for, read_json
+from ..jsonio import lock_for, read_json, write_json
 from ..models import Profile, RuntimeInfo, WindowMode
 from ..procs import host_alive as _host_alive
 from ..procs import process_alive
@@ -63,6 +63,9 @@ ESCAPE_CLIENT_JOB_ENV = "PROFILEPILOT_ESCAPE_CLIENT_JOB"
 
 HOST_LOCK_NAME = "host.lock"
 HOST_STDERR_NAME = "host-stderr.log"
+LAST_EXIT_NAME = "last_exit.json"
+"""``profiles/<id>/last_exit.json``: how the profile's browser last exited (written by the host, see
+:func:`write_last_exit`). Clients read it to tell a crash from a normal close."""
 _STDERR_MAX = 256 * 1024
 _POLL = 0.1
 _REGISTER_WAIT = 15.0
@@ -109,8 +112,12 @@ def _wait_pid_exit(pid: int, timeout: float) -> bool:
         return not psutil.pid_exists(int(pid))
 
 
-def host_command(profile_id: str, root: Path | str, window: WindowMode | None = None) -> tuple[list[str], dict[str, str] | None]:
+def host_command(profile_id: str, root: Path | str, window: WindowMode | None = None,
+                 start_url: str | None = None) -> tuple[list[str], dict[str, str] | None]:
     """argv (and env, if it must differ from ours) that starts a host for ``profile_id``.
+
+    ``start_url`` is passed as ``--start-url=<url>`` (one argument, so a URL can never be read as an
+    option); the host opens it at launch.
 
     On Windows a venv's ``python.exe`` is only a redirector that runs the base interpreter as a
     child; like :mod:`multiprocessing` (bpo-35797) we start the base interpreter directly with
@@ -130,7 +137,72 @@ def host_command(profile_id: str, root: Path | str, window: WindowMode | None = 
     argv = [exe, "-m", "profilepilot.browser.host", profile_id, "--root", str(root)]
     if window:
         argv += ["--window", window]
+    if start_url:
+        argv.append(f"--start-url={start_url}")
     return argv, env
+
+
+#: Names of the Windows NTSTATUS codes a crashing browser process exits with.
+_NTSTATUS_NAMES = {
+    0xC0000005: "access violation",
+    0xC00000FD: "stack overflow",
+    0xC0000374: "heap corruption",
+    0xC0000409: "fail-fast / stack buffer overrun",
+    0xC000001D: "illegal instruction",
+}
+_CRASH_SIGNALS = {"SIGSEGV", "SIGBUS", "SIGILL", "SIGABRT", "SIGFPE"}
+
+
+def crash_description(code: int | None) -> str | None:
+    """A readable description if ``code`` (a browser process exit code) means it *crashed*, else None.
+
+    Windows: an NTSTATUS error code (0xC0000000 and up, also read as a signed 32-bit number), e.g.
+    ``access violation (0xC0000005)``. POSIX: death by SIGSEGV, SIGBUS, SIGILL, SIGABRT or SIGFPE (a
+    small negative ``Popen`` code)."""
+    if code is None:
+        return None
+    if -256 < code < 0:
+        import signal
+
+        try:
+            name = signal.Signals(-code).name
+        except ValueError:
+            return None
+        return name if name in _CRASH_SIGNALS else None
+    value = code & 0xFFFFFFFF
+    if value >= 0xC0000000:
+        return f"{_NTSTATUS_NAMES.get(value, 'crash')} (0x{value:08X})"
+    return None
+
+
+def write_last_exit(store: Store, profile_id: str, *, code: int | None, requested: bool,
+                    chrome_pid: int | None, chrome_create_time: float | None) -> dict[str, Any]:
+    """Record how the profile's browser exited in ``last_exit.json`` (the host calls this when Chrome
+    exits). ``requested``: a stop was asked for (profile_stop), so the exit is no crash."""
+    crash = None if requested else crash_description(code)
+    record = {
+        "profile_id": profile_id, "code": code, "crashed": crash is not None, "crash": crash,
+        "requested": requested, "chrome_pid": chrome_pid, "chrome_create_time": chrome_create_time,
+        "at": time.time(),
+    }
+    folder = store.profile_dir(profile_id)
+    if folder.is_dir():  # never resurrect the folder of a profile deleted meanwhile
+        write_json(folder / LAST_EXIT_NAME, record)
+    return record
+
+
+def read_last_exit(store: Store, profile_id: str) -> dict[str, Any] | None:
+    """The ``last_exit.json`` record of the profile (None if there is none or it is unreadable)."""
+    data = read_json(store.profile_dir(profile_id) / LAST_EXIT_NAME)
+    return data if isinstance(data, dict) else None
+
+
+def exit_of(record: dict[str, Any] | None, info: RuntimeInfo | None) -> bool:
+    """Does the ``last_exit.json`` ``record`` describe the browser of ``info`` (same pid and start)?"""
+    if not record or info is None or not info.chrome_pid or record.get("chrome_pid") != info.chrome_pid:
+        return False
+    recorded, started = record.get("chrome_create_time"), info.chrome_create_time
+    return recorded is None or started is None or abs(float(recorded) - float(started)) <= 1.0
 
 
 def first_error_line(exc: BaseException) -> str:
@@ -336,16 +408,25 @@ class RuntimeManager:
 
     # ------------------------------------------------------------------ start
 
-    def start(self, ref: str, *, timeout: float = 60.0, window: WindowMode | None = None) -> RuntimeInfo:
+    def start(self, ref: str, *, timeout: float = 60.0, window: WindowMode | None = None,
+              start_url: str | None = None) -> RuntimeInfo:
         """Start the profile's browser (idempotent: returns the current info if it is running).
 
-        ``window`` overrides ``launch.window`` for this run only. Raises :class:`LaunchError`
-        (with the host's error and the last lines of ``host.log``) or :class:`ConflictError`
-        when ``config.max_running`` profiles are already running.
+        ``window`` overrides ``launch.window`` for this run only. ``start_url`` (http/https) is
+        opened by Chrome itself at launch, from its command line like a link from another app,
+        instead of the profile's ``launch.start_url`` and also when a saved session is restored (in a
+        new, active tab). Its first request then looks like a typed URL, which a CDP navigation does
+        not quite (docs/FINGERPRINT-AUDIT.md F4/F5). The returned info's ``start_url`` tells whether
+        the browser was launched with it (an already running profile is returned unchanged). Raises
+        :class:`LaunchError` (with the host's error and the last lines of ``host.log``) or
+        :class:`ConflictError` when ``config.max_running`` profiles are already running.
         """
         profile = self.store.get_profile(ref)
         if window is not None and window not in ("normal", "offscreen", "headless"):
             raise ProfilePilotError(f"Invalid window mode {window!r}; use normal, offscreen or headless.")
+        if start_url is not None and (not str(start_url).lower().startswith(("http://", "https://"))
+                                      or any(ch in start_url for ch in "\x00\r\n")):
+            raise ProfilePilotError("A start URL must be an http:// or https:// address.")
         deadline = time.monotonic() + timeout
         while True:
             # Never wait for another host's readiness while holding the cross-profile start lock:
@@ -368,10 +449,10 @@ class RuntimeManager:
                         f"(max_running = {config.max_running}: {names}). Stop one first or raise max_running."
                     )
                 escape = config.escape_client_job or os.environ.get(ESCAPE_CLIENT_JOB_ENV) == "1"
-                proc = self._spawn_host(profile, window, leave_client_job=escape)
+                proc = self._spawn_host(profile, window, leave_client_job=escape, start_url=start_url)
                 self._wait_registered(profile.id, proc, min(deadline, time.monotonic() + _REGISTER_WAIT))
                 if proc.poll() == EXIT_IN_CLIENT_JOB:
-                    proc = self._respawn_outside_job(profile, window)
+                    proc = self._respawn_outside_job(profile, window, start_url=start_url)
                     self._wait_registered(profile.id, proc, min(deadline, time.monotonic() + _REGISTER_WAIT))
             break
         return self._wait_running(profile, proc, deadline, timeout)
@@ -407,11 +488,12 @@ class RuntimeManager:
                 )
             time.sleep(_POLL)
 
-    def _respawn_outside_job(self, profile: Profile, window: WindowMode | None) -> "subprocess.Popen | _HostProcess":
+    def _respawn_outside_job(self, profile: Profile, window: WindowMode | None, *,
+                             start_url: str | None = None) -> "subprocess.Popen | _HostProcess":
         """The first host landed in the client's kill-on-close job: start it through WMI (its parent is
         then the WMI provider host, in no job). If that fails, start it inside the job after all; it
         then records ``client_job`` and the tools tell the user how to keep the browser running."""
-        argv, env = host_command(profile.id, self.store.root, window)
+        argv, env = host_command(profile.id, self.store.root, window, start_url)
         stderr_path = self.store.profile_dir(profile.id) / HOST_STDERR_NAME
         root = Path(self.store.root)
         child_env = dict(env if env is not None else os.environ)
@@ -422,13 +504,13 @@ class RuntimeManager:
         except Exception as exc:  # pywin32/WMI missing or refused
             log.warning("the host is inside this client's kill-on-close job and could not leave it (%s); the "
                         "browser will close when the client disconnects", first_error_line(exc))
-            return self._spawn_host(profile, window, leave_client_job=False)
+            return self._spawn_host(profile, window, leave_client_job=False, start_url=start_url)
         log.info("started the host for profile %s through WMI, outside the client's job (pid %s)", profile.name, pid)
         return _HostProcess(pid)
 
     def _spawn_host(self, profile: Profile, window: WindowMode | None, *,
-                    leave_client_job: bool = False) -> subprocess.Popen:
-        argv, env = host_command(profile.id, self.store.root, window)
+                    leave_client_job: bool = False, start_url: str | None = None) -> subprocess.Popen:
+        argv, env = host_command(profile.id, self.store.root, window, start_url)
         if sys.platform == "win32":
             env = dict(env if env is not None else os.environ)
             if leave_client_job:
@@ -580,6 +662,13 @@ class RuntimeManager:
         if info is None:
             raise ProfileNotRunningError(f"Profile '{profile.name}' is not running.")
         return profile, info
+
+    def open_url(self, ref: str, url: str) -> None:
+        """Have the running profile's Chrome open an http(s) ``url`` from its command line, in a new
+        active tab, like a link opened from another app (the host's ``/open``). Raises
+        :class:`ProfileNotRunningError` or :class:`ControlCallError` (e.g. 409 for a headless browser)."""
+        _profile, info = self._require_running(ref)
+        control_call(info, "POST", "/open", {"url": url}, timeout=15.0)
 
     def set_upstream(self, ref: str, proxy_id: str | None) -> None:
         """Switch the running profile's upstream proxy live (new connections only).

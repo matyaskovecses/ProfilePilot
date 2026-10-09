@@ -16,8 +16,10 @@ from profilepilot.automation.content import (
     snapshot_refs,
     subtree,
 )
+from profilepilot.automation.driver import world_kwargs
 from profilepilot.errors import NotFoundError, ProfilePilotError
 
+from .chrome_helper import cdp_driver  # noqa: F401 - a fixture
 from .fakes import OriginServer
 
 # ---------------------------------------------------------------------- paginate
@@ -237,15 +239,15 @@ def origin():
 
 
 @pytest_asyncio.fixture
-async def page(tmp_path):
-    from playwright.async_api import async_playwright
+async def page(tmp_path, cdp_driver):
+    from profilepilot.automation.driver import async_playwright
 
     from .chrome_helper import launch_chrome
 
     # --disable-backgrounding-occluded-windows: an off-screen window is otherwise "hidden" and
     # Chrome stops requestAnimationFrame, which makes Playwright clicks hang (verified on Chrome 154).
     with launch_chrome(tmp_path / "udd", "--disable-backgrounding-occluded-windows") as chrome:
-        async with async_playwright() as pw:
+        async with async_playwright(cdp_driver) as pw:
             browser = await pw.chromium.connect_over_cdp(chrome.http_url, no_defaults=True)
             try:
                 yield browser.contexts[0].pages[0]
@@ -257,8 +259,10 @@ async def page(tmp_path):
 @pytest.mark.asyncio
 async def test_read_page_drops_hidden_prompt_injection_text(page, origin):
     await page.goto(origin.url + "/")
+    main = world_kwargs(page, "main")  # window.__mutations is the page's own counter
     before = await page.evaluate("document.documentElement.outerHTML")
-    mutations_before = await page.evaluate("window.__mutations")
+    mutations_before = await page.evaluate("window.__mutations", **main)
+    assert isinstance(mutations_before, int)
     outputs = {fmt: await read_page(page, fmt=fmt) for fmt in ("markdown", "text", "html")}
     for fmt, out in outputs.items():
         assert "INJECT" not in out, (fmt, re.findall(r"INJECT\d+", out))
@@ -272,7 +276,7 @@ async def test_read_page_drops_hidden_prompt_injection_text(page, origin):
     assert "<script" not in outputs["html"] and "<template" not in outputs["html"]
     # read-only: the live DOM is untouched and no page observer fired
     assert await page.evaluate("document.documentElement.outerHTML") == before
-    assert await page.evaluate("window.__mutations") == mutations_before
+    assert await page.evaluate("window.__mutations", **main) == mutations_before
 
 
 @pytest.mark.chrome
@@ -313,3 +317,23 @@ async def test_scoped_snapshot_keeps_other_refs_valid(page, origin):
     await page.goto(origin.url + "/")
     with pytest.raises(RefNotFoundError):
         await snapshot(page, ref="e999")
+
+
+
+@pytest.mark.asyncio
+async def test_frame_url_asks_the_document_when_the_driver_never_saw_the_frame_navigate():
+    """An out-of-process iframe that loaded before the CDP connection (a page Chrome opened at launch)
+    has frame.url == '': its document's location stands in (display and relative links only)."""
+    from profilepilot.automation.content import frame_url
+
+    class Frame:
+        def __init__(self, url):
+            self.url, self.asked = url, 0
+
+        async def evaluate(self, script):
+            self.asked += 1
+            return 'http://localhost:5/card.html'
+
+    late, known = Frame(''), Frame('http://127.0.0.1:4/checkout.html')
+    assert await frame_url(late) == 'http://localhost:5/card.html' and late.asked == 1
+    assert await frame_url(known) == 'http://127.0.0.1:4/checkout.html' and known.asked == 0

@@ -109,6 +109,15 @@ This closes F3 only, not F1.
 
 **Accept:** iphey either reads "Trustworthy" (option a) or fails with the explicit crash message and no silent restart.
 
+**Status: done, with a different root cause.** The crash is not DevTools-related: Chrome 154 crashes on iphey.com whenever the
+user-data-dir path is longer than 175 characters, also with no client (audit F2 update). With a short data root iphey reads
+"Trustworthy" under patchright without any patch, so option (a) was not needed. Done as planned: `last_exit.json`, the crash
+message once instead of a silent autostart (the next call starts the profile), `tests/test_tools_unit.py::test_crash_exit_is_reported`.
+Added: a launch warning for long user-data-dirs (`prefs.MAX_USER_DATA_DIR_CHARS`), and no session restore on the first start after a
+crash, because the restore loop was verified (`host.launch_after`, `tests/test_flags.py::test_no_session_restore_right_after_a_crash`).
+The upstream report is still to be sent: `crash_isolate.py --exp startup --udd-len 176` reproduces it with iphey.com and no client;
+a minimal page that triggers it was not found yet.
+
 ---
 
 ## 4. Secure DNS off when proxied (F11; verified in PXND)
@@ -126,6 +135,15 @@ This closes F3 only, not F1.
 - `test_secure_dns_untouched_without_marker`: a user's own setting survives unproxied launches.
 
 **Accept:** the network audit's PXN socket monitor shows 0 non-loopback connections from Chrome.
+
+**Status: done.** As planned, with one refinement to "preserve user settings": the marker records the mode the profile
+had before (`{"previous": ...}`), and an unproxied launch restores that value (none recorded: the key is removed, so
+Chrome's "automatic" returns) - unless the mode is no longer `"off"`, i.e. the user chose another one while proxied,
+which is kept. Without the marker nothing is read or written. Tests: the three above (the third parametrized over the
+user's modes). Re-measured through the real proxy (socket monitor of the Chrome tree, 30 s from launch, counts only:
+[network-doh-step4.json](raw/network-doh-step4.json)): the product path opens **0** non-loopback connections with both
+the SOCKS5 and the HTTP upstream; the pre-fix control on the same machine and proxy opens 2-3 direct TCP 443
+connections about 5 s after launch.
 
 ---
 
@@ -145,6 +163,17 @@ This closes F3 only, not F1.
 
 **Trade-off to document in `safety.py`.** For a proxied profile, a hostname that resolves to a private address on the *proxy's* side is reachable through the proxy. That is not the user's network.
 
+**Status: done, with one deviation.** "Proxied" is not read from the stored `proxy_id` alone: a *running* profile
+answers with its live relay (`RuntimeInfo.relay_port` and an upstream), a stopped one with its saved proxy
+(`tools_browser.profile_proxied` before the start, `session_proxied` after it). The stored value alone would skip the
+DNS check for a profile that was started without a proxy and got one saved later (its browser still connects
+directly, so a name resolving to the LAN would be reached from this machine), and the same for a relay switched to a
+direct connection. `check_url` / `enforce_final_url` take a required `proxied` keyword; `http_fetch` passes
+`resolve=not proxied` to its per-hop hook and its final-URL check. ShardX and unknown refs keep `resolve=True`, and so do
+the settings-time checks of `launch.start_url` in `profile_create` / `profile_update` (that URL is later opened by
+the host without any check, so it must stay safe without a proxy). Tests: the two above (the unit test runs a real relay
+through a fake SOCKS5 upstream and fails every local lookup).
+
 ---
 
 ## 6. Timezone alignment for out-of-process iframes (F7)
@@ -160,6 +189,23 @@ This closes F3 only, not F1.
 3. **Otherwise.** In `ProfileSession._on_page`, register `page.on("frameattached")` / `page.on("framenavigated")`. These call `_apply_timezone_frame(frame)`, which tries `context.new_cdp_session(frame)` (only out-of-process frames succeed), sends `Emulation.setTimezoneOverride` and keeps the session.
    - Same chrome test.
    - Document the first-script race and the revert on detach.
+
+**Status: done (path 3).** The spike failed: `--time-zone-for-testing` is not compiled into branded Chrome 154 (the
+string is in none of its binaries; with the switch every context kept the OS zone, before and after a CDP
+attach/detach; no infobar) - [timezone-step6.json](raw/timezone-step6.json). Implemented as planned with
+`framenavigated` only (at `frameattached` an iframe is still in its parent's process, so `new_cdp_session` cannot
+succeed yet) plus `framedetached` cleanup and the child frames that exist at attach; a kept session is reused on the
+frame's later navigations (the override follows the target into new processes) and replaced when its target is gone.
+Added: `browser_navigate` no longer opens the first URL at launch (step 8) for a profile with `launch.timezone`. Chrome
+would load it before the override can be attached, so the page's first scripts saw the OS zone; it is navigated in the
+existing, already overridden tab instead (`test_tools_unit.py::test_navigate_with_a_timezone_uses_the_overridden_tab`).
+Measured 4/4 (`tests/test_native_fingerprint.py::test_timezone_reaches_oopif_and_workers`): the main frame from its
+first script, dedicated, shared and service workers, the cross-site iframe (late) and its worker all report the
+configured zone; without the frame override the iframe and its worker report the OS zone. Residuals (documented in
+`automation/manager.py`): the out-of-process iframe's *first* script still sees the OS zone (4/4: the earliest hook
+is its commit); tabs and popups opened while attached have the same race; every override reverts when ProfilePilot
+disconnects. A race-free option would be a third patchright patch that sets the default context's `timezoneId`, so the
+driver applies it to every page and iframe target before `Runtime.runIfWaitingForDebugger` (not done).
 
 ---
 
@@ -203,6 +249,15 @@ The P0 configuration (probe as the command-line start URL, no CDP) was clean: no
 - `tests/test_flags.py` for the host's `--start-url` argument.
 - `tests/test_tools_unit.py::test_navigate_autostarts_with_the_destination` with a fake runtime.
 
+**Status: done (1, 2, 3, 4).** Both routes are implemented and measured like P0 (audit F4/F5 updates). The hand-off did not change the
+OS foreground window. Found on the way: the user activation came from the driver's evaluates (`userGesture: true`), not from
+`Page.navigate`; fixed with a second patchright patch, `evaluate-without-user-gesture` (so `browser_evaluate` has no user gesture
+any more). `hasFocus()` is compared with P0 off-screen instead of in a visible window. Pages opened before the attach report their
+out-of-process iframes with `frame.url == ''` in the driver; `content.frame_url` falls back to the document's location (form_detect
+labels, browser_extract base URLs). Tests: the three above, plus `test_reading_tools_never_activate_the_page`, the `running` path of
+`test_first_navigation_is_like_a_typed_url`, `tests/test_runtime_chrome.py::test_urls_open_like_links_from_another_app` and the
+driver patch tests.
+
 ---
 
 ## 9. Proxy details in model-facing text (F10)
@@ -215,6 +270,22 @@ The P0 configuration (probe as the command-line start URL, no CDP) was clean: no
 **Tests.**
 - `tests/test_proxy_url.py::test_redacted_hides_the_whole_user`.
 - `tests/test_tools_unit.py::test_http_fetch_route_names_the_proxy_not_its_host`.
+
+**Status: done.** `redacted()` returns `scheme://***:***@host:port`. `tools_profiles.live_proxy_label` names the proxy
+the *live* relay uses (`RuntimeInfo.proxy_id`, which follows live switches; `'name' (scheme)`, or "an unsaved
+<scheme> proxy" after a switch to a bare URL), used by the `http_fetch` route line, `runtime_text` (`profile_start`,
+`profile_status`) and `proxy_test(profile=)`. The profile tools' saved-proxy label (`proxy_label`: `profile_list`,
+`profile_create`, `profile_set_proxy`, `profile_status`, `proxy_test(profile=)` of a stopped profile) is now
+`'name' (scheme)` too; it showed `ProxyRecord.redacted_url()`, i.e. host, port and the *whole* user name. Added: the
+relay's `last_error`, which reaches the model through the relay hints and `profile_status`, no longer contains the
+upstream's address (python-socks writes "Couldn't connect to proxy HOST:PORT"; `relay.upstream_failure` replaces it with
+`<upstream proxy>`; test `test_proxy_url.py::test_relay_errors_do_not_name_the_upstream_proxy`). Unchanged on purpose:
+the CLI and the local UI (the user's own views) keep showing `RuntimeInfo.upstream`, and the proxy tools themselves
+(`proxy_list`, `proxy_add`, `proxy_test(proxy=)`) still show a record's `redacted_url()` (host, port, user name) - the
+records the user or the model manages there. Tests changed because the output changed on purpose:
+`tests/test_proxy_check.py::test_unreachable_upstream_and_overall_timeout` (the old `u***` form) and two
+`profile_create` assertions in `tests/test_server.py` (they expected `user:***@host:port`; they now assert the name
+and scheme and that host and user are absent).
 
 ---
 

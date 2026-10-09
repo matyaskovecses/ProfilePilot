@@ -156,6 +156,86 @@ def test_prepare_user_data_dir_marks_clean_exit_and_keeps_settings(tmp_path):
     assert not (udd / "DevToolsActivePort").exists()
 
 
+# Secure DNS when proxied (FIX-PLAN step 4, docs/FINGERPRINT-AUDIT.md F11)
+
+
+def _local_state(udd: Path) -> dict:
+    return json.loads((udd / "Local State").read_text(encoding="utf-8"))
+
+
+def test_prepare_user_data_dir_turns_secure_dns_off_when_proxied(tmp_path):
+    from profilepilot.browser.prefs import DOH_OFF_MARKER
+
+    udd = tmp_path / "udd"
+    prepare_user_data_dir(udd, LaunchOptions(), proxied=True)  # a fresh profile: Local State is created
+    assert _local_state(udd) == {"dns_over_https": {"mode": "off"}}
+    assert json.loads((udd / DOH_OFF_MARKER).read_text(encoding="utf-8")) == {"previous": None}
+
+    # an existing Local State: merged, every other key (and the DoH templates) kept
+    udd = tmp_path / "udd2"
+    udd.mkdir()
+    state = {"browser": {"enabled_labs_experiments": ["a@1"]}, "profile": {"info_cache": {"Default": {"name": "x"}}},
+             "dns_over_https": {"mode": "secure", "templates": "https://doh.example/dns-query"}}
+    (udd / "Local State").write_text(json.dumps(state), encoding="utf-8")
+    prepare_user_data_dir(udd, LaunchOptions(), proxied=True)
+    merged = _local_state(udd)
+    assert merged["dns_over_https"] == {"mode": "off", "templates": "https://doh.example/dns-query"}
+    assert {k: v for k, v in merged.items() if k != "dns_over_https"} == {
+        k: v for k, v in state.items() if k != "dns_over_https"}
+    assert json.loads((udd / DOH_OFF_MARKER).read_text(encoding="utf-8")) == {"previous": "secure"}
+    # the next proxied launch keeps the value recorded first (not its own "off")
+    prepare_user_data_dir(udd, LaunchOptions(), proxied=True)
+    assert json.loads((udd / DOH_OFF_MARKER).read_text(encoding="utf-8")) == {"previous": "secure"}
+    assert _local_state(udd)["dns_over_https"]["mode"] == "off"
+
+
+def test_secure_dns_is_restored_when_the_proxy_is_removed(tmp_path):
+    from profilepilot.browser.prefs import DOH_OFF_MARKER
+
+    # Chrome's default ("automatic", no key) comes back, other keys stay
+    udd = tmp_path / "udd"
+    udd.mkdir()
+    (udd / "Local State").write_text(json.dumps({"browser": {"x": 1}}), encoding="utf-8")
+    prepare_user_data_dir(udd, LaunchOptions(), proxied=True)
+    prepare_user_data_dir(udd, LaunchOptions())
+    assert _local_state(udd) == {"browser": {"x": 1}}
+    assert not (udd / DOH_OFF_MARKER).exists()
+
+    # the user's own mode from before the proxy comes back
+    udd = tmp_path / "udd2"
+    udd.mkdir()
+    (udd / "Local State").write_text(json.dumps({"dns_over_https": {"mode": "secure", "templates": "t"}}),
+                                     encoding="utf-8")
+    prepare_user_data_dir(udd, LaunchOptions(), proxied=True)
+    prepare_user_data_dir(udd, LaunchOptions(), proxied=False)
+    assert _local_state(udd) == {"dns_over_https": {"mode": "secure", "templates": "t"}}
+    assert not (udd / DOH_OFF_MARKER).exists()
+
+    # a mode the user chose while proxied is kept
+    udd = tmp_path / "udd3"
+    prepare_user_data_dir(udd, LaunchOptions(), proxied=True)
+    (udd / "Local State").write_text(json.dumps({"dns_over_https": {"mode": "secure"}}), encoding="utf-8")
+    prepare_user_data_dir(udd, LaunchOptions())
+    assert _local_state(udd) == {"dns_over_https": {"mode": "secure"}}
+    assert not (udd / DOH_OFF_MARKER).exists()
+
+
+@pytest.mark.parametrize("mode", ["secure", "off", "automatic", None])
+def test_secure_dns_untouched_without_marker(tmp_path, mode):
+    """A user's own Secure DNS setting survives unproxied launches (only a proxied launch's marker is undone)."""
+    udd = tmp_path / "udd"
+    udd.mkdir()
+    state = {"browser": {"x": 1}} if mode is None else {"dns_over_https": {"mode": mode}, "browser": {"x": 1}}
+    raw = json.dumps(state, separators=(",", ":"))
+    (udd / "Local State").write_text(raw, encoding="utf-8")
+    for _ in range(2):
+        prepare_user_data_dir(udd, LaunchOptions())
+        assert (udd / "Local State").read_text(encoding="utf-8") == raw  # not even rewritten
+    fresh = tmp_path / "fresh"
+    prepare_user_data_dir(fresh, LaunchOptions())
+    assert not (fresh / "Local State").exists()  # left to Chrome
+
+
 def test_has_saved_session(tmp_path):
     udd = tmp_path / "udd"
     assert not has_saved_session(udd)
@@ -307,3 +387,92 @@ def test_host_command_bypasses_the_venv_redirector():
     out = subprocess.run([argv[0], "-c", "import profilepilot, sys; print(sys.prefix)"], env=env,
                          capture_output=True, text=True, timeout=60)
     assert out.returncode == 0 and Path(out.stdout.strip()) == Path(sys.prefix)
+
+
+# --------------------------------------------------------------------------- first navigation at launch (FIX-PLAN step 8)
+
+
+def test_host_start_url_argument(store, tmp_path):
+    from profilepilot.browser.host import launch_start_urls, main
+    from profilepilot.browser.runtime import RuntimeManager, host_command
+
+    url = "https://example.com/--not-an-option?a=-b"
+    argv, _env = host_command("abcd1234", Path("C:/pp"), "offscreen", url)
+    assert argv[-3:] == ["--window", "offscreen", f"--start-url={url}"]  # one argument: never read as options
+    assert host_command("abcd1234", Path("C:/pp"))[0][-2:] == ["--root", str(Path("C:/pp"))]
+    assert main(["nosuchprofile", "--root", str(store.root), f"--start-url={url}"]) == 2  # parsed; unknown profile
+
+    # --start-url (a client's first destination) is opened even next to a restored session;
+    # the profile's own launch.start_url only without one
+    home = LaunchOptions(start_url="https://home.example/")
+    assert launch_start_urls(home, url, session_exists=True) == [url]
+    assert launch_start_urls(home, url, session_exists=False) == [url]
+    assert launch_start_urls(home, None, session_exists=True) == []
+    assert launch_start_urls(home, None, session_exists=False) == ["https://home.example/"]
+    assert launch_start_urls(LaunchOptions(), None, session_exists=False) == []
+
+    store.create_profile("p")
+    for bad in ("file:///C:/Windows/win.ini", "javascript:alert(1)", "about:blank", "https://x.example/\r\n--x"):
+        with pytest.raises(ProfilePilotError, match="http:// or https://"):
+            RuntimeManager(store).start("p", start_url=bad)  # refused before any host is started
+    assert not store.runtime_file(store.get_profile("p").id).exists()
+
+
+def test_launch_log_line_shows_only_origins():
+    from profilepilot.browser.host import redact_launch_args
+
+    args = ["--user-data-dir=C:\\pp\\udd", "--window-position=-32000,-32000", "about:blank",
+            "https://user:secret@shop.example:8443/checkout?token=abc#x", "http://[::1]/", "https://example.com"]
+    assert redact_launch_args(args) == ["--user-data-dir=C:\\pp\\udd", "--window-position=-32000,-32000", "about:blank",
+                                        "https://shop.example:8443/…", "http://[::1]/", "https://example.com/"]
+
+
+def test_long_user_data_dirs_are_flagged(tmp_path):
+    from profilepilot.browser.prefs import MAX_USER_DATA_DIR_CHARS, long_path_hint, user_data_dir_too_long
+
+    short = tmp_path / "u"
+    deep = Path("C:/") / ("x" * (MAX_USER_DATA_DIR_CHARS - 2))  # 176 characters: Chrome 154 crashes on some pages
+    assert len(str(deep)) == MAX_USER_DATA_DIR_CHARS + 1
+    assert not user_data_dir_too_long(short) and long_path_hint(short) == ""
+    assert user_data_dir_too_long(deep) is (sys.platform == "win32")
+    if sys.platform == "win32":
+        assert not user_data_dir_too_long(Path("C:/") / ("x" * (MAX_USER_DATA_DIR_CHARS - 3)))  # 175: fine
+        assert "176 characters" in long_path_hint(deep) and "PROFILEPILOT_HOME" in long_path_hint(deep)
+
+
+
+def test_no_session_restore_right_after_a_crash():
+    """FIX-PLAN step 3: --restore-last-session would reopen the tab that crashed the browser (and crash it
+    again, in a loop); after a crash the next run starts without the old tabs, like Chrome itself."""
+    from profilepilot.browser.host import launch_after
+
+    on = LaunchOptions(restore_session=True)
+    crashed = {"code": 3221225477, "crashed": True, "crash": "access violation (0xC0000005)"}
+    assert launch_after(on, crashed).restore_session is False
+    assert on.restore_session is True  # the profile's own setting is unchanged
+    for normal in (None, {"code": 0, "crashed": False}, {"code": 3221225477, "crashed": False, "requested": True}):
+        assert launch_after(on, normal) is on
+    assert launch_after(LaunchOptions(restore_session=False), crashed).restore_session is False
+    args = build_chrome_args(browser=CHROME, user_data_dir=Path("C:/pp/udd"), cdp_port=9333,
+                             launch=launch_after(on, crashed), relay_port=None, start_urls=[])
+    assert "--restore-last-session" not in args and args[-1] == "about:blank"
+
+
+
+def test_host_open_route_only_hands_http_urls_to_a_running_browser(store):
+    """The host's POST /open (FIX-PLAN step 8) refuses other schemes and a browser that is not running
+    (or headless) before it runs anything."""
+    from profilepilot.browser.host import ProfileHost
+
+    async def scenario():
+        host = ProfileHost(store, store.create_profile("opener"))
+        for bad in (None, {}, {"url": 5}, {"url": "file:///C:/x"}, {"url": "javascript:alert(1)"},
+                    {"url": "https://x.example/\r\n--y"}):
+            with pytest.raises(ControlError) as refused:
+                await host._route_open(bad)
+            assert refused.value.status == 400
+        with pytest.raises(ControlError) as refused:
+            await host._route_open({"url": "https://example.com/"})  # no browser started
+        assert refused.value.status == 409 and "not running" in str(refused.value)
+
+    _run_async(scenario())

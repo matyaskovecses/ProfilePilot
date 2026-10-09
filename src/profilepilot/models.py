@@ -165,7 +165,9 @@ class Profile(_Model):
     identity_id: str | None = None
     """The identity (see :mod:`profilepilot.identity`) that form autofill uses by default."""
     browser: str = "auto"
-    """auto | chrome | edge | chromium | brave | absolute path to a Chromium-family executable."""
+    """auto | a kind of :data:`profilepilot.paths.BROWSER_KINDS` (chrome, edge, brave, chromium, chrome-beta,
+    chrome-dev, chrome-canary, edge-beta, edge-dev, edge-canary) | absolute path to a Chromium-family executable
+    (CLI and config only)."""
     launch: LaunchOptions = Field(default_factory=LaunchOptions)
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
@@ -210,13 +212,17 @@ class RuntimeInfo(_Model):
     chrome_create_time: float | None = None
     browser_path: str | None = None
     browser_version: str | None = None
+    browser_kind: str | None = None
+    """The kind of the running browser (``chrome``, ``edge``, ``chrome-canary`` ...; see ``paths.BROWSER_KINDS``)."""
     cdp_port: int | None = None
     cdp_http_url: str | None = None
     cdp_ws_url: str | None = None
     relay_port: int | None = None
     proxy_id: str | None = None
     upstream: str | None = None
-    """Redacted upstream proxy URL, or None for a direct connection."""
+    """Redacted upstream proxy URL (``ProxyEndpoint.redacted``: host and port, no credentials), or None for a
+    direct connection. For logs, the CLI and the local UI; MCP tools name the proxy by its saved name and
+    scheme instead (``tools_profiles.live_proxy_label``)."""
     control_port: int | None = None
     control_token: str | None = None
     window: WindowMode = "normal"
@@ -225,6 +231,10 @@ class RuntimeInfo(_Model):
     client_job: bool | None = None
     """True when the host could not leave the kill-on-close job of the client that started it (some
     MCP clients): the browser then closes when that client disconnects."""
+    start_url: str | None = None
+    """The URL a client asked the host to open at launch (``RuntimeManager.start(start_url=)``): Chrome
+    opened it from its command line, like a link from another app, in the active tab. Local only:
+    not part of :meth:`public`."""
 
     @property
     def proxy_url(self) -> str | None:
@@ -238,7 +248,7 @@ class RuntimeInfo(_Model):
 
     def public(self) -> dict[str, Any]:
         """Model-safe view (no control token)."""
-        data = self.model_dump(mode="json", exclude={"control_token", "control_port", "chrome_create_time"})
+        data = self.model_dump(mode="json", exclude={"control_token", "control_port", "chrome_create_time", "start_url"})
         data["proxy_url"] = self.proxy_url
         data["http_proxy_url"] = self.http_proxy_url
         return {k: v for k, v in data.items() if v is not None}
@@ -255,6 +265,13 @@ class ShardXConfig(_Model):
     settings = mint short-lived tokens from ShardX's settings.json api_secret (explicit opt-in)."""
 
 
+class AutomationConfig(_Model):
+    driver: Literal["auto", "patchright", "playwright"] = "auto"
+    """The CDP driver (see :mod:`profilepilot.automation.driver`). auto = patchright when installed
+    (no ``Runtime.enable``, isolated-world evaluates), else Playwright. Env override:
+    ``PROFILEPILOT_DRIVER``."""
+
+
 class AppConfig(_Model):
     browser_path: str | None = None
     """Override for the default browser executable (otherwise auto-detected)."""
@@ -268,3 +285,4 @@ class AppConfig(_Model):
     flag WMI process creation. Claude Desktop / Claude Code already allow breakaway and need no
     escape. Env override: ``PROFILEPILOT_ESCAPE_CLIENT_JOB=1``."""
     shardx: ShardXConfig = Field(default_factory=ShardXConfig)
+    automation: AutomationConfig = Field(default_factory=AutomationConfig)

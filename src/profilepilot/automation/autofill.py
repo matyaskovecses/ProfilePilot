@@ -44,7 +44,7 @@ from ..identity import SENSITIVE_FIELDS, derived_values
 from .typing import NotTypeableError, TextEntryError, TypeMethod, enter_text
 
 if TYPE_CHECKING:
-    from playwright.async_api import ElementHandle, Frame, Locator, Page
+    from .driver import ElementHandle, Frame, Locator, Page
 
 log = logging.getLogger("profilepilot.autofill")
 
@@ -808,7 +808,7 @@ class _Raw:
 async def _frames_to_scan(page: "Page", scope: "Locator | None") -> list[tuple["Frame", "ElementHandle | None"]]:
     """``(frame, scope element in that frame or None)`` for every frame to scan, main frame first.
     Child frames whose ``<iframe>`` element is invisible are skipped."""
-    from playwright.async_api import Error as PlaywrightError
+    from .driver import Error as PlaywrightError
 
     scope_handle = scope_frame = None
     if scope is not None:
@@ -845,7 +845,8 @@ async def _frames_to_scan(page: "Page", scope: "Locator | None") -> list[tuple["
 
 
 async def _scan(page: "Page", scope: "Locator | None") -> list[_Raw]:
-    from playwright.async_api import Error as PlaywrightError
+    from .content import frame_url
+    from .driver import Error as PlaywrightError
 
     raws: list[_Raw] = []
     frames = await _frames_to_scan(page, scope)
@@ -864,13 +865,14 @@ async def _scan(page: "Page", scope: "Locator | None") -> list[_Raw]:
             except PlaywrightError as exc:  # the frame navigated or went away meanwhile
                 log.debug("autofill: frame not scanned (%s)", str(exc).splitlines()[0][:120] if str(exc) else exc)
                 continue
+            url = await frame_url(frame)
             elements: dict[int, Any] = {int(k): v for k, v in props.items() if k.isdigit()}
             for i, info in enumerate(data["infos"]):
                 handle = elements.get(i)
                 element = handle.as_element() if handle is not None else None
                 if element is None:
                     continue
-                raws.append(_Raw(frame, frame.url, index, data.get("lang") or "", element, info))
+                raws.append(_Raw(frame, url, index, data.get("lang") or "", element, info))
     finally:
         for _, scope_handle in frames:
             if scope_handle is not None:
@@ -1839,7 +1841,7 @@ async def autofill(
     origin of every frame around it (fail closed: without a policy, sensitive values never go into
     any child frame). ``progress`` is awaited after every field.
     """
-    from playwright.async_api import Error as PlaywrightError
+    from .driver import Error as PlaywrightError
 
     rng = rng or random.Random()
     vals = prepare_values(values)
@@ -1948,7 +1950,7 @@ async def _process(ctx: _Ctx, f: DetectedField, report: AutofillReport, *, overw
                    last_pass: bool = False) -> str | None:
     """Fill one field and record it. Returns "defer" (select without a matching option yet),
     "again" (element went stale before the last pass: the next pass finds it again) or None."""
-    from playwright.async_api import Error as PlaywrightError
+    from .driver import Error as PlaywrightError
 
     if not _requested(f.kind, only):
         return None
@@ -2014,7 +2016,7 @@ async def _process(ctx: _Ctx, f: DetectedField, report: AutofillReport, *, overw
     except NotTypeableError as exc:
         report.skipped.append({**entry, "reason": ctx.scrub(str(exc))})
         return None
-    except (PlaywrightError, TextEntryError) as exc:
+    except (*PlaywrightError, TextEntryError) as exc:  # PlaywrightError is a tuple (one class per driver)
         if _stale(exc):
             if not last_pass:
                 return "again"
@@ -2031,7 +2033,7 @@ async def _frame_origin(frame: "Frame") -> str:
     """The frame's current origin. ``frame.url`` comes from the browser (a page script cannot fake
     it); ``about:srcdoc`` / ``about:blank`` / ``blob:`` frames, and out-of-process frames that a late
     connection has not seen navigate yet (url ''), report the origin of their document."""
-    from playwright.async_api import Error as PlaywrightError
+    from .driver import Error as PlaywrightError
 
     url = frame.url or ""
     if re.match(r"^https?://", url, re.IGNORECASE):

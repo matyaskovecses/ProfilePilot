@@ -22,6 +22,20 @@ their audit names, `audit-socks5` and `audit-http`. Both are the same upstream e
 | What detects the attached client? | (1) Playwright sends `Runtime.enable` (plus auto-attach to workers). Three of 18 public detector sites flag the profile as automated (deviceandbrowserinfo, the fingerprint.com Pro demo and pixelscan's bot check), and the local probe catches it from the first line of the page. (2) One site (iphey.com) **crashes the whole browser process** while the client is attached. (3) `browser_evaluate` is flagged as main-world Playwright code (rebrowser). `browser_read`, `browser_snapshot` and every tool's visibility check also run in the main world, which a page that hooks DOM APIs can catch. (4) Weaker tells come from how ProfilePilot navigates: user activation without any input, `document.hasFocus()` false all session, and one extra `history.length` entry. |
 | Same answer **with a proxy**? | **Yes, with a clean network layer.** For SOCKS5 and HTTP upstreams no page saw the real IP: IPv4, IPv6, WebRTC, DNS resolvers and headers were all clean. TLS (JA4), the HTTP/2 Akamai fingerprint and header order are byte-identical to plain Chrome. ProfilePilot is *better* than stock Chrome with the same proxy, which leaks `REAL_IP` over WebRTC. Expected differences: the timezone doesn't match the exit country, the TCP/IP OS fingerprint is the exit device's, and WebRTC gathers zero ICE candidates. Bugs: the opt-in timezone alignment misses cross-site iframes, remote (HTTP-server) mode resolves every URL through the ISP's DNS, Chrome's Secure-DNS probes go around the proxy (native behaviour, one-line fix), and `http_fetch(engine="scrapling")` claims to be macOS Chrome 150. |
 
+**Update after FIX-PLAN steps 3 and 8 (raw: [detector-iphey-crash-isolation-step3.json](audit/raw/detector-iphey-crash-isolation-step3.json),
+[detector-iphey-P-step3.json](audit/raw/detector-iphey-P-step3.json), [first-navigation-step8.json](audit/raw/first-navigation-step8.json)).**
+Two root causes in the table above were wrong. (2) The iphey.com crash is not caused by the attached client: Chrome 154 crashes there
+whenever its user-data-dir path is longer than 175 characters, also with no client at all, and the audit's P profiles happened to
+sit 6 characters deeper than B1 (F2). With a short data root, P with patchright reads "Trustworthy". (4) The user activation does not come
+from `Page.navigate` but from the driver's own evaluates, which are sent as user gestures (F4). Both are fixed or handled;
+`hasFocus()` and `history.length` now match P0 for the first navigation (F5).
+
+**Update after FIX-PLAN steps 4, 5, 6 and 9 (raw: [network-doh-step4.json](audit/raw/network-doh-step4.json),
+[timezone-step6.json](audit/raw/timezone-step6.json)).** The proxied network layer has no egress around the proxy left:
+Chrome opens 0 non-loopback connections (F11) and remote mode no longer resolves a proxied profile's URLs locally (F8).
+The opt-in timezone now reaches cross-site iframes and every worker type, except an out-of-process iframe's first
+script (F7). Model-facing text names a proxy by its saved name and scheme (F10).
+
 **Bottom line.** ProfilePilot already achieves "a genuine Chrome" at the fingerprint level. Every remaining difference
 that a site can grade comes from *how the automation client talks to Chrome*, not from the launch: the CDP
 domains it enables, the JavaScript world it evaluates in and the way it navigates. Experiment PR shows the way to fix it.
@@ -42,16 +56,16 @@ shows it removes `Runtime.enable` from page and worker sessions and evaluates in
 | ID | Finding | Verdict | Severity (scraping) | Fix (see FIX-PLAN) |
 |---|---|---|---|---|
 | F1 | `Runtime.enable` and worker auto-attach from the attached Playwright client are detectable (prepareStackTrace and console-timing side channels; 3 detector sites) | differs-bug | **High** | Step 2: patchright driver |
-| F2 | A page can crash the whole Chrome browser process while DevTools instrumentation is attached (iphey.com, 5/5) | differs-bug | **High** (availability) | Step 3 |
+| F2 | A page can crash the whole Chrome browser process (iphey.com, 5/5). **Re-diagnosed in step 3:** not DevTools; Chrome 154 crashes when the user-data-dir path is longer than 175 characters, with or without a client (the audit's P paths were 178, B1's 172) | differs-bug → native Chrome bug, path-dependent | Low with the default data root (~58 characters); High for long data roots | Step 3: **done** (warning, crash reported once, no silent restart, no restore after a crash) |
 | F3 | Main-world evaluation: `browser_evaluate` flagged (UtilityScript stack, main-world DOM calls), and `read_page`, the snapshot masking and `_ensure_foreground` call DOM APIs in the main world | differs-bug | Medium | Step 2 (isolated world by default) |
-| F4 | `browser_navigate` (CDP `Page.navigate`) gives the page sticky user activation with no input event | differs-bug | Low | Step 8 |
-| F5 | `document.hasFocus()` stays `false`: keyboard focus stays in the omnibox of the initial `about:blank` tab | differs-bug | Low (could be medium once clicks happen; untested) | Step 8 |
+| F4 | The page gets sticky user activation with no input event. **Re-diagnosed in step 8:** not `Page.navigate`; every driver evaluate (`Runtime.callFunctionOn(userGesture: true)`), already `browser_navigate`'s own title read, activates the page | differs-bug | Low | Step 8: **fixed** with patchright (patch `evaluate-without-user-gesture`); the Playwright fallback still activates |
+| F5 | `document.hasFocus()` stays `false`: keyboard focus stays in the omnibox of the initial `about:blank` tab | differs-bug | Low (stays low: a CDP click gives the page focus) | Step 8: **fixed** (first URL opened by Chrome itself: at launch, or handed to the running browser) |
 | F6 | Back/forward cache disabled (`--disable-back-forward-cache`) | differs-bug (deliberate) | Low | Step 10 (keep, document) |
-| F7 | Opt-in timezone alignment does not reach out-of-process (cross-site) iframes, and it disappears when CDP detaches | differs-bug | Medium when the option is used | Step 6 |
-| F8 | Remote mode (`serve --http`) resolves every URL hostname through the OS resolver (the ISP's DNS), even for proxied profiles | differs-bug | Medium (privacy) | Step 5 |
+| F7 | Opt-in timezone alignment does not reach out-of-process (cross-site) iframes, and it disappears when CDP detaches | differs-bug | Medium when the option is used | Step 6: **fixed** with a per-iframe override (residual: such an iframe's first script still sees the OS zone; overrides end when CDP detaches) |
+| F8 | Remote mode (`serve --http`) resolves every URL hostname through the OS resolver (the ISP's DNS), even for proxied profiles | differs-bug | Medium (privacy) | Step 5: **fixed** (static checks only for proxied profiles) |
 | F9 | `http_fetch(engine="scrapling")` sends a macOS / Chrome 150 identity on the profile's IP and cookies | differs-bug | Medium | Step 7 |
-| F10 | Model-facing text shows the proxy host, port and the first 3 characters of the proxy user name | differs-bug | Low (privacy) | Step 9 |
-| F11 | Chrome's Secure DNS "automatic" probes go direct from `REAL_IP` around the proxy. This is native behaviour; stock Chrome with the same proxy does the same. | same as native, fix anyway | Low–medium (privacy, not site-visible) | Step 4 (verified fix) |
+| F10 | Model-facing text shows the proxy host, port and the first 3 characters of the proxy user name | differs-bug | Low (privacy) | Step 9: **fixed** (the proxy's saved name and scheme) |
+| F11 | Chrome's Secure DNS "automatic" probes go direct from `REAL_IP` around the proxy. This is native behaviour; stock Chrome with the same proxy does the same. | same as native, fix anyway | Low–medium (privacy, not site-visible) | Step 4: **fixed** (0 non-loopback connections, both proxy types) |
 
 ---
 
@@ -150,10 +164,10 @@ Verdicts:
 | CDP: `console.debug(<3000-key object>)` ×100 timing | 0.4–1.5 ms (B0, B1, B1N, P0) | **26–35 ms** | 26–33 ms | **differs-bug (F1)** |
 | Main-world DOM call traps (hooked getters/methods called by non-page code) | 0 | P/P2/PN: 0. **P3 (`browser_snapshot` + `browser_read`): 46 calls** (visibilityState ×2, body ×7, documentElement ×6, getComputedStyle ×6, getAttribute ×8, shadowRoot ×6, childNodes ×6, getBoundingClientRect ×5) whose stacks contain `UtilityScript.evaluate (<anonymous>:311:30)` / `eval at evaluate` | 0 (no reads done) | **differs-bug (F3)** |
 | One main-world evaluate on about:blank before the page loads (P2 vs P) | n/a | no trace on the next document | n/a | same |
-| User activation without input (`navigator.userActivation.hasBeenActive`, `new AudioContext().state`) | false / suspended | **true / running** in every `browser_navigate` config; PL and P0 false / suspended | true / running | **differs-bug (F4)** |
-| `document.hasFocus()` | true in all late samples (B0, B1, B1N, P0) | **false for the whole session** in every CDP-navigated config (P, P2, P3, PL, PN). Captures show the omnibox focused with the URL selected. | false | **differs-bug (F5)** |
+| User activation without input (`navigator.userActivation.hasBeenActive`, `new AudioContext().state`) | false / suspended | **true / running** in every `browser_navigate` config; PL and P0 false / suspended | true / running | **differs-bug (F4)**; step 8: false / suspended in P (the driver's evaluates no longer carry a user gesture) |
+| `document.hasFocus()` | true in all late samples (B0, B1, B1N, P0) | **false for the whole session** in every CDP-navigated config (P, P2, P3, PL, PN). Captures show the omnibox focused with the URL selected. | false | **differs-bug (F5)**; step 8: true in every late sample, like P0 |
 | Back/forward cache (`pageshow.persisted` after `history.back()`) | true (restored) | false: the page reloads (navigation type back_forward, `notRestoredReasons` null); same in B1, B1N, P0 | false | **differs-bug (F6)**. The ablation shows `--disable-back-forward-cache` is the only switch with this effect. |
-| `history.length` | 2 | 3: the extra entry is the initial about:blank, which `browser_navigate` reuses | 3 | differs-expected (like a new tab plus a typed URL) |
+| `history.length` | 2 | 3: the extra entry is the initial about:blank, which `browser_navigate` reuses | 3 | differs-expected (like a new tab plus a typed URL); step 8: equal to P0 (no about:blank entry) |
 | Browser UI: automation infobar, unsupported-flag infobar, first-run / search-engine dialogs | none (with sentinel) | none in any window capture; innerHeight equals B for the same window mode | none | same |
 
 ### 3.3 Window and rendering
@@ -179,7 +193,7 @@ Verdicts:
 | CreepJS | 0 % headless, 0 % stealth, no lies | identical section hashes; PD identical | n/a | same |
 | pixelscan.net/fingerprint-check | consistent; no masking, proxy or automation | identical | n/a | same |
 | pixelscan.net/bot-check (Navigator, Webdriver, CDP, UA) | all Clear (2 runs) | **"Bot Behavior Detected"**: CDP group, `IsDevtoolOpen` (2/2) | PD and PR Clear (the check runs after load) | **differs-bug (F1)** |
-| iphey.com | Trustworthy, MX 100 | **chrome.exe exits 0xC0000005** about 1 s after the page starts a dedicated worker; nothing to read (5/5) | PD crashes too; **PR Trustworthy**; raw isolation below | **differs-bug (F2)** |
+| iphey.com | Trustworthy, MX 100 | **chrome.exe exits 0xC0000005** about 1 s after the page starts a dedicated worker; nothing to read (5/5) | PD crashes too; **PR Trustworthy**; raw isolation below | **differs-bug (F2)**; step 3: P (patchright) **Trustworthy** with a short data root; the crash follows the user-data-dir length |
 | whoer.net | 100 %, no proxy/anonymizer | identical | n/a | same |
 | browserleaks /javascript | webdriver false; inner 1265×1333, outer 1265×1420 | identical except downlink | n/a | same |
 | browserleaks /client-hints | brands, platform, viewport, DPR, device-memory | identical except Downlink | n/a | same |
@@ -279,7 +293,7 @@ every document while ProfilePilot is attached, which in practice is the whole se
 Gate it on the new local regression test, then re-run the four flagged sites. Consider C only as an optional "detach when idle" setting
 for long idle periods, and D only if A regresses.
 
-### F2. A page crashes the Chrome browser process while DevTools instrumentation is attached (High, availability)
+### F2. A page crashes the Chrome browser process while DevTools instrumentation is attached (High, availability; re-diagnosed in step 3: user-data-dir path length)
 
 **Evidence.** On iphey.com, `chrome.exe` (the browser process) exits with 0xC0000005 (3221225477) about 1 s after the page starts a
 dedicated worker. This happened in 5/5 P attempts. The host logs `browser exited (code 3221225477)` and exits, every tab dies, and the next tool call autostarts a fresh browser.
@@ -307,6 +321,42 @@ restored on the next start and the client attaches again. This was not tested.
 2. If it does, the only way to avoid the crash is to not auto-attach workers during load: a `Target.setAutoAttach` `filter` that excludes `worker`. That needs a driver patch, because Playwright has no option for it, and ProfilePilot never uses worker handles. The other route is option D.
 3. Independently, make the crash legible. When the host reports exit code 0xC0000005 while a tool call is in flight, the tool error should say "the page crashed Chrome while it was being automated". It should also stop the next autostart from silently reopening the same tab.
 4. Report the browser-process crash upstream with `crash_isolate.py` as a reproduction. Don't include the site's code.
+
+**Update (FIX-PLAN step 3): re-diagnosed, the cause is the user-data-dir path length.** Raw:
+[detector-iphey-crash-isolation-step3.json](audit/raw/detector-iphey-crash-isolation-step3.json) (`crash_isolate.py` now records `udd_len`
+and takes `--udd-len`).
+
+| Experiment (Chrome 154, ProfilePilot's switches, iphey.com) | user-data-dir ≥ 176 characters | ≤ 175 characters (84–99 in the matrix) |
+|---|---|---|
+| `startup`: the URL on Chrome's command line, **no CDP client at all** | **crash** (0xC0000005, ~6 s) | alive |
+| `none`, `runtime`, `autoattach_ev` (each child resumed through its own session), `autoattach_filtered` (no worker auto-attached) | **crash** | alive |
+| `playwright`, `patchright` (ProfilePilot's driver) | **crash** | alive |
+
+- Every one of 19 runs with a user-data-dir of 176–197 characters crashed; none of about 30 runs at 175 or less did (bisection
+  with no client: 172, 173, 174 and 175 alive, 176, 179 and 181 crashed). At 175 Chrome creates
+  `GPUPersistentCache/DawnGraphiteCache/<32 chars>/cache.db`, `cache.db-wal` and `cache.journal` (83 characters below the
+  user-data-dir); at 176 the folder stays empty: the GPU cache database cannot be created under the Windows path limit (260), and
+  when iphey.com's page then uses the GPU, the browser process apparently dereferences the missing database (an inference from
+  the files; Chrome's crash dump was not analysed). A site-independent reproduction page has not been found yet, so the upstream
+  report still needs the site or more work.
+- The audit's own paths explain every original result. It ran under the same 126-character scratch root
+  (`<scratch>/audit-home/detectors-noproxy` = 156): B1 and PR used `b1|pr/iphey-<time>` (172, Trustworthy), P and PD
+  `profiles/<id>/udd` (178, crash), and the isolation folders `crash/<exp>-<time>` were 174 for `none` (alive) and 177–183 for
+  `runtime`, `autoattach`, `autoattach_rt` and `playwright` (crash). The DevTools attribution followed the experiment-name length.
+- With a short data root, P (patchright, `browser_navigate` + `browser_read` + `browser_screenshot`) reads **Trustworthy** like
+  B1 ([detector-iphey-P-step3.json](audit/raw/detector-iphey-P-step3.json), [detector-iphey-B1-step3.json](audit/raw/detector-iphey-B1-step3.json)).
+- **Decision on worker auto-attach:** no driver patch (option a is not needed): auto-attach is not the cause, and the filter
+  alone still crashes with a long path. ProfilePilot's default data root (`%LOCALAPPDATA%\ProfilePilot\profiles\<id>\udd`) is
+  about 58 characters plus the Windows user name, far below the limit.
+- **What ProfilePilot does now:** `browser/prefs.py` `MAX_USER_DATA_DIR_CHARS = 175`; the host logs a warning at launch when the
+  user-data-dir is longer. When Chrome exits with an NTSTATUS crash code that no stop asked for, the host writes
+  `profiles/<id>/last_exit.json` and logs `it crashed (access violation (0xC0000005))`. The next tool call (or the call that was
+  running) reports "Chrome crashed while this page was open ... The profile was not restarted" once, with the path hint when it
+  applies, instead of "the tab was closed" and a silent restart.
+- **Crash loop (verified):** with `restore_session` the restarted browser restored the crashing tab next to the agent's new URL and
+  crashed again 6 s later, in 3 of 3 rounds. The first start after a crash therefore runs without `--restore-last-session` (like
+  Chrome, which does not restore by itself after a crash): 0 further crashes ([first-navigation-step8.json](audit/raw/first-navigation-step8.json)).
+  The tabs (and session cookies) of the crashed run are not restored.
 
 ### F3. Main-world evaluation (Medium)
 
@@ -337,7 +387,7 @@ The aria snapshot itself and locator actions run in Playwright's utility world a
 - Without patchright, the fallback is an isolated-world helper: `Page.createIsolatedWorld` on the frame, then `Runtime.evaluate(contextId=…, returnByValue=True)`. This needs no `Runtime.enable`.
 - Without patchright, also replace element evaluates with utility-world locator methods, for example `locator.get_attribute("type")` instead of `e => e.type === 'password'`.
 
-### F4. `browser_navigate` grants user activation without input (Low)
+### F4. `browser_navigate` grants user activation without input (Low; re-diagnosed and fixed in step 8: the driver's user-gesture evaluates)
 
 **Evidence.**
 - In every `browser_navigate` configuration, `navigator.userActivation.hasBeenActive === true` and `new AudioContext().state === "running"` (autoplay allowed) before any input.
@@ -354,7 +404,20 @@ It is **not verified** whether a URL a human types into the omnibox gets the sam
 **Fix.** See F5: the first navigation can avoid `Page.navigate` entirely. Do **not** switch to `location.href`. PL shows
 it sends `Sec-Fetch-Site: cross-site` instead of `none`, which is a worse tell for the first request than the activation.
 
-### F5. `document.hasFocus()` is false for the whole session (Low; may be medium)
+**Update (FIX-PLAN step 8): re-diagnosed and fixed.** A page that reports its own state every 50 ms
+([first-navigation-step8.json](audit/raw/first-navigation-step8.json)) shows that `Page.navigate` grants no activation: a document
+opened with it starts un-activated. The activation arrives tens of milliseconds later with the driver's next evaluate, because
+Playwright and patchright send every `Runtime.callFunctionOn` (`evaluate`, `page.title()`, aria snapshots, actionability checks)
+with `userGesture: true`. `browser_navigate` itself reads the title, so every config activated the page within the first tool call.
+ProfilePilot's patchright driver now carries a second in-memory patch, `evaluate-without-user-gesture`, which sends
+`userGesture: false` on the default context of its `no_defaults` connections (checked against the installed bundle before the
+driver starts; `tests/test_driver.py`). Measured: the page stays un-activated through `browser_navigate`, `browser_snapshot`,
+`browser_read`, `browser_screenshot`, `browser_scroll`, `browser_evaluate` and a second `Page.navigate`, and becomes activated
+by `browser_click`, as for a person. `tests/test_native_fingerprint.py::test_reading_tools_never_activate_the_page` guards it (a
+strict xfail with the Playwright fallback, which keeps its gestures). Side effect: `browser_evaluate` code has no user gesture, so
+the popup blocker stops its `window.open` (documented; open popups with `browser_click`). The "human-typed URL" question below is moot.
+
+### F5. `document.hasFocus()` is false for the whole session (Low; fixed in step 8)
 
 **Evidence.**
 - Every CDP-navigated configuration had `hasFocus()` false in 12/12 late samples. B0, B1, B1N and P0 were true.
@@ -378,6 +441,20 @@ Trade-offs:
 - The start URL is visible in the local process command line.
 - A saved session plus a start URL opens an extra tab (already documented in `flags.py`).
 - The handoff spawns a short-lived chrome.exe.
+
+**Update (FIX-PLAN step 8): fixed for the first navigation.** Both routes are implemented:
+`browser_navigate` on a stopped profile starts it with the destination (`RuntimeManager.start(start_url=)` → host `--start-url`,
+"Opened at launch"); on a running profile whose only tab is still its initial `about:blank`, the host's `POST /open` runs
+`chrome.exe --user-data-dir=<udd> --profile-directory=Default <url>` (with the relay's proxy switches, so a browser that died meanwhile
+could never start unproxied; such a process is killed), the new tab is adopted and the blank one closed. Measured with the probe
+against P0 in the same run, for both routes: `Sec-Fetch-Site: none`, no user activation, `AudioContext` suspended, `history.length`
+equal and `hasFocus()` true in every late sample (`test_first_navigation_is_like_a_typed_url`). The hand-off did not change the OS
+foreground window (`GetForegroundWindow` polled for 4 s; [first-navigation-step8.json](audit/raw/first-navigation-step8.json)); it is
+never used for a minimized window (Chrome would restore it) or a headless one. `hasFocus()` turned out to be measurable off-screen:
+Chrome reports focus for its active window while another application has the OS foreground (B1 and P0 were true), so the test
+compares with P0 instead of opening a visible window. Open question 4 of the plan is answered: a CDP click gives the page focus
+(from about:blank + `Page.navigate`, `hasFocus()` became true with the first `browser_scroll` or `browser_click`), so clicks never
+arrive while it is false and F5 stays low. Later navigations keep `Page.navigate`.
 
 Do not use `Emulation.setFocusEmulationEnabled`. It fakes focus even when the window really is in the background, which is not native.
 
@@ -412,6 +489,16 @@ they can compare it with the top frame.
 1. Try a launch-level mechanism first, because it covers every renderer and survives detaching. Candidate: Chromium's `--time-zone-for-testing=<IANA>` switch. Verify on Chrome 154 that it reaches the main frame, OOPIFs, dedicated, shared and service workers, shows no infobar, and is not page-visible. Being a "for testing" switch, it may disappear in a later Chrome.
 2. If it does not work, apply the override per OOPIF. On `page.on("frameattached")` / `framenavigated`, try `context.new_cdp_session(frame)`, which only succeeds for out-of-process frames, and keep those sessions. There is a race: the iframe's first scripts can run before the override lands. Document it.
 
+**Update (FIX-PLAN step 6; raw: [timezone-step6.json](audit/raw/timezone-step6.json)).** Option 1 does not exist on
+branded Chrome 154: `--time-zone-for-testing` is in none of its binaries, and with it every context kept the OS zone.
+Option 2 is implemented (`framenavigated`, plus the frames present at attach), and a profile with `launch.timezone`
+now gets its first URL navigated in the already overridden tab instead of opened at launch (step 8), so the page's own
+first script has the zone too. Measured 4/4 with `Asia/Tokyo`: the main frame from its first script, dedicated, shared
+and **service** workers, the cross-site iframe (after its first script) and the iframe's worker all report it; without
+the per-frame override the iframe and its worker report `OS_TIMEZONE`, as in PXT. **Residual:** the
+out-of-process iframe's first script still reads the OS zone (4/4; the earliest hook is its commit), new tabs and popups
+have the same race, and every override still ends when CDP detaches. Severity: Low-Medium when the option is used.
+
 ### F8. Remote mode resolves URLs through the OS resolver even for proxied profiles (Medium, privacy)
 
 **Evidence.**
@@ -434,6 +521,14 @@ The static checks are still needed because Chrome's implicit proxy bypass sends 
 
 Trade-off: a hostname that resolves to a private address *on the proxy's side* becomes reachable through the proxy. That network is not the user's; document it.
 The alternative, resolving over DoH through the relay, is more code.
+
+**Update (FIX-PLAN step 5): fixed.** `UrlPolicy.check/acheck(resolve=False)` runs the static checks only. Remote-mode
+tools use it when the profile's traffic leaves through an upstream proxy: a running profile is judged by its live relay
+(it must have an upstream), a stopped one by its saved proxy. A profile that runs without a proxy, ShardX profiles, and
+the settings-time check of a profile's `launch.start_url` keep resolving.
+`tests/test_tools_unit.py::test_proxied_profile_remote_mode_does_not_resolve_locally` fails every local lookup and drives `browser_navigate`
+(at launch and later) and `http_fetch` (through a real relay) on a proxied profile: 0 local lookups, while local names
+and private literals are still refused.
 
 ### F9. `http_fetch(engine="scrapling")` impersonates a different browser and OS (Medium)
 
@@ -474,6 +569,13 @@ User headers still override.
 
 **Fix.** Model-facing text names the proxy by its saved name and scheme, for example `via the profile's proxy 'audit-socks5' (socks5)`. `redacted()` keeps no part of the user name.
 
+**Update (FIX-PLAN step 9): fixed.** `redacted()` gives `scheme://***:***@host:port`. The `http_fetch` route line,
+`profile_start` / `profile_status`, `proxy_test(profile=)` and the profile tools' saved-proxy label name the proxy by
+its saved name and scheme (the profile label used to show `ProxyRecord.redacted_url()`, i.e. the *whole* user name), and
+the relay's error text, which reaches the model in hints, has the upstream's address replaced. `RuntimeInfo.upstream`
+stays for logs, the CLI and the local UI; the proxy tools themselves (`proxy_list`, `proxy_add`, `proxy_test(proxy=)`)
+still show the saved records with host, port and user name.
+
 ### F11. Secure DNS "automatic" probes bypass the proxy (native; Low–medium privacy)
 
 **Evidence.**
@@ -488,6 +590,13 @@ The pref is not MAC-protected and pages cannot observe it.
 
 Trade-off: no Secure DNS for proxied profiles. Hostnames resolve at the proxy anyway, so nothing is lost.
 
+**Update (FIX-PLAN step 4): fixed** ([network-doh-step4.json](audit/raw/network-doh-step4.json)). `prepare_user_data_dir(proxied=True)`
+merges the pref before every proxied launch and records the previous mode in a marker; the first launch
+without a proxy restores it (a mode the user picked meanwhile is kept, and without the marker nothing is touched).
+Re-measured through the real proxy with the socket monitor (30 s from launch): **0** non-loopback connections from
+Chrome's process tree with `audit-socks5` and with `audit-http`, while the pre-fix control on the same machine and proxy
+opened 2-3 direct TCP 443 connections about 5 s after launch.
+
 ---
 
 ## 5. Expected differences (documented, not bugs)
@@ -498,7 +607,7 @@ Trade-off: no Secure DNS for proxied profiles. Hostnames resolve at the proxy an
 | **Timezone vs proxy country** | Native mode keeps the OS timezone, OS_TIMEZONE, while the exit geolocates to America/New_York. | The opt-in `launch.timezone` / `launch.lang` align it (PXT), apart from F7. |
 | **TCP/IP OS fingerprint is the exit's** | The proxy terminates TCP. browserleaks reads "Android" (TTL 49–51, MSS 1400) while the UA says Windows. | Identical with stock Chrome and the same proxy. Only fixable by choosing a Windows-based exit. |
 | **WebRTC gathers zero ICE candidates when proxied** | `--webrtc-ip-handling-policy=disable_non_proxied_udp` (`launch.webrtc=auto`) | No real or LAN IP leaks, where stock Chrome with the same proxy leaks `REAL_IP`. A page can see that gathering yields nothing, which looks like a WebRTC-protection setting and is unusual for desktop Chrome. Accepted trade-off. |
-| **`history.length` +1** | The profile starts on about:blank and `browser_navigate` reuses that tab. | Like a person who opened a new tab and typed a URL. Disappears for the first navigation with the F4/F5 fix. |
+| **`history.length` +1** | The profile starts on about:blank and `browser_navigate` reuses that tab. | Like a person who opened a new tab and typed a URL. Gone for the first navigation since FIX-PLAN step 8 (the URL is opened by Chrome itself). |
 | **`window="offscreen"` geometry** | `--window-position=-32000,-32000` gives screenX/Y = -32000 (Windows' minimized-window coordinate) and a window on no screen. The invisible 8 px borders vanish (innerWidth = outerWidth, innerHeight +8), which also changes `Sec-CH-Viewport-*`. | **Trivially detectable**, although none of the 18 sites graded it. Opt-in only; `normal` (the default) equals B0 on every geometry field. Document "offscreen = detectable; use normal for stealth". |
 | **Window never reports `hidden`** | `--disable-backgrounding-occluded-windows` (all modes). A covered native Chrome reports `hidden`, with outer size 0 and rAF stopped. | Required: otherwise Playwright actions hang on covered windows. No infobar, and the single-flag ablation shows no other effect. A page cannot verify that it "should" be hidden. |
 | **`http_fetch` engine=httpx is a plain HTTP client** | Documented. It borrows the browser's UA, but TLS is Python's (JA4 `t13d1812h1…`), over HTTP/1.1 with no client hints. | Risky. A Chrome UA on a non-Chrome TLS stack, sharing an IP with the real browser, is a classic bot signal. Consider making `auto` prefer the aligned curl_cffi engine (after F9), or not borrowing the Chrome UA (optional FIX-PLAN step 11). |
@@ -554,9 +663,9 @@ Not covered by this audit, and worth a follow-up run:
 - **Behaviour-based checks.** incolumitas' behavioral score and deviceandbrowserinfo's behavioural page need real mouse movement.
 - **Proxies.** A second proxy in another country, a UDP-capable vs UDP-less upstream, and a machine with global IPv6.
 - **Untested launch options.** `headless` mode, and a non-default `launch.lang`; PXT's `en-US` equals the OS language.
-- **Service workers** for the timezone override.
-- **`hasFocus()` during CDP clicks and typing** (F5 severity).
-- **Human-typed URL baseline.** Whether a human-typed omnibox URL also grants user activation (F4).
+- ~~**Service workers** for the timezone override.~~ Answered in step 6: they report the configured zone.
+- ~~**`hasFocus()` during CDP clicks and typing** (F5 severity).~~ Answered in step 8: a CDP click gives the page focus.
+- ~~**Human-typed URL baseline.**~~ Moot since step 8: the activation came from the driver's evaluates, not from the navigation.
 
 ---
 

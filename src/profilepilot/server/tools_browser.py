@@ -5,7 +5,9 @@ active tab (or ``tab``) and answers ``[profile] <title> — <url>`` followed by 
 Navigation targets go through the :class:`~profilepilot.safety.UrlPolicy` first. In remote mode
 the page's URL is checked again before every tool acts on it and before any output is returned
 (redirects, scripts, timers and popups can move a tab to a blocked address); a tab on a blocked
-address is navigated to ``about:blank`` and nothing read from it is returned.
+address is navigated to ``about:blank`` and nothing read from it is returned. For a profile whose
+traffic leaves through an upstream proxy those checks resolve no host names on this machine (static
+checks only; docs/FINGERPRINT-AUDIT.md F8, see :mod:`profilepilot.safety`).
 """
 
 from __future__ import annotations
@@ -20,15 +22,16 @@ from typing import Annotated, Any, Callable, Literal
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context, Image
 from mcp.server.mcpserver.exceptions import ToolError
-from playwright.async_api import Error as PlaywrightError
-from playwright.async_api import Locator, Page
-from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import Field
 
 from ..automation import content
 from ..automation.content import InvalidTargetError
-from ..automation.manager import ProfileSession
+from ..automation.driver import Error as PlaywrightError
+from ..automation.driver import Locator, Page, world_kwargs
+from ..automation.driver import TimeoutError as PlaywrightTimeoutError
+from ..automation.manager import ProfileSession, is_shardx_ref
 from ..errors import NotFoundError, PolicyError, ProfilePilotError
+from ..models import RuntimeInfo
 from ..safety import normalize_url
 from .app import (
     DEFAULT_MAX_CHARS,
@@ -71,17 +74,18 @@ WaitUntil = Literal["load", "domcontentloaded", "networkidle", "commit"]
 # ---------------------------------------------------------------------- shared helpers
 
 
-async def open_page(ctx: Context, profile: str, tab: int | None = None, *,
-                    interactive: bool = True) -> tuple[AppState, ProfileSession, Page]:
+async def open_page(ctx: Context, profile: str, tab: int | None = None, *, interactive: bool = True,
+                    start_url: str | None = None) -> tuple[AppState, ProfileSession, Page]:
     """Resolve and (auto)start the profile, attach, and return the page to act on.
 
     In remote mode a tab that sits on a blocked address (it navigated there on its own) is blanked
     and the tool refuses to act on it. ``interactive=False`` (read-only tools) leaves a minimized
-    window minimized."""
+    window minimized. ``start_url``: see ``BrowserManager.session``."""
     state = get_state(ctx)
-    session = await state.browsers.session(profile)
+    session = await (state.browsers.session(profile, start_url=start_url) if start_url
+                     else state.browsers.session(profile))
     page = await session.page(tab, interactive=interactive)
-    await enforce_final_url(state, page)
+    await enforce_final_url(state, page, proxied=session_proxied(session))
     return state, session, page
 
 
@@ -106,7 +110,7 @@ async def respond(session: ProfileSession, page: Page, body: str = "", *, state:
     profile's pages (:meth:`AppState.redact`): this is the single choke point of every tool that
     reads a page (snapshot, read, extract, evaluate, wait_for, scroll and the form tools)."""
     if state is not None and not page.is_closed():
-        await enforce_final_url(state, page)
+        await enforce_final_url(state, page, proxied=session_proxied(session))
     if state is None:
         return await _respond(session, page, body, lambda text: text)
     return state.redact(session.key, await _respond(session, page, body, partial(state.redact, session.key)))
@@ -133,22 +137,63 @@ async def _respond(session: ProfileSession, page: Page, body: str, redact: Calla
     return out
 
 
-async def check_url(state: AppState, url: str) -> str:
-    """Normalise a model-supplied URL ("example.com" -> https://) and apply the URL policy."""
+def routes_through_proxy(info: RuntimeInfo | None) -> bool:
+    """Does the running browser of ``info`` reach the web through an upstream proxy? (Its relay has an
+    upstream. A relay switched to a direct connection connects - and resolves names - on this machine.)"""
+    return info is not None and bool(info.relay_port) and info.upstream is not None
+
+
+def session_proxied(session: ProfileSession) -> bool:
+    """:func:`routes_through_proxy` for an attached session (ShardX sessions: False)."""
+    return routes_through_proxy(getattr(session, "runtime", None))
+
+
+async def profile_proxied(state: AppState, ref: str) -> bool:
+    """Remote mode, before the profile is (auto)started: will ``ref``'s traffic leave through an upstream
+    proxy? A running profile answers with its live relay, a stopped one with its saved proxy (it starts
+    with it). ShardX and unknown refs, and local mode (which resolves nothing): False."""
+    if not state.policy.restricts_private or is_shardx_ref(ref):
+        return False
+
+    def lookup() -> bool:
+        try:
+            profile = state.store.get_profile(ref)
+            info = state.runtime.status(profile.id)
+        except ProfilePilotError:
+            return False
+        return routes_through_proxy(info) if info is not None else profile.proxy_id is not None
+
+    return await run_sync(lookup)
+
+
+async def profile_timezone(state: AppState, ref: str) -> str | None:
+    """The saved ``launch.timezone`` of profile ``ref`` (None for ShardX and unknown refs)."""
+    if is_shardx_ref(ref):
+        return None
+    try:
+        return (await run_sync(state.store.get_profile, ref)).launch.timezone
+    except ProfilePilotError:
+        return None
+
+
+async def check_url(state: AppState, url: str, *, proxied: bool) -> str:
+    """Normalise a model-supplied URL ("example.com" -> https://) and apply the URL policy. ``proxied``
+    (:func:`profile_proxied`): no local DNS resolution, static checks only."""
     target = normalize_url(url)
-    await state.policy.acheck(target)
+    await state.policy.acheck(target, resolve=not proxied)
     return target
 
 
-async def enforce_final_url(state: AppState, page: Page) -> None:
-    """Remote mode: re-check where the page ended up (redirects, scripts, clicks, timers)."""
+async def enforce_final_url(state: AppState, page: Page, *, proxied: bool) -> None:
+    """Remote mode: re-check where the page ended up (redirects, scripts, clicks, timers). ``proxied``
+    (:func:`session_proxied`): static checks only, no local DNS resolution."""
     if not state.policy.restricts_private or page.is_closed():
         return
     url = page.url
     if not url.lower().startswith(("http://", "https://")):
         return
     try:
-        await state.policy.acheck(url)
+        await state.policy.acheck(url, resolve=not proxied)
     except PolicyError:
         try:
             await page.goto("about:blank")
@@ -164,7 +209,7 @@ async def blank_blocked_tabs(state: AppState, session: ProfileSession) -> int:
     blanked = 0
     for page in list(session.context.pages):
         try:
-            await enforce_final_url(state, page)
+            await enforce_final_url(state, page, proxied=session_proxied(session))
         except PolicyError:
             blanked += 1
     return blanked
@@ -210,7 +255,7 @@ async def after_action(state: AppState, session: ProfileSession, page: Page, mes
     await settle(page)
     current = await session.page(interactive=False)
     if current is not page:
-        await enforce_final_url(state, current)
+        await enforce_final_url(state, current, proxied=session_proxied(session))
         return await respond(session, current, message, state=state)  # respond reports the new tab
     return await respond(session, page, message, state=state)
 
@@ -279,10 +324,25 @@ async def browser_navigate(
     browser_snapshot to see actionable elements or browser_read for the text."""
     action = (url or "").strip().lower()
     destination = None
-    if action not in ("back", "forward", "reload"):
-        destination = await check_url(get_state(ctx), url)  # before anything is started
-    state, session, page = await open_page(ctx, profile, tab, interactive=False)  # works on hidden pages
+    state = get_state(ctx)
+    if action not in ("back", "forward", "reload"):  # checked before anything is started
+        destination = await check_url(state, url, proxied=await profile_proxied(state, profile))
+    # The first http(s) destination is opened by Chrome itself from its command line, like a link from
+    # another app: a stopped profile starts with it, and a running one whose only tab is still the blank
+    # tab it started with gets it handed over (a new tab). No CDP navigation, so the tab has the focus
+    # and no extra history entry (docs/FINGERPRINT-AUDIT.md F5). Later navigations use Page.navigate.
+    # Not with an (opt-in) timezone: Chrome would load that page before the override can be attached, so
+    # its first scripts would see the OS timezone; the existing tab already has the override (F7).
+    launch = destination if tab is None and destination and destination.lower().startswith(("http://", "https://")) \
+        and not await profile_timezone(state, profile) else None
+    state, session, page = await open_page(ctx, profile, tab, interactive=False, start_url=launch)  # hidden pages too
     timeout = timeout_s * 1000
+    if launch is not None and session.take_launch_url() == launch:
+        return await opened_at_launch(state, session, page, launch, wait_until, timeout)
+    if launch is not None:
+        handed = await state.browsers.open_in_blank_tab(session, launch)
+        if handed is not None:
+            return await opened_at_launch(state, session, handed, launch, wait_until, timeout, handed_over=True)
     try:
         if action in ("back", "forward"):
             # ProfilePilot starts Chrome with --disable-back-forward-cache, but other browsers (ShardX,
@@ -300,19 +360,19 @@ async def browser_navigate(
                     await page.wait_for_load_state(wait_until, timeout=min(timeout, SETTLE_TIMEOUT_MS))
                 except PlaywrightError:
                     pass
-            await enforce_final_url(state, page)
+            await enforce_final_url(state, page, proxied=session_proxied(session))
             status = f" (HTTP {response.status})" if response else ""
             return await respond(session, page, f"Went {action}{status}.", state=state)
         if action == "reload":
             response = await page.reload(wait_until=wait_until, timeout=timeout)
-            await enforce_final_url(state, page)
+            await enforce_final_url(state, page, proxied=session_proxied(session))
             status = f" (HTTP {response.status})" if response else ""
             return await respond(session, page, f"Reloaded{status}.", state=state)
         assert destination is not None
         response = await page.goto(destination, wait_until=wait_until, timeout=timeout)
     except PlaywrightError as exc:
         raise await navigation_error(state, session, exc) from None
-    await enforce_final_url(state, page)
+    await enforce_final_url(state, page, proxied=session_proxied(session))
     if response is None:
         scheme = destination.split(":", 1)[0].lower()
         status = ("Navigated (no HTTP response for data:/about: URLs)." if scheme in ("data", "about", "blob")
@@ -321,6 +381,33 @@ async def browser_navigate(
         status = f"Navigated: HTTP {response.status}{' ' + response.status_text if response.status_text else ''}."
     return await respond(session, page, status + " Next: browser_snapshot (elements with refs) or browser_read (text).",
                          state=state)
+
+
+async def opened_at_launch(state: AppState, session: ProfileSession, page: Page, url: str, wait_until: WaitUntil,
+                           timeout: float, *, handed_over: bool = False) -> str:
+    """``browser_navigate``'s first destination: Chrome opened ``url`` itself, at launch or (``handed_over``)
+    from a second command line, in the active tab ``page``; wait for it like ``page.goto`` would. No
+    HTTP status: nothing was navigated over CDP."""
+    try:
+        # Attached right after the launch, the tab may still show its initial empty document.
+        await page.wait_for_url(lambda current: current.startswith(("http://", "https://", "chrome-error:")),
+                                wait_until="commit", timeout=timeout)
+        if wait_until != "commit" and not page.url.startswith("chrome-error:"):
+            await page.wait_for_load_state(wait_until, timeout=timeout)
+    except PlaywrightError as exc:
+        raise await navigation_error(state, session, exc) from None
+    if page.url.startswith("chrome-error:"):
+        hint = await relay_hint(state, session) or (
+            f"Check the address, or the profile's proxy with proxy_test(profile='{session.label}')."
+            if session.runtime is not None and session.runtime.relay_port else "Check the address.")
+        raise ProfilePilotError(f"Chrome could not open {clip_text(url, URL_MAX)}: it shows its error page "
+                                f"(no response, a DNS or connection error). {hint}")
+    await enforce_final_url(state, page, proxied=session_proxied(session))
+    how = ("Opened like a link from another app: Chrome opened this URL in a new tab, which replaced the blank one"
+           if handed_over else
+           "Opened at launch: the profile started with this URL, like a link opened from another app")
+    return await respond(session, page, f"{how} (no HTTP status is reported for it). Next: browser_snapshot "
+                                        "(elements with refs) or browser_read (text).", state=state)
 
 
 async def browser_snapshot(
@@ -420,7 +507,7 @@ async def browser_extract(
             continue
         if frame is page.main_frame:
             main_html = html
-        found = await run_sync(content.extract, html, frame.url, css=css, xpath=xpath, attr=attr,
+        found = await run_sync(content.extract, html, await content.frame_url(frame), css=css, xpath=xpath, attr=attr,
                                limit=limit - len(values))
         values.extend(found)
     if not values:
@@ -503,16 +590,23 @@ async def browser_evaluate(
                                                  "'document.title' or '() => [...document.links].length'.")],
     max_chars: MaxCharsArg = DEFAULT_MAX_CHARS,
     tab: TabArg = None,
+    world: Annotated[Literal["isolated", "main"], Field(
+        description="isolated (default): a separate JavaScript world that sees the DOM but not the page's own "
+                    "variables, and that the page cannot observe. main: the page's own world, only to read page "
+                    "JavaScript state such as window.__NEXT_DATA__; the page can detect it.")] = "isolated",
 ) -> str:
     """Run JavaScript in the page and return its JSON-serialised result. Use sparingly: prefer
-    browser_read / browser_extract for content. Never use it to read card numbers, SSNs or
+    browser_read / browser_extract for content. By default it runs in an isolated world (DOM access,
+    invisible to the page); world='main' reaches the page's own variables but is detectable. It runs
+    without a user gesture, like the page's own code: what needs a click (opening a popup, clipboard,
+    fullscreen) is refused, so use browser_click for that. Never use it to read card numbers, SSNs or
     passwords out of a form (values filled by form_autofill_sensitive are redacted)."""
     if is_blank(expression):
         raise ProfilePilotError("No expression given.")
     state, session, page = await open_page(ctx, profile, tab, interactive=False)
     refuse_on_secret_page(state, session, page, "browser_evaluate")
     try:
-        result = await page.evaluate(expression)
+        result = await page.evaluate(expression, **world_kwargs(page, world))
     except PlaywrightError as exc:  # a thrown error can carry page values too
         raise ToolError(state.redact(session.key, str(to_tool_error(exc, "browser_evaluate")))) from None
     text = state.redact(session.key, json.dumps(result, ensure_ascii=False, indent=1, default=str))  # before cutting
@@ -820,13 +914,14 @@ async def browser_tabs(
     if action in ("select", "close") and index is None:
         raise ProfilePilotError(f"Give the 'index' of the tab to {action} (see browser_tabs action=list).")
     state = get_state(ctx)
-    destination = await check_url(state, url) if action == "new" and not is_blank(url) else None
+    destination = (await check_url(state, url, proxied=await profile_proxied(state, profile))
+                   if action == "new" and not is_blank(url) else None)
     session = await state.browsers.session(profile)
     message = ""
     blanked = await blank_blocked_tabs(state, session)
     if action == "new":
         page = await session.new_tab(destination)
-        await enforce_final_url(state, page)
+        await enforce_final_url(state, page, proxied=session_proxied(session))
         message = f"Opened tab {session.index_of(page)}."
     elif action == "select":
         assert index is not None
@@ -887,5 +982,6 @@ def register(server: MCPServer) -> None:
              open_world=True, invoking="Managing tabs…", invoked="Tabs updated")
 
 
-__all__ = ["register", "open_page", "respond", "check_url", "enforce_final_url", "target", "after_action",
+__all__ = ["register", "open_page", "respond", "check_url", "enforce_final_url", "profile_proxied",
+           "session_proxied", "routes_through_proxy", "target", "after_action",
            "require_target"]

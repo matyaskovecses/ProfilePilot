@@ -31,7 +31,7 @@ from profilepilot.store import Store
 from .fakes import FakeSocks5Server, OriginServer
 
 PROFILE_TOOLS = {
-    "profile_list", "profile_create", "profile_update", "profile_delete", "profile_clone", "profile_start",
+    "profile_list", "browser_list", "profile_create", "profile_update", "profile_delete", "profile_clone", "profile_start",
     "profile_stop", "profile_status", "profile_set_proxy", "proxy_list", "proxy_add", "proxy_remove", "proxy_test",
 }
 BROWSER_TOOLS = {
@@ -221,7 +221,9 @@ async def test_profile_and_proxy_crud_never_reveal_passwords(home):
             "name": "shop-de", "proxy": f"http://frank:{SECRET}@10.4.4.4:3128", "tags": ["shop"],
             "lang": "de-DE", "timezone": "Europe/Berlin", "window": "offscreen", "notes": "German shop",
         })
-        assert "Created profile 'shop-de'" in out and "frank:***@10.4.4.4:3128" in out
+        # the profile tools name the proxy, never its host or user (FIX-PLAN step 9, F10)
+        assert "Created profile 'shop-de'" in out and "Proxy: 'shop-de' (http)." in out
+        assert "10.4.4.4" not in out and "frank" not in out
         auto_saved = home.get_proxy("shop-de")  # a new proxy URL is saved under the profile's name
         assert auto_saved.username == "frank" and home.proxy_endpoint(auto_saved.id).password == SECRET
         await rec.call("profile_create", {"name": "shop-de"}, ok=False)  # duplicate name
@@ -472,11 +474,12 @@ async def test_end_to_end_two_isolated_profiles(chrome_home):
                 await rec.call("profile_create", {"name": "alpha", "window": "offscreen"})
                 proxy_url = f"socks5://puser:{SECRET_ENCODED}@127.0.0.1:{socks.port}"
                 out = await rec.call("profile_create", {"name": "beta", "proxy": proxy_url, "window": "offscreen"})
-                assert "puser:***@127.0.0.1" in out
+                assert "Proxy: 'beta' (socks5)." in out and "puser" not in out  # name and scheme only (F10)
 
                 # browser tools auto-start the profile; the origin sets a cookie in alpha only
+                # (the first navigation of a stopped profile is opened by Chrome itself at launch)
                 out = await rec.call("browser_navigate", {"profile": "alpha", "url": origin.url + "/set-cookie?sid=abc123"})
-                assert out.startswith("[alpha]") and "HTTP 200" in out
+                assert out.startswith("[alpha]") and "Opened at launch" in out and "/set-cookie?sid=abc123" in out
                 assert store.runtime_file(store.get_profile("alpha").id).exists()
                 cookies = await rec.call("cookies_get", {"profile": "alpha", "url": origin.url + "/"})
                 assert '"name": "sid"' in cookies and "abc123" not in cookies and "value_length" in cookies

@@ -27,7 +27,7 @@ from urllib.parse import urljoin
 from ..errors import NotFoundError, ProfilePilotError
 
 if TYPE_CHECKING:
-    from playwright.async_api import Page
+    from .driver import Page
 
 log = logging.getLogger("profilepilot.content")
 
@@ -174,7 +174,7 @@ async def _aria_snapshot(page: "Page", *, depth: int | None, boxes: bool) -> str
         kwargs["depth"] = depth
     if boxes:
         kwargs["boxes"] = True
-    from playwright.async_api import Error as PlaywrightError
+    from .driver import Error as PlaywrightError
 
     for attempt in range(3):
         try:
@@ -506,7 +506,7 @@ _SHADOW_HTML_JS = r"""
 
 async def _evaluate(target: Any, script: str, arg: Any = None) -> Any:
     """``target.evaluate`` (page or frame), retried when a navigation destroys the context."""
-    from playwright.async_api import Error as PlaywrightError
+    from .driver import Error as PlaywrightError
 
     for attempt in range(3):
         try:
@@ -520,6 +520,23 @@ async def _evaluate(target: Any, script: str, arg: Any = None) -> Any:
             except PlaywrightError:
                 await asyncio.sleep(0.25)
     raise AssertionError("unreachable")
+
+
+async def frame_url(frame: Any) -> str:
+    """``frame.url``; for a frame whose URL the driver never saw (an out-of-process iframe that had
+    loaded before the CDP connection was made, as on a page Chrome opened at launch: ``''``), the
+    ``location.href`` of its document. For display and for resolving relative links only: security
+    decisions use the document's origin (see ``autofill._frame_origin``)."""
+    from .driver import Error as PlaywrightError
+
+    url = frame.url or ""
+    if url:
+        return url
+    try:
+        href = await frame.evaluate("() => location.href")
+    except PlaywrightError:
+        return url
+    return href if isinstance(href, str) else url
 
 
 async def visible_html(target: Any) -> str:
@@ -553,7 +570,7 @@ async def read_page(
         raise ProfilePilotError(f"Unknown format {fmt!r}; use 'markdown', 'text' or 'html'.")
     sel = (selector or "").strip() or None
     opts = {"fmt": "text" if fmt == "text" else "html", "mainOnly": bool(main_only)}
-    from playwright.async_api import Error as PlaywrightError
+    from .driver import Error as PlaywrightError
 
     for attempt in range(3):
         try:

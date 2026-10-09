@@ -5,36 +5,55 @@ hands out :class:`ProfileSession` objects. It never launches Chrome itself (that
 :class:`~profilepilot.browser.runtime.RuntimeManager`'s job, or ShardX's for ``shardx:`` refs) and
 never closes a browser: on CDP connections ``Browser.close()`` only disconnects.
 
-Attach rules (verified with Playwright 1.63 on Chrome 154):
+The CDP driver is patchright by default (no ``Runtime.enable``, isolated-world evaluates) or
+Playwright: see :mod:`profilepilot.automation.driver`. :attr:`BrowserManager.driver` names it.
+
+Attach rules (verified with Playwright 1.63 and patchright 1.63 on Chrome 154):
 
 * ``connect_over_cdp(url, no_defaults=True)`` - keeps Chrome's native download, focus and media
-  behaviour.
+  behaviour (with patchright only thanks to the driver patch in ``driver.py``: it would otherwise
+  emulate focus, so every attached tab would report "visible" and focused).
 * Always ``browser.contexts[0]``: the persistent profile context with the profile's cookies.
   ``new_context()`` would create an in-memory incognito-like context and is never used.
 * Downloads are pointed at the profile's ``downloads/`` folder with
   ``Browser.setDownloadBehavior`` on a browser CDP session that stays attached.
-* ``launch.timezone`` (opt-in) is applied with ``Emulation.setTimezoneOverride`` per page; the
-  override lives as long as its CDP session, so those sessions are kept attached.
+* ``launch.timezone`` (opt-in) is applied with ``Emulation.setTimezoneOverride`` per page *and per
+  out-of-process iframe*: under site isolation a cross-site iframe (captcha, anti-bot and ad frames)
+  runs in another renderer, which the page's override does not reach (docs/FINGERPRINT-AUDIT.md F7).
+  ``context.new_cdp_session(frame)`` only succeeds for such frames, so every child frame that
+  navigates is tried. Overrides cover the renderer process and its workers and survive the target's
+  later navigations, but only while their CDP session stays attached: they are kept, and every
+  override reverts to the OS timezone when ProfilePilot disconnects. Two races remain: an
+  out-of-process iframe's first scripts may run before its override lands (the earliest hook is its
+  commit), and so may those of tabs and popups that open while attached. ``browser_navigate``
+  therefore opens the first URL of a profile with a timezone in its existing, already overridden tab.
+  Chrome 154 has no launch-level alternative: ``--time-zone-for-testing`` is not compiled into
+  branded Chrome (FIX-PLAN step 6 spike: every context kept the OS zone with it).
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import logging
+import time
 from collections import deque
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 import anyio.to_thread
-from playwright.async_api import Browser, BrowserContext, CDPSession, Dialog, Locator, Page, Playwright
-from playwright.async_api import Error as PlaywrightError
-from playwright.async_api import async_playwright
 
+from ..browser.prefs import long_path_hint
+from ..browser.runtime import exit_of, read_last_exit
 from ..errors import LaunchError, NotFoundError, ProfileNotRunningError, ProfilePilotError
 from ..models import Profile, RuntimeInfo, WindowMode
+from ..procs import host_alive, process_alive
 from .content import InvalidTargetError, normalize_ref, stale_ref_error
+from .driver import Browser, BrowserContext, CDPSession, Dialog, DriverName, Frame, Locator, Page, Playwright
+from .driver import Error as PlaywrightError
+from .driver import async_playwright, select_driver
 
 if TYPE_CHECKING:
     from ..browser.runtime import RuntimeManager
@@ -45,6 +64,13 @@ log = logging.getLogger("profilepilot.automation")
 
 SHARDX_PREFIX = "shardx:"
 TITLE_TIMEOUT = 2.0
+LAUNCH_URL_MAX_AGE = 120.0
+"""A runtime whose ``start_url`` matches counts as launched for this call only if it started this
+recently (a start that returns an already running profile does not open the URL again)."""
+HANDOFF_TIMEOUT = 15.0
+"""Seconds for a URL handed to the running browser's command line to show up as a new tab."""
+EXIT_RECORD_WAIT = 3.0
+"""Seconds to wait for the host to record how a browser that just died exited (``last_exit.json``)."""
 
 
 def is_shardx_ref(ref: str) -> bool:
@@ -88,12 +114,17 @@ class ProfileSession:
         self._disconnected = False
         self._browser_cdp: CDPSession | None = None
         self._tz_sessions: dict[Page, CDPSession] = {}
+        self._tz_frames: dict[Frame, CDPSession] = {}
+        """Timezone sessions of out-of-process iframes (see the module docstring)."""
         self._tasks: set[asyncio.Task[Any]] = set()
+        self.launch_url: str | None = None
+        """The URL Chrome opened at launch for the caller that started it (see :meth:`take_launch_url`)."""
         browser.on("disconnected", self._on_disconnected)
         context.on("page", self._on_page)
         context.on("dialog", self._on_dialog)
         for page in context.pages:
             page.on("close", self._on_page_close)
+            self._watch_frames(page)
 
     def __repr__(self) -> str:
         return f"<ProfileSession {self.label!r} key={self.key} connected={self.is_connected}>"
@@ -115,7 +146,10 @@ class ProfileSession:
             except PlaywrightError as exc:
                 log.warning("%s: could not set the download folder: %s", self.label, _first_line(exc))
         if self.timezone:
-            await asyncio.gather(*(self._apply_timezone(p) for p in self._pages()))
+            pages = self._pages()
+            await asyncio.gather(*(self._apply_timezone(p) for p in pages))
+            await asyncio.gather(*(self._apply_timezone_frame(f) for p in pages for f in p.frames
+                                   if f.parent_frame is not None))
         self._active = await self._guess_foreground()
 
     async def _guess_foreground(self) -> Page | None:
@@ -144,6 +178,7 @@ class ProfileSession:
         except PlaywrightError as exc:
             log.debug("%s: disconnect: %s", self.label, _first_line(exc))
         self._tz_sessions.clear()
+        self._tz_frames.clear()
         self._browser_cdp = None
 
     def _ensure_open(self) -> None:
@@ -168,13 +203,29 @@ class ProfileSession:
         self._active = page
         self.new_tabs.append(page)
         page.on("close", self._on_page_close)
+        self._watch_frames(page)
         if self.timezone:
             self._spawn(self._apply_timezone(page))
 
     def _on_page_close(self, page: Page) -> None:
         self._tz_sessions.pop(page, None)
+        for frame in [f for f in self._tz_frames if f.page is page]:
+            self._tz_frames.pop(frame, None)
         if self._active is page:
             self._active = None
+
+    def _watch_frames(self, page: Page) -> None:
+        """With a timezone: give every out-of-process iframe of ``page`` its own override."""
+        if self.timezone:
+            page.on("framenavigated", self._on_frame_navigated)
+            page.on("framedetached", self._on_frame_detached)
+
+    def _on_frame_navigated(self, frame: Frame) -> None:
+        if frame.parent_frame is not None:
+            self._spawn(self._apply_timezone_frame(frame))
+
+    def _on_frame_detached(self, frame: Frame) -> None:
+        self._tz_frames.pop(frame, None)
 
     def _on_dialog(self, dialog: Dialog) -> None:
         entry = {"type": dialog.type, "message": dialog.message[:500],
@@ -189,6 +240,29 @@ class ProfileSession:
         items = list(self.dialogs)
         self.dialogs.clear()
         return items
+
+    def initial_blank_tab(self) -> Page | None:
+        """The only tab, when it still shows the ``about:blank`` the browser started with (else None)."""
+        pages = self._pages()
+        return pages[0] if len(pages) == 1 and pages[0].url == "about:blank" else None
+
+    def adopt(self, page: Page) -> None:
+        """Make ``page`` (a tab ProfilePilot opened itself) the active tab without reporting it as new."""
+        self._active = page
+        with contextlib.suppress(ValueError):
+            self.new_tabs.remove(page)
+
+    def adopt_url(self, url: str) -> None:
+        """Make the newest tab that shows ``url`` the active tab (nothing changes when none does)."""
+        page = next((p for p in reversed(self._pages()) if p.url == url), None)
+        if page is not None:
+            self.adopt(page)
+
+    def take_launch_url(self) -> str | None:
+        """The URL this session's browser was started with by ``BrowserManager.session(start_url=)``,
+        once (later calls return None): it is open in the active tab, loading or loaded."""
+        url, self.launch_url = self.launch_url, None
+        return url
 
     def drain_new_tabs(self) -> list[Page]:
         """Return and forget the tabs opened since the last call (still open ones only)."""
@@ -209,6 +283,38 @@ class ProfileSession:
             self._tz_sessions[page] = cdp  # the override lasts only while this session is attached
         except PlaywrightError as exc:
             log.warning("%s: timezone override %r failed: %s", self.label, self.timezone, _first_line(exc))
+
+    async def _apply_timezone_frame(self, frame: Frame) -> None:
+        """The timezone override for ``frame`` if it is an out-of-process iframe (its own renderer).
+        ``new_cdp_session(frame)`` fails for in-process frames, which the page's override covers. A
+        kept session is reused (the override follows its target's navigations while it is attached);
+        when that target is gone (the frame went back into its parent's process, or got a new target) the
+        frame is tried afresh."""
+        if not self.timezone or frame.is_detached():
+            return
+        params = {"timezoneId": self.timezone}
+        kept = self._tz_frames.get(frame)
+        if kept is not None:
+            try:
+                await kept.send("Emulation.setTimezoneOverride", params)  # same zone: a no-op
+                return
+            except PlaywrightError:
+                self._tz_frames.pop(frame, None)
+        try:
+            cdp = await self.context.new_cdp_session(frame)
+        except PlaywrightError:
+            return  # part of its parent's renderer
+        try:
+            await cdp.send("Emulation.setTimezoneOverride", params)
+        except PlaywrightError as exc:
+            log.warning("%s: timezone override %r for a frame failed: %s", self.label, self.timezone,
+                        _first_line(exc))
+            with contextlib.suppress(PlaywrightError):
+                await cdp.detach()
+            return
+        if frame.is_detached():
+            return
+        self._tz_frames[frame] = cdp  # kept attached: detaching would revert the override
 
     # ------------------------------------------------------------------ tabs
 
@@ -377,6 +483,8 @@ class BrowserManager:
         self.start_timeout = start_timeout
         self.connect_timeout = connect_timeout
         self._playwright: Playwright | None = None
+        self.driver: DriverName | None = None
+        """The CDP driver in use (``patchright`` / ``playwright``) once started."""
         self._pw_lock = asyncio.Lock()
         self._sessions: dict[str, ProfileSession] = {}
         self._locks: dict[str, asyncio.Lock] = {}
@@ -404,8 +512,17 @@ class BrowserManager:
     async def _ensure_playwright(self) -> Playwright:
         async with self._pw_lock:
             if self._playwright is None:
-                self._playwright = await async_playwright().start()
+                self.driver = select_driver(await _to_thread(self._config))
+                self._playwright = await async_playwright(self.driver).start()
+                log.debug("CDP driver: %s", self.driver)
             return self._playwright
+
+    def _config(self) -> Any:
+        try:
+            return self.store.load_config()
+        except Exception as exc:  # an unreadable config.json: the environment / default still apply
+            log.warning("could not read the config for the driver selection: %s", exc)
+            return None
 
     def _lock(self, key: str) -> asyncio.Lock:
         lock = self._locks.get(key)
@@ -420,12 +537,19 @@ class BrowserManager:
 
     # ------------------------------------------------------------------ sessions
 
-    async def session(self, ref: str, *, autostart: bool = True, window: WindowMode | None = None) -> ProfileSession:
+    async def session(self, ref: str, *, autostart: bool = True, window: WindowMode | None = None,
+                      start_url: str | None = None) -> ProfileSession:
         """Connected session for a profile ref (id, name, id prefix) or ``shardx:<id-or-name>``.
 
         Reuses the cached connection unless it was disconnected or the runtime changed (Chrome was
         restarted: different pid / CDP port). With ``autostart`` a stopped profile is started
-        (``window`` overrides its window mode for that run).
+        (``window`` overrides its window mode for that run) - except right after its browser
+        *crashed* (``last_exit.json``): that is reported once as a :class:`ProfileNotRunningError`
+        instead of silently reopening the page that crashed it, and the next call starts it again.
+
+        ``start_url`` (http/https) is only used when this call starts the profile: Chrome then opens
+        it itself at launch (see ``RuntimeManager.start``), and :meth:`ProfileSession.take_launch_url`
+        returns it once, so the caller waits for that tab instead of navigating it.
         """
         ref = (ref or "").strip()
         if is_shardx_ref(ref):
@@ -441,22 +565,117 @@ class BrowserManager:
                     return cached
                 log.info("%s: cached connection is stale; reconnecting", profile.name)
                 await self._drop(key)
+                crash = await self._crash_error(profile, cached.runtime) if info is None else None
+                if crash is not None:
+                    raise crash
+            started = False
             if info is None:
                 if not autostart:
                     raise ProfileNotRunningError(f"Profile '{profile.name}' is not running. Start it with profile_start.")
-                info = await _to_thread(partial(self.runtime.start, key, timeout=self.start_timeout, window=window))
+                info, started = await self._start(key, window, start_url), True
             try:
                 session = await self._attach_profile(profile, info)
             except LaunchError:
-                # The runtime may have died between status() and the attach: re-check once.
+                # The runtime may have died between status() and the attach: re-check once, but never
+                # start it again in the same call when its browser crashed.
                 fresh = await _to_thread(self.runtime.status, key)
+                if fresh is None:
+                    crash = await self._crash_error(profile, info)
+                    if crash is not None:
+                        raise crash from None
                 if fresh is None and autostart:
-                    fresh = await _to_thread(partial(self.runtime.start, key, timeout=self.start_timeout, window=window))
+                    fresh, started = await self._start(key, window, start_url), True
                 if fresh is None or _same_runtime(info, fresh):
                     raise
-                session = await self._attach_profile(profile, fresh)
+                info = fresh
+                session = await self._attach_profile(profile, info)
+            if started and start_url and _launched_with(info, start_url):
+                session.launch_url = start_url
+                session.adopt_url(start_url)  # next to a restored session: act on that tab, not a restored one
             self._sessions[key] = session
             return session
+
+    async def open_in_blank_tab(self, session: ProfileSession, url: str) -> Page | None:
+        """A running profile whose only tab is still the ``about:blank`` it started with: hand ``url``
+        to Chrome's command line (``RuntimeManager.open_url``), which opens it in a new, active tab like
+        a link from another app, then adopt that tab and close the blank one. None (nothing changed)
+        when that does not apply or fails: the caller navigates over CDP instead. Never for a
+        minimized window (Chrome would restore it, which takes the user's keyboard focus)."""
+        opener = getattr(self.runtime, "open_url", None)
+        info = session.runtime
+        if opener is None or session.profile is None or info is None or info.window == "headless":
+            return None
+        blank = session.initial_blank_tab()
+        if blank is None or await session.window_minimized(blank):
+            return None
+        try:
+            async with session.context.expect_page(timeout=HANDOFF_TIMEOUT * 1000) as event:
+                await _to_thread(opener, session.profile.id, url)
+            page = await event.value
+        except (ProfilePilotError, *PlaywrightError) as exc:
+            log.info("%s: could not hand the URL to the browser (%s); navigating instead", session.label,
+                     _first_line(exc))
+            return None
+        session.adopt(page)
+        try:
+            await blank.close()
+        except PlaywrightError as exc:
+            log.debug("%s: closing the initial blank tab: %s", session.label, _first_line(exc))
+        return page
+
+    async def _start(self, key: str, window: WindowMode | None, start_url: str | None) -> RuntimeInfo:
+        kwargs: dict[str, Any] = {"timeout": self.start_timeout, "window": window}
+        if start_url:
+            kwargs["start_url"] = start_url
+        return await _to_thread(partial(self.runtime.start, key, **kwargs))
+
+    async def crash_error(self, ref: str) -> ProfilePilotError | None:
+        """The error to report instead of a lost connection when the browser that ``ref``'s cached
+        session was attached to *crashed* (``last_exit.json``), else None. The session is dropped, so
+        the crash is reported once and the next call starts the profile again. Never raises."""
+        try:
+            ref = (ref or "").strip()
+            if not ref or is_shardx_ref(ref):
+                return None
+            profile = await _to_thread(self.store.get_profile, ref)
+            session = self._sessions.get(profile.id)
+            if session is None:
+                return None
+            error = await self._crash_error(profile, session.runtime)
+            if error is not None:
+                async with self._lock(profile.id):
+                    if self._sessions.get(profile.id) is session:
+                        await self._drop(profile.id)
+            return error
+        except Exception as exc:  # only ever used while reporting another error
+            log.debug("crash check failed: %s", exc)
+            return None
+
+    async def _crash_error(self, profile: Profile, info: RuntimeInfo | None) -> ProfilePilotError | None:
+        """A :class:`ProfileNotRunningError` explaining the crash if the browser of ``info`` is gone and
+        its host recorded a crash exit for it; None when it is alive or exited normally."""
+        if info is None or not info.chrome_pid:
+            return None
+        if await _to_thread(process_alive, info.chrome_pid, info.chrome_create_time):
+            return None
+        deadline = asyncio.get_running_loop().time() + EXIT_RECORD_WAIT
+        while True:  # the host writes the record right after Chrome exits
+            record = await _to_thread(read_last_exit, self.store, profile.id)
+            if exit_of(record, info):
+                break
+            if asyncio.get_running_loop().time() > deadline or not await _to_thread(host_alive, info):
+                record = await _to_thread(read_last_exit, self.store, profile.id)  # the host may just have exited
+                if exit_of(record, info):
+                    break
+                return None
+            await asyncio.sleep(0.1)
+        assert record is not None
+        if not record.get("crashed"):
+            return None
+        log.warning("%s: the browser crashed (%s)", profile.name, record.get("crash"))
+        udd = await _to_thread(self.store.user_data_dir, profile.id)
+        return ProfileNotRunningError(crash_message(profile.name, str(record.get("crash") or "crash"),
+                                                    long_path_hint(udd)))
 
     async def _attach_profile(self, profile: Profile, info: RuntimeInfo) -> ProfileSession:
         endpoint = info.cdp_http_url or (f"http://127.0.0.1:{info.cdp_port}" if info.cdp_port else None)
@@ -573,6 +792,13 @@ def _same_runtime(old: RuntimeInfo | None, new: RuntimeInfo) -> bool:
     )
 
 
+def _launched_with(info: RuntimeInfo, start_url: str) -> bool:
+    """Was the browser of ``info`` launched just now with ``start_url`` (not an older run that happens
+    to have the same start URL)?"""
+    started = info.started_at.timestamp() if info.started_at else 0.0
+    return getattr(info, "start_url", None) == start_url and started >= time.time() - LAUNCH_URL_MAX_AGE
+
+
 def _shardx_endpoint(cdp: dict[str, Any]) -> str | None:
     if cdp.get("http_url"):
         return str(cdp["http_url"])
@@ -602,6 +828,14 @@ async def _safe_title(page: Page) -> str:
         return await asyncio.wait_for(page.title(), TITLE_TIMEOUT)
     except Exception:  # busy page, open dialog, navigation in flight
         return ""
+
+
+def crash_message(label: str, crash: str, hint: str = "") -> str:
+    """What a tool reports after the profile's browser crashed (docs/FINGERPRINT-AUDIT.md F2)."""
+    message = (f"Chrome crashed while this page was open ('{label}' exited with {crash}). The profile was not "
+               "restarted; the next browser call starts it without the tabs it had (like Chrome after a crash), "
+               "and opening the same page again may crash it again.")
+    return f"{message} {hint}" if hint else message
 
 
 def minimized_message(label: str) -> str:

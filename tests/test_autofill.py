@@ -38,8 +38,10 @@ from profilepilot.automation.autofill import (
     text_value,
 )
 from profilepilot.automation.clipboard import ClipboardUnavailable
+from profilepilot.automation.driver import world_kwargs
 from profilepilot.identity import SENSITIVE_FIELDS
 
+from .chrome_helper import cdp_driver, default_driver_only  # noqa: F401 - cdp_driver is a fixture
 from .fakes import OriginServer, clipboard_text_now, pages_from_dir, user_clipboard_guard
 
 FIXTURES = Path(__file__).parent / "fixtures" / "autofill"
@@ -329,11 +331,13 @@ def servers():
 
 
 @pytest_asyncio.fixture
-async def open_page(chrome, servers):
-    from playwright.async_api import async_playwright
+async def open_page(chrome, servers, cdp_driver):
+    """Opens a fixture page in a new tab, through each CDP driver in turn (patchright evaluates in
+    an isolated world: detection and filling must work the same)."""
+    from profilepilot.automation.driver import async_playwright
 
     main = servers[0]
-    async with async_playwright() as pw:
+    async with async_playwright(cdp_driver) as pw:
         browser = await pw.chromium.connect_over_cdp(chrome.http_url, no_defaults=True)
         tabs = []
 
@@ -436,8 +440,9 @@ async def test_labels_placeholders_and_german_without_autocomplete(open_page, tm
 
 @pytest.mark.chrome
 @pytest.mark.asyncio
-async def test_checkout_card_iframe_with_paste(open_page, servers, tmp_path, uses_real_clipboard):
+async def test_checkout_card_iframe_with_paste(open_page, servers, tmp_path, uses_real_clipboard, cdp_driver):
     """Sensitive card values pasted into a cross-site (out-of-process) iframe, like Stripe."""
+    default_driver_only(cdp_driver, "uses the user's real clipboard")
     card_origin = servers[1]
     page = await open_page("checkout")
     card_frame = next(f for f in page.frames if f.url.startswith(card_origin))
@@ -457,7 +462,7 @@ async def test_checkout_card_iframe_with_paste(open_page, servers, tmp_path, use
     in_frame = [e for e in report.filled if e.get("frame")]
     assert {e["kind"] for e in in_frame} == {"card_number", "card_exp", "card_cvv"}
     assert all(e["frame"] == card_origin for e in in_frame)
-    events = await card_frame.evaluate("events")
+    events = await card_frame.evaluate("events", **world_kwargs(card_frame, "main"))  # a page global
     pastes = [e for e in events if e["type"] == "paste"]
     assert len(pastes) == 3 and all(e["trusted"] for e in pastes)
     assert any(e["inputType"] == "insertFromPaste" and e["trusted"] for e in events)

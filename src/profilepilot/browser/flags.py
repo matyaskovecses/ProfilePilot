@@ -135,7 +135,7 @@ def build_chrome_args(
         # occluded, stops rendering frames and every Playwright action hangs.
         "--disable-backgrounding-occluded-windows",
     ]
-    if browser.kind == "edge":
+    if browser.family == "edge":  # every Edge channel
         args.append("--edge-skip-compat-layer-relaunch")  # keeps the PID we spawned alive
 
     proxied = relay_port is not None

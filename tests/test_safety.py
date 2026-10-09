@@ -155,6 +155,27 @@ async def test_async_check_uses_the_same_rules(fake_dns):
         await REMOTE.acheck("chrome://settings")
 
 
+@pytest.mark.asyncio
+async def test_remote_mode_without_resolution_blocks_literals_and_local_names(fake_dns):
+    """Proxied profiles (FIX-PLAN step 5, F8): ``resolve=False`` runs the static checks only - every
+    local name and private literal in any spelling is still refused, and nothing is resolved here."""
+    for url in PRIVATE_LITERALS + BLOCKED_ALWAYS + ["data:text/html,<p>x</p>", "http://db.internal:5432/"]:
+        with pytest.raises(PolicyError):
+            REMOTE.check(url, resolve=False)
+        with pytest.raises(PolicyError):
+            await REMOTE.acheck(url, resolve=False)
+    # names are left to the proxy, also those that resolve to private addresses here (the proxy's
+    # network is not the user's: the documented trade-off)
+    for url in ("http://evil.example/", "https://lan.example:8443/", "http://metadata.example/",
+                "https://good.example/x", "https://unresolvable.example/", "https://8.8.8.8/", "about:blank"):
+        REMOTE.check(url, resolve=False)
+        await REMOTE.acheck(url, resolve=False)
+    assert fake_dns == []  # getaddrinfo was never called
+    with pytest.raises(PolicyError):  # the default still resolves
+        await REMOTE.acheck("http://evil.example/")
+    assert fake_dns == ["evil.example"]
+
+
 def test_remote_mode_allows_public_literals_without_dns(fake_dns):
     for url in ("https://8.8.8.8/", "http://1.1.1.1:8080/", "https://[2606:4700:4700::1111]/", "about:blank"):
         REMOTE.check(url)

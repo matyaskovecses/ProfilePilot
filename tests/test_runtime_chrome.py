@@ -374,3 +374,64 @@ def test_executable_that_is_not_a_browser_fails_fast(env):
         rm.start("notchrome", timeout=30)
     assert time.monotonic() - started < 20
     assert rm.list_running() == []
+
+
+def _requests(origin: OriginServer, path: str, timeout: float = 15.0) -> list[dict[str, str]]:
+    """Lower-cased headers of every GET of ``path`` (with query) so far, waiting for the first one."""
+    deadline = time.monotonic() + timeout
+    while True:
+        found = [{k.lower(): v for k, v in r["headers"].items()} for r in origin.requests if r["path"] == path]
+        if found or time.monotonic() > deadline:
+            return found
+        time.sleep(0.1)
+
+
+@pytest.mark.chrome
+def test_urls_open_like_links_from_another_app(env, pw):
+    """FIX-PLAN step 8: start(start_url=) opens the URL at launch, also next to a restored session, and
+    open_url hands one to the running browser (a new tab); both requests are like a typed URL
+    (Sec-Fetch-Site: none) and the host log shows URLs as origins only. Step 3: a stop is recorded in
+    last_exit.json as requested, not as a crash."""
+    from profilepilot.browser.control import ControlCallError
+    from profilepilot.browser.runtime import read_last_exit
+
+    store, rm = env
+    profile = store.create_profile("links")
+    with OriginServer() as origin:
+        info = rm.start("links", start_url=f"{origin.url}/one?token=SECRET1")
+        assert info.start_url == f"{origin.url}/one?token=SECRET1" and "start_url" not in info.public()
+        assert rm.start("links", start_url=f"{origin.url}/other").start_url == info.start_url  # already running
+        first = _requests(origin, "/one?token=SECRET1")
+        assert first and first[0].get("sec-fetch-site") == "none" and first[0].get("sec-fetch-user") == "?1"
+
+        rm.open_url("links", f"{origin.url}/two?token=SECRET2")
+        second = _requests(origin, "/two?token=SECRET2")
+        assert second and second[0].get("sec-fetch-site") == "none"
+        assert not _requests(origin, "/other", timeout=0)
+        with attach(pw, info) as page:
+            urls = sorted(p.url for p in page.context.pages)
+        assert urls == [f"{origin.url}/one?token=SECRET1", f"{origin.url}/two?token=SECRET2"], urls
+        with pytest.raises(ControlCallError) as refused:
+            rm.open_url("links", "file:///C:/Windows/win.ini")  # the host takes http(s) only
+        assert refused.value.status == 400
+
+        assert rm.stop("links") is True
+        record = read_last_exit(store, profile.id)
+        assert record and record["requested"] is True and record["crashed"] is False
+        assert record["chrome_pid"] == info.chrome_pid
+
+        # a saved session is restored, and the start URL opens next to it
+        again = rm.start("links", start_url=f"{origin.url}/three")
+        with attach(pw, again) as page:
+            context = page.context
+            deadline = time.monotonic() + 10
+            while len(context.pages) < 3 and time.monotonic() < deadline:
+                time.sleep(0.1)
+            urls = sorted(p.url for p in context.pages)
+        assert urls == [f"{origin.url}/one?token=SECRET1", f"{origin.url}/three",
+                        f"{origin.url}/two?token=SECRET2"], urls
+        rm.stop("links")
+    log_text = store.host_log(profile.id).read_text(encoding="utf-8")
+    assert "SECRET1" not in log_text and "SECRET2" not in log_text and f"{origin.url}/…" in log_text
+    with pytest.raises(ProfileNotRunningError):
+        rm.open_url("links", origin.url)

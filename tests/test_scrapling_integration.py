@@ -25,7 +25,9 @@ from profilepilot.proxy.url import ProxyEndpoint
 
 pytest.importorskip("scrapling.fetchers", reason="profilepilot[scrapling] is not installed")
 
+from profilepilot.automation.driver import driver_of  # noqa: E402
 from profilepilot.integrations.scrapling import (  # noqa: E402
+    SESSION_DRIVER,
     AsyncProfileSession,
     ProfileFetcherSession,
     ProfileSession,
@@ -188,6 +190,7 @@ async def test_async_session_reuses_profile_context_and_leaves_browser_running(p
     assert len(start_tab) == 1 and "/set-cookie" in start_tab[0]
     async with AsyncProfileSession("scrape", pilot=pilot, max_pages=2) as session:
         assert session.profile.name == "scrape"
+        assert driver_of(session.context) == SESSION_DRIVER  # patchright by default: no Runtime.enable
         # the session drives the profile's own persistent context, not a fresh one
         assert any(c["name"] == "pp_sid" for c in await session.context.cookies(origin.url))
         page = await session.fetch(f"{origin.url}/echo")
@@ -351,6 +354,7 @@ def offline_pilot(tmp_path) -> ProfilePilot:
     {"proxy": "http://u:p@h:1"}, {"cdp_url": "http://127.0.0.1:9"}, {"useragent": "X"},
     {"locale": "de-DE"}, {"timezone_id": "UTC"}, {"cookies": [{"name": "a", "value": "b", "url": "http://x/"}]},
     {"additional_args": {"color_scheme": "dark"}}, {"user_data_dir": "C:/x"}, {"real_chrome": True},
+    {"hide_canvas": True}, {"allow_webgl": False}, {"block_webrtc": True},  # stealth launch flags
 ])
 def test_browser_sessions_refuse_profile_owned_options(offline_pilot, option):
     for cls in (AsyncProfileSession, ProfileSession):
@@ -360,7 +364,8 @@ def test_browser_sessions_refuse_profile_owned_options(offline_pilot, option):
 
 
 def test_browser_sessions_ignore_launch_only_options_and_fail_fast_on_typos(offline_pilot):
-    session = AsyncProfileSession("offline", pilot=offline_pilot, headless=True, google_search=True, max_pages=3)
+    session = AsyncProfileSession("offline", pilot=offline_pilot, headless=True, google_search=True, max_pages=3,
+                                  allow_webgl=True)  # the genuine browser's own setting: accepted
     assert session._config.headless is False and session._config.google_search is True
     assert session.max_pages == 3 and session._is_alive is False
     assert AsyncProfileSession("offline", pilot=offline_pilot)._config.google_search is False

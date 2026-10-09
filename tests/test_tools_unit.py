@@ -9,6 +9,7 @@ from typing import Any
 
 import httpx
 import pytest
+import pytest_asyncio
 from mcp import Client
 from mcp.types import TextContent
 
@@ -460,3 +461,464 @@ async def test_press_key_refuses_to_paste_the_users_clipboard(home, monkeypatch)
         for key in ("Control+V", "Shift+Insert", "ControlOrMeta+Shift+V"):
             out = await call(client, "browser_press_key", {"profile": "p", "key": key}, ok=False)
             assert "system clipboard" in out and "browser_paste" in out
+
+
+# ---------------------------------------------------------------------- browser_evaluate world (FIX-PLAN step 2)
+
+
+class _EvalPage:
+    """Enough of a driver Page for browser_evaluate; records the evaluate keyword arguments."""
+
+    def __init__(self) -> None:
+        self.url = "https://example.test/"
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def evaluate(self, expression: str, *args: Any, **kwargs: Any) -> Any:
+        self.calls.append((expression, kwargs))
+        return "page value" if kwargs.get("isolated_context") is False else None
+
+    def is_closed(self) -> bool:
+        return False
+
+    async def wait_for_load_state(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def title(self) -> str:
+        return "Example"
+
+
+class _PatchrightEvalPage(_EvalPage):
+    """The same, posing as a patchright Page (driver_of() looks at the class's module)."""
+
+
+_PatchrightEvalPage.__module__ = "patchright.async_api._generated"
+
+
+class _EvalSession:
+    def __init__(self, profile: Any, page: _EvalPage) -> None:
+        self.key, self.label, self.profile, self.runtime = profile.id, profile.name, profile, None
+        self._page = page
+
+    async def page(self, tab: Any = None, *, interactive: bool = True) -> _EvalPage:
+        return self._page
+
+    def drain_new_tabs(self) -> list[Any]:
+        return []
+
+    def drain_dialogs(self) -> list[Any]:
+        return []
+
+    def is_active(self, page: Any) -> bool:
+        return True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("page_cls", "isolated", "main"), [
+    (_PatchrightEvalPage, {"isolated_context": True}, {"isolated_context": False}),
+    (_EvalPage, {}, {}),  # Playwright has no isolated-world evaluate: both are the main world
+])
+async def test_browser_evaluate_world_param(home, monkeypatch, page_cls, isolated, main):
+    page = page_cls()
+
+    async def session(self: BrowserManager, ref: str, **_kw: Any) -> _EvalSession:
+        return _EvalSession(self.store.get_profile(ref), page)
+
+    monkeypatch.setattr(BrowserManager, "session", session)
+    home.create_profile("p")
+    async with Client(create_server(store=home)) as client:
+        schema = next(t for t in (await client.list_tools()).tools if t.name == "browser_evaluate").input_schema
+        assert schema["properties"]["world"]["enum"] == ["isolated", "main"]
+        assert schema["properties"]["world"]["default"] == "isolated" and "world" not in schema.get("required", [])
+        assert "detect" in schema["properties"]["world"]["description"]  # main world is documented as detectable
+        await call(client, "browser_evaluate", {"profile": "p", "expression": "document.title"})
+        out = await call(client, "browser_evaluate", {"profile": "p", "expression": "window.x", "world": "main"})
+        await call(client, "browser_evaluate", {"profile": "p", "expression": "1", "world": "page"}, ok=False)
+    assert page.calls == [("document.title", isolated), ("window.x", main)]
+    if page_cls is _PatchrightEvalPage:
+        assert '"page value"' in out
+
+
+# ---------------------------------------------------------------------- a fake runtime (FIX-PLAN steps 3 and 8)
+
+
+class _Chrome:
+    """A stand-in browser process: alive until it 'exits' (a real child process, so the crash check
+    sees a dead PID with the recorded start time)."""
+
+    def __init__(self) -> None:
+        import subprocess
+        import sys
+
+        import psutil
+
+        self.proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+        self.create_time = psutil.Process(self.proc.pid).create_time()
+
+    def exit(self) -> None:
+        self.proc.kill()
+        self.proc.wait(10)
+
+
+class _FakeRuntime:
+    """The two RuntimeManager methods BrowserManager uses (one fake browser at a time); records starts."""
+
+    def __init__(self, store: Store) -> None:
+        self.store = store
+        self.starts: list[dict[str, Any]] = []
+        self.info: Any = None
+        self.chromes: list[_Chrome] = []
+        self.attached: list[_LaunchSession] = []
+        self.relay_port = 1
+        """The relay port a proxied profile's runtime reports (a test can point it at a real relay)."""
+        self.upstream: str = "socks5://***:***@proxy.invalid:1080"
+
+    def status(self, ref: str) -> Any:
+        if self.info is None or self.chromes[-1].proc.poll() is not None:
+            return None
+        return self.info if self.info.profile_id == self.store.get_profile(ref).id else None
+
+    def start(self, ref: str, *, timeout: float = 60.0, window: Any = None, **kw: Any) -> Any:
+        import os
+
+        from profilepilot.models import RuntimeInfo
+
+        if self.status(ref) is not None:
+            return self.info
+        profile = self.store.get_profile(ref)
+        self.starts.append(dict(kw))
+        chrome = _Chrome()
+        self.chromes.append(chrome)
+        proxied = profile.proxy_id is not None  # like the host: a relay with the saved proxy as its upstream
+        self.info = RuntimeInfo(profile_id=profile.id, profile_name=profile.name, state="running",
+                                host_pid=os.getpid(), chrome_pid=chrome.proc.pid, chrome_create_time=chrome.create_time,
+                                cdp_port=9, cdp_http_url="http://127.0.0.1:9", start_url=kw.get("start_url"),
+                                relay_port=self.relay_port if proxied else None, proxy_id=profile.proxy_id,
+                                upstream=self.upstream if proxied else None)
+        return self.info
+
+    def exit(self, code: int = 0xC0000005) -> None:
+        """The browser process exits with ``code`` and the 'host' records it in last_exit.json; the
+        CDP connection of the attached session drops."""
+        from profilepilot.browser.runtime import write_last_exit
+
+        chrome = self.chromes[-1]
+        chrome.exit()
+        write_last_exit(self.store, self.info.profile_id, code=code, requested=False, chrome_pid=chrome.proc.pid,
+                        chrome_create_time=chrome.create_time)
+        self.attached[-1].connected = False
+
+    def close(self) -> None:
+        for chrome in self.chromes:
+            if chrome.proc.poll() is None:
+                chrome.exit()
+
+
+class _LaunchPage:
+    """Enough of a driver Page for browser_navigate and browser_tabs."""
+
+    def __init__(self, url: str) -> None:
+        self.url = "about:blank"
+        self.pending = url  # what the tab is loading (Chrome's start URL)
+        self.gotos: list[str] = []
+        self.waited: list[str] = []
+        self.on_goto: Any = None
+
+    async def wait_for_url(self, predicate: Any, *, wait_until: str = "load", timeout: float | None = None) -> None:
+        if not predicate(self.url):
+            self.url = self.pending  # the navigation Chrome started at launch commits
+        assert predicate(self.url)
+        self.waited.append(f"url:{wait_until}")
+
+    async def wait_for_load_state(self, state: str = "load", *, timeout: float | None = None) -> None:
+        self.waited.append(state)
+
+    async def goto(self, url: str, **kw: Any) -> Any:
+        if self.on_goto is not None:
+            raise self.on_goto()
+        self.gotos.append(url)
+        self.url = url
+        return SimpleNamespace(status=200, status_text="OK")
+
+    async def title(self) -> str:
+        return "Fake page"
+
+    def is_closed(self) -> bool:
+        return False
+
+
+class _LaunchSession:
+    """Enough of a ProfileSession: what BrowserManager.session caches and the tools use."""
+
+    def __init__(self, profile: Any, info: Any) -> None:
+        self.key, self.label, self.profile, self.runtime = profile.id, profile.name, profile, info
+        self.launch_url: str | None = None
+        self.page_obj = _LaunchPage(info.start_url or "about:blank")
+        self.connected = True
+        self.context = FakeContext()  # no cookies, no pages (http_fetch)
+        self.browser = SimpleNamespace()  # no CDP: http_fetch sends httpx's own user agent
+
+    @property
+    def is_connected(self) -> bool:
+        return self.connected
+
+    def take_launch_url(self) -> str | None:
+        url, self.launch_url = self.launch_url, None
+        return url
+
+    def adopt_url(self, url: str) -> None:
+        self.adopted = url
+
+    async def page(self, tab: Any = None, *, interactive: bool = True) -> _LaunchPage:
+        if not self.connected:
+            from profilepilot.errors import ProfileNotRunningError
+
+            raise ProfileNotRunningError(f"The connection to '{self.label}' was lost. Try again.")
+        return self.page_obj
+
+    async def tabs(self) -> list[dict[str, Any]]:
+        return [{"index": 0, "url": self.page_obj.url, "title": "Fake page", "active": True}]
+
+    async def close(self) -> None:
+        self.connected = False
+
+    def drain_new_tabs(self) -> list[Any]:
+        return []
+
+    def drain_dialogs(self) -> list[Any]:
+        return []
+
+    def is_active(self, page: Any) -> bool:
+        return True
+
+
+@pytest.fixture
+def fake_runtime(home, monkeypatch):
+    runtime = _FakeRuntime(home)
+
+    async def attach(self: BrowserManager, profile: Any, info: Any) -> _LaunchSession:
+        runtime.attached.append(_LaunchSession(profile, info))
+        return runtime.attached[-1]
+
+    monkeypatch.setattr(BrowserManager, "_attach_profile", attach)
+    try:
+        yield runtime
+    finally:
+        runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_navigate_autostarts_with_the_destination(home, fake_runtime):
+    """browser_navigate on a stopped profile starts it with the destination as Chrome's start URL and
+    waits for that tab instead of navigating it over CDP (F4/F5); later navigations use Page.navigate."""
+    home.create_profile("p")
+    home.create_profile("q")
+    async with Client(create_server(store=home, runtime=fake_runtime)) as client:
+        out = await call(client, "browser_navigate", {"profile": "p", "url": "example.com/a?b=1", "wait_until": "load"})
+        assert fake_runtime.starts == [{"start_url": "https://example.com/a?b=1"}]
+        assert fake_runtime.attached[-1].adopted == "https://example.com/a?b=1"  # that tab is acted on
+        page = fake_runtime.attached[-1].page_obj
+        assert page.gotos == [] and page.waited == ["url:commit", "load"]
+        assert "Opened at launch" in out and "Navigated" not in out and "https://example.com/a?b=1" in out
+
+        out = await call(client, "browser_navigate", {"profile": "p", "url": "https://example.org/"})
+        assert page.gotos == ["https://example.org/"] and "Navigated: HTTP 200" in out
+        assert len(fake_runtime.starts) == 1  # running: started once
+
+        fake_runtime.exit(code=0)  # (the fake runs one browser at a time)
+        # not http(s), or a given tab: started without a start URL, then navigated as before
+        await call(client, "browser_navigate", {"profile": "q", "url": "data:text/html,<p>hi</p>"})
+        assert fake_runtime.starts[-1] == {}
+        assert fake_runtime.attached[-1].page_obj.gotos == ["data:text/html,<p>hi</p>"]
+        fake_runtime.exit(code=0)
+        await call(client, "browser_navigate", {"profile": "q", "url": "https://example.com/", "tab": 0})
+        assert fake_runtime.starts[-1] == {} and fake_runtime.attached[-1].page_obj.gotos == ["https://example.com/"]
+
+
+@pytest.mark.asyncio
+async def test_crash_exit_is_reported(home, fake_runtime):
+    """FIX-PLAN step 3: when the browser crashed (the host's last_exit.json), the next tool call says so
+    instead of silently starting the profile again - once; a tool call that was running when the crash
+    happened reports it instead of a closed tab. A normal exit is no crash."""
+    from profilepilot.automation.driver import Error as DriverError
+    from profilepilot.browser.runtime import read_last_exit
+
+    profile = home.create_profile("p")
+    async with Client(create_server(store=home, runtime=fake_runtime)) as client:
+        await call(client, "browser_navigate", {"profile": "p", "url": "https://crash.example/"})
+
+        fake_runtime.exit()  # 0xC0000005 between two tool calls
+        assert read_last_exit(home, profile.id)["crash"] == "access violation (0xC0000005)"
+        out = await call(client, "browser_tabs", {"profile": "p"}, ok=False)
+        assert "Chrome crashed while this page was open" in out and "access violation (0xC0000005)" in out
+        assert "was not restarted" in out and len(fake_runtime.starts) == 1  # no silent autostart
+
+        out = await call(client, "browser_tabs", {"profile": "p"})  # the next call starts it again
+        assert "1 tab(s)" in out and len(fake_runtime.starts) == 2
+
+        def crash_now() -> BaseException:  # the browser crashes while browser_navigate waits for it
+            fake_runtime.exit()
+            return DriverError[0]("Target page, context or browser has been closed")
+
+        fake_runtime.attached[-1].page_obj.on_goto = crash_now
+        out = await call(client, "browser_navigate", {"profile": "p", "url": "https://example.net/"}, ok=False)
+        assert "Chrome crashed while this page was open" in out and "has been closed" not in out
+        assert len(fake_runtime.starts) == 2
+        await call(client, "browser_tabs", {"profile": "p"})
+        assert len(fake_runtime.starts) == 3
+
+        # the user closed the window (exit code 0): no crash message, the profile simply starts again
+        fake_runtime.exit(code=0)
+        await call(client, "browser_tabs", {"profile": "p"})
+        assert len(fake_runtime.starts) == 4 and read_last_exit(home, profile.id)["crashed"] is False
+
+
+def test_crash_descriptions():
+    from profilepilot.browser.runtime import crash_description, exit_of, write_last_exit
+    from profilepilot.models import RuntimeInfo
+
+    assert crash_description(3221225477) == "access violation (0xC0000005)"
+    assert crash_description(-1073741819) == "access violation (0xC0000005)"  # the same code, signed
+    assert crash_description(0xC0000409) == "fail-fast / stack buffer overrun (0xC0000409)"
+    assert crash_description(0xC0001234) == "crash (0xC0001234)"
+    assert crash_description(-11) == "SIGSEGV"
+    for normal in (None, 0, 1, 21, -15):  # closed, killed, Chrome's own exit codes, SIGTERM
+        assert crash_description(normal) is None, normal
+    info = RuntimeInfo(profile_id="abcd1234", profile_name="p", host_pid=1, chrome_pid=42, chrome_create_time=100.0)
+    assert exit_of({"chrome_pid": 42, "chrome_create_time": 100.4}, info)
+    assert not exit_of({"chrome_pid": 42, "chrome_create_time": 160.0}, info)  # a reused PID
+    assert not exit_of({"chrome_pid": 43}, info) and not exit_of(None, info)
+
+
+def test_last_exit_record_never_resurrects_a_deleted_profile(home):
+    from profilepilot.browser.runtime import read_last_exit, write_last_exit
+
+    profile = home.create_profile("p")
+    record = write_last_exit(home, profile.id, code=0xC0000005, requested=True, chrome_pid=1, chrome_create_time=None)
+    assert record["crashed"] is False  # a stop that was asked for is no crash
+    assert read_last_exit(home, profile.id)["code"] == 0xC0000005
+    home.delete_profile(profile.id)
+    write_last_exit(home, profile.id, code=0, requested=False, chrome_pid=1, chrome_create_time=None)
+    assert not home.profile_dir(profile.id).exists()
+
+
+# ---------------------------------------------------------------------- proxied profiles (FIX-PLAN steps 5 and 9)
+
+
+@pytest_asyncio.fixture
+async def upstream_relay(fake_runtime):
+    """A real relay through a fake SOCKS5 upstream (which resolves ``localhost.test`` itself, like a proxy
+    resolving names on its side), wired into the fake runtime as the relay of proxied profiles; plus an
+    origin server. Yields ``(socks, relay, origin)``."""
+    from profilepilot.proxy.relay import LocalRelay
+    from profilepilot.proxy.url import ProxyEndpoint
+
+    from .fakes import FakeSocks5Server
+
+    socks = await FakeSocks5Server().start()
+    endpoint = ProxyEndpoint("socks5", "127.0.0.1", socks.port, socks.username, socks.password)
+    relay = LocalRelay(endpoint)
+    await relay.start(0)
+    fake_runtime.relay_port, fake_runtime.upstream = relay.port, endpoint.redacted()
+    try:
+        with OriginServer() as origin:
+            yield socks, relay, origin
+    finally:
+        await relay.stop()
+        await socks.stop()
+
+
+@pytest.fixture
+def no_local_dns(monkeypatch):
+    """Every host-name lookup of this process is recorded and fails (IP literals still work): the names
+    a test sends to the local resolver."""
+    import ipaddress
+    import socket
+
+    real = socket.getaddrinfo
+    names: list[str] = []
+
+    def getaddrinfo(host: Any, *args: Any, **kwargs: Any) -> Any:
+        name = host.decode() if isinstance(host, bytes) else host
+        if name is None:
+            return real(host, *args, **kwargs)
+        try:
+            ipaddress.ip_address(str(name).split("%", 1)[0])
+            return real(host, *args, **kwargs)
+        except ValueError:
+            names.append(str(name))
+            raise socket.gaierror(socket.EAI_NONAME, "test: no local DNS") from None
+
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)  # what the event loop's getaddrinfo calls
+    return names
+
+
+@pytest.mark.asyncio
+async def test_proxied_profile_remote_mode_does_not_resolve_locally(home, fake_runtime, upstream_relay, no_local_dns):
+    """F8: in remote mode the URL policy resolved every host name through this machine's resolver (the
+    ISP), also for proxied profiles. A proxied profile now gets the static checks only: browser_navigate
+    (at launch and later) and http_fetch (through the relay) succeed without a single local lookup, and
+    local names / private literals are still refused. An unproxied profile still resolves."""
+    socks, _relay, origin = upstream_relay
+    record = home.add_proxy(f"socks5://{socks.username}:pw@127.0.0.1:{socks.port}", "up")
+    home.create_profile("p", proxy_id=record.id)
+    home.create_profile("q")
+    async with Client(create_server(store=home, runtime=fake_runtime, remote=True)) as client:
+        out = await call(client, "browser_navigate", {"profile": "p", "url": "https://first.example/a"})
+        assert "Opened at launch" in out and fake_runtime.starts == [{"start_url": "https://first.example/a"}]
+        out = await call(client, "browser_navigate", {"profile": "p", "url": "https://second.example/"})
+        assert "Navigated: HTTP 200" in out  # running: the live relay decides
+        out = await call(client, "http_fetch", {"profile": "p", "url": f"http://localhost.test:{origin.port}/echo",
+                                                "format": "raw"})
+        assert "HTTP 200" in out and "echo /echo" in out
+        assert ("localhost.test", origin.port) in socks.targets  # resolved at the proxy
+        for blocked in ("http://localhost:1/", "http://127.1/", "http://192.168.1.1/", "http://x.localhost/",
+                        "http://printer.local/", "http://[::ffff:7f00:1]/"):
+            for tool in ("browser_navigate", "http_fetch"):
+                refused = await call(client, tool, {"profile": "p", "url": blocked}, ok=False)
+                assert "remote mode" in refused, refused
+        assert no_local_dns == []
+
+        fake_runtime.exit(code=0)  # (one fake browser at a time)
+        await call(client, "browser_navigate", {"profile": "q", "url": "https://third.example/"})
+        assert "third.example" in no_local_dns  # unproxied: checked against the local resolver as before
+        await call(client, "http_fetch", {"profile": "q", "url": f"http://localhost.test:{origin.port}/echo"}, ok=False)
+        assert "localhost.test" in no_local_dns
+
+
+@pytest.mark.asyncio
+async def test_http_fetch_route_names_the_proxy_not_its_host(home, fake_runtime, upstream_relay):
+    """F10: the route line (and the other model-facing proxy texts) name the saved proxy and its scheme,
+    never the upstream's host, port or any part of its user name."""
+    from profilepilot.server.tools_profiles import live_proxy_label, proxy_label, runtime_text
+
+    socks, relay, origin = upstream_relay
+    record = home.add_proxy(f"socks5://{socks.username}:pw@127.0.0.1:{socks.port}", "audit-socks5")
+    home.create_profile("p", proxy_id=record.id)
+    async with Client(create_server(store=home, runtime=fake_runtime)) as client:
+        out = await call(client, "http_fetch", {"profile": "p", "url": f"http://localhost.test:{origin.port}/echo"})
+    assert "via the profile's proxy 'audit-socks5' (socks5)" in out, out
+    info = fake_runtime.info
+    assert info.upstream == f"socks5://***:***@127.0.0.1:{socks.port}"  # kept for logs, never shown
+    status = runtime_text("p", info, live_proxy_label(home, info))
+    for text in (out, status):
+        assert f":{socks.port}" not in text and socks.username not in text and "***" not in text
+    assert "Proxy: 'audit-socks5' (socks5) through the local relay" in status
+    unsaved = info.model_copy(update={"proxy_id": None})  # switched live to a proxy URL
+    assert live_proxy_label(home, unsaved) == "an unsaved socks5 proxy"
+    assert proxy_label(record) == "'audit-socks5' (socks5)"  # the profile tools' saved-proxy label
+    assert live_proxy_label(home, info.model_copy(update={"upstream": None})) is None  # relay, direct
+    assert "Proxy: direct through" in runtime_text("p", info.model_copy(update={"upstream": None}))
+    relay.stats.last_error = None
+
+
+@pytest.mark.asyncio
+async def test_navigate_with_a_timezone_uses_the_overridden_tab(home, fake_runtime):
+    """FIX-PLAN step 6: with launch.timezone the first URL is not opened by Chrome at launch (its first
+    scripts would run before the override is attached) but navigated in the existing tab, which the
+    session overrides when it attaches."""
+    home.create_profile("p", launch={"timezone": "Asia/Tokyo"})
+    async with Client(create_server(store=home, runtime=fake_runtime)) as client:
+        out = await call(client, "browser_navigate", {"profile": "p", "url": "https://example.com/"})
+    assert fake_runtime.starts == [{}]  # no start URL
+    assert fake_runtime.attached[-1].page_obj.gotos == ["https://example.com/"]
+    assert "Navigated: HTTP 200" in out and "Opened at launch" not in out

@@ -15,6 +15,15 @@ Two threats are handled here:
 
 Local stdio mode (the default) allows ``localhost`` so people can drive their dev servers.
 
+Proxied profiles (``resolve=False``; docs/FINGERPRINT-AUDIT.md F8): resolving a host name here sends it to
+this machine's resolver (the ISP), which would defeat the proxy's privacy. For a profile whose traffic
+leaves through an upstream proxy, remote mode therefore runs the static checks only: every scheme rule,
+``localhost`` / ``*.localhost`` / the local suffixes, and every loopback, private, link-local, CGNAT or
+reserved literal in any numeric spelling stay blocked (Chrome's implicit proxy bypass sends ``localhost``
+and loopback literals direct, so those checks are still needed). Other names are resolved by the proxy
+and connected from the proxy's network. Trade-off: a name that resolves to a private address *on the
+proxy's side* is reachable through the proxy - a network that is not the user's.
+
 Limitation: the check happens before navigation. A public page can still redirect or script its
 way to a private address afterwards, and DNS answers can change between the check and the
 connection (DNS rebinding). This is a guard-rail for model-initiated requests, not a firewall.
@@ -101,10 +110,11 @@ class UrlPolicy:
 
     # ------------------------------------------------------------------ checks
 
-    def check(self, url: str) -> None:
-        """Raise :class:`PolicyError` if ``url`` may not be opened. Resolves DNS synchronously."""
+    def check(self, url: str, *, resolve: bool = True) -> None:
+        """Raise :class:`PolicyError` if ``url`` may not be opened. Resolves DNS synchronously, unless
+        ``resolve`` is False (a proxied profile: static checks only, see the module docstring)."""
         host, port = self._check_static(url)
-        if host is None:
+        if host is None or not resolve:
             return
         try:
             infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
@@ -113,10 +123,10 @@ class UrlPolicy:
             return
         self._check_resolved(host, (info[4][0] for info in infos))
 
-    async def acheck(self, url: str) -> None:
+    async def acheck(self, url: str, *, resolve: bool = True) -> None:
         """Async variant of :meth:`check` (DNS resolution does not block the event loop)."""
         host, port = self._check_static(url)
-        if host is None:
+        if host is None or not resolve:
             return
         try:
             infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)

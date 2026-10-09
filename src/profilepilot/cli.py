@@ -825,13 +825,32 @@ def _version_of(dist: str) -> str | None:
         return None
 
 
+def cmd_browsers(args: argparse.Namespace) -> int:
+    """List the installed browsers a profile can run in (their genuine identities)."""
+    from .paths import BROWSER_LABELS, list_browsers
+
+    browsers = list_browsers()
+    data = [{"kind": b.kind, "name": BROWSER_LABELS.get(b.kind, b.kind), "version": b.version, "path": b.path}
+            for b in browsers]
+
+    def text() -> str:
+        if not browsers:
+            return "No supported browser found. Install Google Chrome, Microsoft Edge, Brave or Chromium."
+        rows = [(d["kind"], d["name"], d["version"] or "?", d["path"]) for d in data]
+        hint = "Use a kind with: profilepilot profile create NAME --browser KIND"
+        return table(rows, ["KIND", "BROWSER", "VERSION", "PATH"]) + "\n" + hint
+
+    emit(args, data, text)
+    return 0 if browsers else 1
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     from .paths import data_root, list_browsers
 
     checks: list[tuple[str, bool | None, str]] = []  # (name, ok (None = info), detail)
     checks.append(("python", sys.version_info >= (3, 10), f"{platform.python_version()} ({sys.executable})"))
     checks.append(("profilepilot", True, __version__))
-    for dist in ("playwright", "mcp", "scrapling", "curl_cffi"):
+    for dist in ("playwright", "patchright", "mcp", "scrapling", "curl_cffi"):
         version = _version_of(dist)
         required = dist in ("playwright", "mcp")
         checks.append((dist, bool(version) if required else None, version or "not installed"))
@@ -867,6 +886,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         except Exception as exc:
             checks.append(("running profiles", False, f"{type(exc).__name__}: {exc}"))
         config = store.load_config()
+        try:
+            from .automation.driver import select_driver
+
+            checks.append(("cdp driver", None, f"{select_driver(config)} (config automation.driver="
+                                               f"{config.automation.driver}; env PROFILEPILOT_DRIVER overrides)"))
+        except ProfilePilotError as exc:
+            checks.append(("cdp driver", False, str(exc)))
         checks.append(("profiles", None, f"{len(store.list_profiles())} profile(s), {len(store.list_proxies())} proxy(ies), "
                                          f"max_running {config.max_running}"))
         if config.shardx.enabled:
@@ -1173,6 +1199,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("client", choices=list(CLIENTS))
     p.add_argument("--dry-run", action="store_true")
 
+    add(sub, "browsers", "list the installed browsers a profile can run in", cmd_browsers)
     add(sub, "doctor", "check the installation", cmd_doctor)
 
     shx = sub.add_parser("shardx", help="optional ShardX launcher backend", parents=[common])

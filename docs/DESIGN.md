@@ -26,6 +26,10 @@ used as an optional backend.
 | MCP hosts (Claude Desktop / Code, libuv) run servers in a kill-on-close job with silent breakaway. | A detached host process spawned by the MCP server survives server restarts. |
 | The official Python MCP SDK's `stdio_client` runs the server in a kill-on-close job **without** breakaway; a host spawned with `CREATE_BREAKAWAY_FROM_JOB` still lands in it (no error) and dies within a second of the client closing. A process created through WMI `Win32_Process.Create` is in no job (parent `WmiPrvSE.exe`, same interactive session). | The host checks its own job before anything else; inside a foreign kill-on-close job it exits with code 5 and `RuntimeManager` starts it again through WMI. Without WMI it runs inside the job, records `client_job` and the tools say how to keep the browser running. |
 | Playwright 1.63 Python: `connect_over_cdp(url, no_defaults=True)`, `page.aria_snapshot(mode="ai", depth=, boxes=)` emits `[ref=eN]`; `page.locator("aria-ref=eN")` resolves a ref; `browser.close()` on a CDP connection only disconnects. | Snapshot/ref-based tools; always use `browser.contexts[0]` (the persistent profile context), never `new_context()`. |
+| patchright 1.63 (the default CDP driver since FIX-PLAN step 2; `automation/driver.py`) has Playwright 1.63's API but sends no `Runtime.enable` to pages or workers and evaluates in an isolated world by default. Over `connect_over_cdp(no_defaults=True)` it still sends `Emulation.setFocusEmulationEnabled` to every page (upstream skips it there): every attached tab, background tabs and minimized windows included, then reports `visibilityState "visible"` and `hasFocus() true` (verified). | All imports of the driver go through `automation/driver.py` (`PROFILEPILOT_DRIVER` / `automation.driver` select Playwright as a fallback). It starts patchright's node driver with `patchright_preload.js`, an in-memory, version-checked patch that restores upstream's `no_defaults` rule. `browser_evaluate(world="main")` is the only main-world evaluate. |
+| Playwright and patchright send every evaluate (`Runtime.callFunctionOn`, also `page.title()`, aria snapshots and actionability checks) with `userGesture: true`: the page gets sticky user activation (`navigator.userActivation.hasBeenActive`, a running `AudioContext`) without any input. `Page.navigate` itself grants none (verified: a page polling its own state stays un-activated through a CDP navigation). | The second patch of `patchright_preload.js` (`evaluate-without-user-gesture`) sends `userGesture: false`: only real CDP `Input` clicks and keys activate a page, as for a person. `browser_evaluate` therefore runs without a user gesture (the popup blocker stops its `window.open`); the Playwright fallback still activates pages. |
+| A URL on Chrome's command line opens like a link from another app: `Sec-Fetch-Site: none`, no user activation, the tab has the focus, `history.length` 1. Started on `about:blank`, focus stays in the omnibox and the first `Page.navigate` adds a history entry. | `browser_navigate` on a stopped profile starts it with the destination (`RuntimeManager.start(start_url=)` → host `--start-url`) and waits for that tab ("Opened at launch", no HTTP status). On a running profile whose only tab is its initial `about:blank`, the host's `POST /open` hands the URL to `chrome.exe --user-data-dir=<udd> --profile-directory=Default <url>` (new tab adopted, blank one closed; never for minimized or headless windows; measured: no change of the OS foreground window). Later navigations use `Page.navigate`. Out-of-process iframes that loaded before the attach have `frame.url == ''` in the driver: `content.frame_url` asks the document. |
+| A user-data-dir longer than 175 characters (Windows): Chrome cannot create `GPUPersistentCache/DawnGraphiteCache/<32>/cache.*` (MAX_PATH), and some pages (iphey.com) then crash the browser process with 0xC0000005, with or without a DevTools client (19 of 19 runs at 176-197 characters crashed, none of about 30 at 175 or less). | `browser/prefs.py` `user_data_dir_too_long`; the host logs a warning and the crash message names the cause. The default data root gives ~58 characters. The host writes `last_exit.json`; the next tool call reports a crash once instead of silently restarting the profile, and the first start after a crash does not restore the session (verified: the restored crashing tab crashed it again, in a loop). |
 | MCP SDK 2.3: `from mcp.server import MCPServer`; `run("streamable-http", host, port, streamable_http_path, json_response, stateless_http, transport_security)`; `Image` in `mcp.server.mcpserver`; `ToolAnnotations` snake_case in `mcp.types`. DNS-rebinding protection auto-on for loopback hosts. | See §6. |
 | ChatGPT custom MCP: public HTTPS Streamable HTTP or OpenAI Secure MCP Tunnel; auth only none/OAuth (no static API keys); `readOnlyHint`/`destructiveHint`/`openWorldHint` should be set; images may not reach the model. | Text-first outputs; secret-path auth option; Secure Tunnel documented. |
 | Scrapling 0.4.15 `cdp_url` attach always calls `browser.new_context()` (loses profile cookies, applies dark scheme/DPR2/UA override). | Our Scrapling integration subclasses the session to reuse `contexts[0]`. |
@@ -97,8 +101,11 @@ Finally the start URLs (or `about:blank`). **Never** emit `--remote-allow-origin
 `--enable-automation`, `--disable-blink-features`, `--no-sandbox`, `--user-agent`, `--test-type`.
 
 ### 3.2 `browser/prefs.py` (A)
-* `prepare_user_data_dir(udd: Path, launch: LaunchOptions) -> None` — before each launch:
-  delete stale `DevToolsActivePort`; ensure `Default/Preferences` exists; set
+* `prepare_user_data_dir(udd: Path, launch: LaunchOptions, *, proxied: bool = False) -> None` — before each launch:
+  delete stale `DevToolsActivePort`; `proxied` (the host has a relay): merge `dns_over_https.mode = "off"`
+  into `Local State` and record the previous mode in `<udd>/.profilepilot-doh-off` (Secure DNS probes bypass the
+  proxy, docs/FINGERPRINT-AUDIT.md F11); unproxied with that marker: restore the recorded mode unless the user
+  changed it, remove the marker; never touch Secure DNS without the marker; ensure `Default/Preferences` exists; set
   `profile.exit_type = "Normal"` and `profile.exited_cleanly = true` (avoid "restore?" bubbles);
   if `launch.restore_session`, make session cookies + tabs survive restarts. **Verify empirically**
   which mechanism works on Chrome 154 (seeding `session.restore_on_startup = 1` in Preferences vs.
@@ -114,10 +121,13 @@ carry header `X-ProfilePilot-Token: <token>` (constant-time compare). Endpoints:
 `POST /stop` → triggers graceful stop, returns `{"ok": true}`;
 `POST /upstream` body `{"url": "<proxy url with creds>"|null}` or `{"proxy_id": "<id>"|null}` →
 swaps the relay upstream live (new connections only). Rejected (409) if the profile was launched
-without a relay. Client helper: `control_call(info: RuntimeInfo, method, path, body=None, timeout=5.0) -> dict` (sync, httpx).
+without a relay. `POST /open` body `{"url": "http(s)://..."}` → hands the URL to the running Chrome's
+command line (new active tab, like a link from another app; 400 for other schemes, 409 when not
+running, headless, or when the extra chrome.exe did not hand off within 5 s: it is then killed; it
+carries the relay's proxy switches so it could never start unproxied). Client helper: `control_call(info: RuntimeInfo, method, path, body=None, timeout=5.0) -> dict` (sync, httpx).
 
 ### 3.4 `browser/host.py` (A) — `run_host(profile_id: str, root: Path | None) -> int`
-Entry: `python -m profilepilot.browser.host <profile_id> [--root PATH] [--window MODE]` (module has `main(argv)`; the CLI also exposes it as the hidden `profilepilot host` subcommand). The host must not
+Entry: `python -m profilepilot.browser.host <profile_id> [--root PATH] [--window MODE] [--start-url=URL]` (module has `main(argv)`; the CLI also exposes it as the hidden `profilepilot host` subcommand). The host must not
 import MCP/Playwright). Logging to `profiles/<id>/host.log` (rotate at ~1 MB). Steps:
 1. `Store(root)`; load profile; acquire **non-blocking** `FileLock(profile_dir/"host.lock")` held for
    life (if taken → exit code 3, "already running").
@@ -129,7 +139,9 @@ import MCP/Playwright). Logging to `profiles/<id>/host.log` (rotate at ~1 MB). S
 4. If profile has a proxy: `LocalRelay(store.profile_proxy_endpoint(profile))`, start on port 0.
 5. Start control server; allocate a free CDP port (bind 127.0.0.1:0, read, close; avoid ports
    in use); write runtime.json with `state="starting"`.
-6. `prepare_user_data_dir`, build args, spawn Chrome (`subprocess.Popen`, stdin/stdout/stderr
+6. `prepare_user_data_dir(proxied=relay is not None)`, build args (start URL: `--start-url`, opened even next to a restored session,
+   else `launch.start_url` when no session is restored; the log line shows URLs as origins only; a
+   user-data-dir longer than 175 characters is logged as a warning, see §1), spawn Chrome (`subprocess.Popen`, stdin/stdout/stderr
    DEVNULL; Windows `creationflags=CREATE_NO_WINDOW`). Poll `/json/version` every 100 ms up to
    45 s; verify via psutil that a process in Chrome's tree (root pid or its children) LISTENs on
    the port. If Chrome exits within ~5 s with no listener → "handed off to an existing Chrome on this
@@ -141,6 +153,8 @@ import MCP/Playwright). Logging to `profiles/<id>/host.log` (rotate at ~1 MB). S
    `websockets` package or raw HTTP upgrade… simplest: Playwright is NOT allowed in the host; use
    `websockets` (add dependency) to send `{"id":1,"method":"Browser.close"}`), wait up to 10 s,
    then `taskkill /PID` (Windows, no /F), wait 5 s, then kill the process tree (psutil).
+   When Chrome has exited, write `profiles/<id>/last_exit.json` (`code`, `crashed`/`crash` for an NTSTATUS
+   crash code such as 0xC0000005 that no stop asked for, `chrome_pid` + `chrome_create_time`).
 9. Cleanup: stop relay & control server, delete runtime.json, `store.add_runtime(...)`, release lock,
    exit 0.
 
@@ -150,8 +164,11 @@ class RuntimeManager:
     def __init__(self, store: Store): ...
     def status(self, ref: str) -> RuntimeInfo | None          # validated; stale runtime.json removed
     def list_running(self) -> list[RuntimeInfo]
-    def start(self, ref: str, *, timeout: float = 60.0, window: WindowMode | None = None) -> RuntimeInfo
+    def start(self, ref: str, *, timeout: float = 60.0, window: WindowMode | None = None,
+              start_url: str | None = None) -> RuntimeInfo
         # idempotent (returns current info if running). Enforces config.max_running.
+        # start_url (http/https only): passed as `--start-url=<url>`; Chrome opens it at launch
+        # (RuntimeInfo.start_url records it; not part of public()).
         # Spawns `sys.executable -m profilepilot.browser.host <id> --root <root>` detached:
         #   Windows: DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW (+ CREATE_BREAKAWAY_FROM_JOB, retry without on failure); POSIX: start_new_session=True
         # Waits for runtime.json state=running (or error / host exit) → raises LaunchError with the
@@ -169,9 +186,13 @@ class RuntimeManager:
 class BrowserManager:
     def __init__(self, store: Store, runtime: RuntimeManager, shardx: "ShardXClient | None" = None): ...
     async def __aenter__/__aexit__  # starts/stops async_playwright; never closes browsers
-    async def session(self, ref: str, *, autostart: bool = True) -> ProfileSession
+    async def session(self, ref: str, *, autostart: bool = True, window=None, start_url=None) -> ProfileSession
         # ref may be a ProfilePilot profile ref or "shardx:<id-or-name>" (ShardX backend)
         # caches one CDP connection per profile; reconnects if disconnected/stale (runtime changed)
+        # start_url: used only when this call starts the profile (session.take_launch_url() returns it once)
+        # after a crash (last_exit.json of the browser the cached session was attached to): raises
+        # ProfileNotRunningError with the crash once instead of autostarting; the next call starts it
+    async def crash_error(self, ref: str) -> ProfilePilotError | None   # tool_guard: crash instead of "closed"
     async def disconnect(self, ref: str) -> None   # drop cached connection (call after stop)
 
 class ProfileSession:
@@ -187,7 +208,11 @@ class ProfileSession:
 ```
 On attach: `connect_over_cdp(cdp_http_url, no_defaults=True)`, use `browser.contexts[0]`; apply
 `Browser.setDownloadBehavior(behavior="allow", downloadPath=<profile downloads>, eventsEnabled=True)`;
-if `launch.timezone` set, `Emulation.setTimezoneOverride` on each page (+ `context.on("page")`).
+if `launch.timezone` set, `Emulation.setTimezoneOverride` on each page (+ `context.on("page")`) and on each
+out-of-process iframe (`framenavigated` → `context.new_cdp_session(frame)`, which only succeeds for those; sessions
+kept attached). Residual races (an OOPIF's first script, new tabs) and the revert on disconnect: see
+`automation/manager.py`; `--time-zone-for-testing` does not exist in branded Chrome 154. `browser_navigate` does not
+open a timezone profile's first URL at launch (the page would load before the override).
 Track the active page per profile (new popups become active; tools report a tab switch).
 A **minimized** window is never restored or brought to the front: `bringToFront`,
 `Browser.setWindowBounds` and even `ShowWindow(SW_SHOWNOACTIVATE)` give Chrome the keyboard focus
@@ -233,6 +258,9 @@ link-local/reserved addresses and `localhost`. Local stdio mode allows localhost
 `\` counts as `/` before the query of http(s) URLs (WHATWG, as in Chrome), both when checking and in
 `normalize_url`, so the checked host is the one Chrome contacts. `check_host(host, port)` applies the
 same rules to upstream proxy hosts (proxy_add / profile_create / profile_set_proxy / proxy_test).
+`check(url, resolve=False)` / `acheck(..., resolve=False)` run the static checks only (every local name and private
+literal stays blocked): the tools use it for profiles whose traffic leaves through an upstream proxy, so their
+host names never reach this machine's resolver (docs/FINGERPRINT-AUDIT.md F8).
 
 ### 3.11 `integrations/shardx.py` (C)
 `ShardXClient(base_url="http://127.0.0.1:40325", token=None, *, token_provider=None)` using httpx:
@@ -286,7 +314,7 @@ and act on the active tab unless `tab` is given. Outputs are text-first and pagi
 (`max_chars` default 12000, `offset`, returning `next_offset`). Annotations: set
 `read_only_hint`, `destructive_hint`, `idempotent_hint`, `open_world_hint` on every tool.
 
-Profiles & proxies: `profile_list`, `profile_create(name, proxy?, tags?, notes?, window?, browser?, lang?, timezone?)`,
+Profiles & proxies: `profile_list`, `browser_list`, `profile_create(name, proxy?, tags?, notes?, window?, browser?, lang?, timezone?)`,
 `profile_update(profile, …)`, `profile_delete(profile)` (to trash; destructive), `profile_clone(profile, new_name, copy_data?)`,
 `profile_start(profile, window?)`, `profile_stop(profile)`, `profile_status(profile?)`,
 `proxy_list`, `proxy_add(url, name?, tags?)` (+ bulk: newline-separated), `proxy_remove(proxy, force?)`,

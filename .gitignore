@@ -9,3 +9,6 @@ build/
 *.mcpb
 .env
 .DS_Store
+
+# Raw audit results contain the auditing machine's own fingerprint (hashes, visitor IDs): keep local.
+docs/audit/raw/

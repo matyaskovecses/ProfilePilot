@@ -20,6 +20,7 @@ import pytest_asyncio
 from profilepilot.automation import clipboard
 from profilepilot.automation import typing as typing_mod
 from profilepilot.automation.clipboard import ClipboardUnavailable, clipboard_text, paste_shortcut
+from profilepilot.automation.driver import world_kwargs
 from profilepilot.automation.typing import (
     INTERVAL_CLAMP,
     NotTypeableError,
@@ -30,6 +31,7 @@ from profilepilot.automation.typing import (
     value_landed,
 )
 
+from .chrome_helper import cdp_driver, default_driver_only  # noqa: F401 - cdp_driver is a fixture
 from .fakes import TEST_DIB, OriginServer, clipboard_text_now, user_clipboard_guard
 
 TEST_CARD = "4242424242424242"
@@ -53,6 +55,30 @@ for (const t of ['keydown', 'keyup', 'paste', 'beforeinput', 'input']) {
     inputType: e.inputType || null, target: e.target.id, ts: performance.now()}), true);
 }
 document.getElementById('blocked').addEventListener('paste', e => e.preventDefault());
+</script></body></html>"""
+
+CONTROLLED_PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>Controlled</title></head><body>
+<input id="name"> <textarea id="bio"></textarea>
+<select id="pick"><option value="">-</option><option value="b">Beta</option></select> <input id="agree" type="checkbox">
+<script>
+// A model of React's controlled inputs (react-dom's value tracking): the tracker overrides each
+// node's own value/checked property in the page's main world. onChange runs only when an event
+// finds the node's value different from what the tracker last saw, and the re-render writes the
+// state back, so a value written through that main-world property never reaches the state.
+window.state = {};
+for (const el of document.querySelectorAll('input, textarea, select')) {
+  const key = el.type === 'checkbox' ? 'checked' : 'value';
+  const desc = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), key);
+  let tracked = String(desc.get.call(el));
+  Object.defineProperty(el, key, {configurable: true, get() { return desc.get.call(this); },
+                                  set(v) { tracked = String(v); desc.set.call(this, v); }});
+  state[el.id] = desc.get.call(el);
+  const onChange = () => {
+    if (String(desc.get.call(el)) !== tracked) { tracked = String(desc.get.call(el)); state[el.id] = desc.get.call(el); }
+    el[key] = state[el.id];
+  };
+  for (const type of ['input', 'change', 'click']) el.addEventListener(type, onChange);
+}
 </script></body></html>"""
 
 
@@ -135,15 +161,16 @@ def chrome(tmp_path_factory):
 
 @pytest.fixture(scope="module")
 def origin():
-    with OriginServer({"/": PAGE}) as server:
+    with OriginServer({"/": PAGE, "/controlled": CONTROLLED_PAGE}) as server:
         yield server
 
 
 @pytest_asyncio.fixture
-async def page(chrome, origin):
-    from playwright.async_api import async_playwright
+async def page(chrome, origin, cdp_driver):
+    """A tab on PAGE, through each CDP driver in turn (patchright evaluates in an isolated world)."""
+    from profilepilot.automation.driver import async_playwright
 
-    async with async_playwright() as pw:
+    async with async_playwright(cdp_driver) as pw:
         browser = await pw.chromium.connect_over_cdp(chrome.http_url, no_defaults=True)
         tab = await browser.contexts[0].new_page()
         await tab.goto(origin.url + "/")
@@ -179,7 +206,7 @@ def no_clipboard():
 
 
 async def _log(page, target: str | None = None, types: tuple[str, ...] | None = None) -> list[dict]:
-    entries = await page.evaluate("log")
+    entries = await page.evaluate("log", **world_kwargs(page, "main"))  # a page global
     return [e for e in entries if (target is None or e["target"] == target) and (types is None or e["t"] in types)]
 
 
@@ -260,10 +287,11 @@ async def test_paste_falls_back_to_human_typing_when_the_clipboard_is_unavailabl
 
 @pytest.mark.chrome
 @pytest.mark.asyncio
-async def test_paste_with_the_real_clipboard(page, tmp_path):
+async def test_paste_with_the_real_clipboard(page, tmp_path, cdp_driver):
     """Trusted paste events, exclusion formats while sensitive text is on the clipboard, restore
     of the user's text and image, fallback when the page blocks paste, and a newer copy made by
     the user during a paste is kept. The user's own clipboard is restored by the guard."""
+    default_driver_only(cdp_driver, "uses the user's real clipboard")
     lock = tmp_path / "cb.lock"
     sentinel = "PP-TEST-SENTINEL-CLIPBOARD"
     await page.click("#b")  # warm up before taking the clipboard (keeps the window short)
@@ -348,6 +376,35 @@ async def test_a_floating_label_over_the_field_costs_no_click_timeout(page, tmp_
                             rng=random.Random(3), wpm=900)
     assert used == "human" and await page.input_value("#fl") == "Testy"
     assert time.monotonic() - started < 2.5  # the full click timeout alone was 5 s
+
+
+@pytest.mark.chrome
+@pytest.mark.asyncio
+async def test_controlled_inputs_get_every_change(page, origin, tmp_path, no_clipboard, cdp_driver):
+    """React-style controlled inputs see what the typing engine and Playwright's actions enter,
+    whichever world the driver evaluates in (patchright: isolated, Playwright: main)."""
+    await page.goto(origin.url + "/controlled")
+    lock, main = tmp_path / "cb.lock", world_kwargs(page, "main")
+    for method in ("fill", "type", "human", "paste"):  # paste falls back to typing (no clipboard here)
+        text = f"Testy {method}"
+        await enter_text(page, page.locator("#name"), text, method=method, clipboard_lock=lock,
+                         rng=random.Random(1), wpm=900)
+        assert await page.evaluate("state.name", **main) == text, method
+        assert await page.input_value("#name") == text, method  # the re-render kept it
+    await enter_text(page, page.locator("#bio"), "Line one\nLine two", method="human", clipboard_lock=lock,
+                     rng=random.Random(2), wpm=900)
+    assert await page.evaluate("state.bio", **main) == "Line one\nLine two"
+    await page.locator("#pick").select_option("b")
+    await page.locator("#agree").check()
+    assert await page.evaluate("[state.pick, state.agree]", **main) == ["b", True]
+    # The model holds: a value written through the page's own property never reaches the state ...
+    write = ("id => { const el = document.getElementById(id); el.value = 'scripted'; "
+             "el.dispatchEvent(new Event('input', {bubbles: true})); }")
+    await page.evaluate(write, "name", **main)
+    assert await page.evaluate("state.name", **main) == "Testy paste"
+    if cdp_driver == "patchright":  # ... while one written from patchright's isolated world does
+        await page.evaluate(write, "name")
+        assert await page.evaluate("state.name", **main) == "scripted"
 
 
 # ---------------------------------------------------------------------- unit: fakes (no Chrome)

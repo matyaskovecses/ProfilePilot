@@ -60,8 +60,12 @@ or a log. `proxy_url()` returns `None` when the profile has no proxy.
 
 ## 1. The raw endpoints (plain Playwright / plain Scrapling `Fetcher`)
 
+ProfilePilot itself drives profiles with patchright, Playwright's API without the page-visible
+`Runtime.enable` (see `profilepilot.automation.driver`). Attach with patchright too; upstream
+Playwright works the same way but a page can detect it while it is attached.
+
 ```python
-from playwright.sync_api import sync_playwright
+from patchright.sync_api import sync_playwright   # same API as playwright.sync_api
 from scrapling.fetchers import Fetcher
 from profilepilot import ProfilePilot
 
@@ -100,8 +104,9 @@ async def main():
 asyncio.run(main())
 ```
 
-`AsyncProfileSession` is a subclass of Scrapling's `AsyncDynamicSession`, so everything Scrapling
-offers on a page still works: `page_action`, `page_setup`, `wait_selector`, `network_idle`,
+`AsyncProfileSession` is a subclass of Scrapling's patchright-based `AsyncStealthySession` (or of
+`AsyncDynamicSession` when ProfilePilot's CDP driver is set to Playwright with `PROFILEPILOT_DRIVER` /
+config `automation.driver`), so everything Scrapling offers on a page still works: `page_action`, `page_setup`, `wait_selector`, `network_idle`,
 `disable_resources`, `blocked_domains`, `block_ads`, `capture_xhr`, `extra_headers`, `retries`,
 `timeout`, the parser (`css`, `xpath`, `find_all`, ...), and so on.
 
@@ -125,6 +130,7 @@ the fingerprint:
 | `useragent`, `locale`, `timezone_id`, `additional_args`, `init_script` | Keep the genuine browser; use the profile's `lang=` / `timezone=` launch options when you really need them. |
 | `cookies` | Use `pp.set_cookies(ref, cookies)`. Cookies live in the profile. |
 | `cdp_url`, `user_data_dir`, `real_chrome`, `executable_path`, `extra_flags`, `dns_over_https` | The browser is launched by ProfilePilot (profile `browser=` and `extra_args=` options). |
+| `hide_canvas`, `allow_webgl`, `block_webrtc` | Stealth launch flags; the genuine browser stays as it is (the WebRTC policy is the profile's `webrtc=` launch option). |
 | `headless` | Accepted and ignored; the window mode is a profile option (`window="normal"/"offscreen"/"headless"`). |
 
 `google_search` (the fake Google referer) defaults to **False** here. Pass `google_search=True` to
