@@ -3,8 +3,10 @@
 Everything here speaks plain CDP over the profile browser's own websocket and HTTP endpoints. It
 never sends ``Runtime.enable``, ``Page.enable`` or any other domain-enabling command, and never
 evaluates script: a page cannot notice that the Manager looked at it. A thumbnail attaches a
-short-lived flat session to one page target, asks ``Page.getLayoutMetrics`` and
-``Page.captureScreenshot`` (JPEG, scaled to ~480 px wide) and detaches again. The websocket client
+short-lived flat session to one page target, asks ``Page.captureScreenshot`` (JPEG of the viewport
+as painted, no ``clip``: a clip makes Chrome apply a temporary device-emulation override, which the
+user sees as the page shrinking and snapping back on every refresh) and detaches again; the Manager
+scales the picture down itself. The websocket client
 (:class:`CdpConnection`, :func:`browser_connection`, :class:`CdpError`) lives in
 :mod:`profilepilot.browser.devtools` and is re-exported here.
 
@@ -28,8 +30,7 @@ from ..browser.devtools import CdpConnection, CdpError, browser_connection
 
 log = logging.getLogger("profilepilot.ui.cdp")
 
-THUMB_WIDTH = 480
-THUMB_QUALITY = 60
+THUMB_QUALITY = 50
 OFFSCREEN_LIMIT = -5000
 """Windows placed further left/up than this are off-screen (``--window-position=-32000,-32000``)."""
 
@@ -94,15 +95,16 @@ async def _window_of(cdp: CdpConnection, target_id: str) -> dict[str, Any] | Non
         return None
 
 
-async def capture_thumbnail(ws_url: str, target_id: str, *, width: int = THUMB_WIDTH, quality: int = THUMB_QUALITY,
+async def capture_thumbnail(ws_url: str, target_id: str, *, quality: int = THUMB_QUALITY,
                             timeout: float = 4.0, cdp: CdpConnection | None = None) -> bytes:
-    """A JPEG of the visible part of ``target_id``, about ``width`` pixels wide.
+    """A JPEG of the visible part of ``target_id``, at the window's own size (never a ``clip``: that
+    would visibly resize the page in the user's window while the picture is taken).
 
     Raises :class:`ThumbnailUnavailable` for a minimized window (Chrome paints nothing then) and
     :class:`CdpError` for other failures."""
     if cdp is None:
         async with browser_connection(ws_url) as conn:
-            return await capture_thumbnail(ws_url, target_id, width=width, quality=quality, timeout=timeout, cdp=conn)
+            return await capture_thumbnail(ws_url, target_id, quality=quality, timeout=timeout, cdp=conn)
     window = await _window_of(cdp, target_id)
     if window and (window.get("bounds") or {}).get("windowState") == "minimized":
         raise ThumbnailUnavailable("minimized")
@@ -111,23 +113,9 @@ async def capture_thumbnail(ws_url: str, target_id: str, *, width: int = THUMB_W
     if not session_id:
         raise CdpError("could not attach to the tab")
     try:
-        metrics = await cdp.call("Page.getLayoutMetrics", session_id=session_id, timeout=3.0)
-        viewport = metrics.get("cssVisualViewport") or metrics.get("visualViewport") or {}
-        css_w = float(viewport.get("clientWidth") or 0) or 1280.0
-        css_h = float(viewport.get("clientHeight") or 0) or 800.0
-        page_x = float(viewport.get("pageX") or 0)
-        page_y = float(viewport.get("pageY") or 0)
-        device = metrics.get("visualViewport") or {}
-        # clip.scale multiplies CSS pixels; Chrome also applies the device pixel ratio.
-        dpr = 1.0
-        if device.get("clientWidth") and viewport.get("clientWidth"):
-            dpr = max(0.5, float(device["clientWidth"]) / float(viewport["clientWidth"]))
-        scale = max(0.05, min(1.0, width / (css_w * dpr)))
         shot = await cdp.call("Page.captureScreenshot", {
             "format": "jpeg",
             "quality": int(quality),
-            "clip": {"x": page_x, "y": page_y, "width": css_w, "height": css_h, "scale": scale},
-            "captureBeyondViewport": False,
             "optimizeForSpeed": True,
         }, session_id=session_id, timeout=timeout)
         data = shot.get("data")
