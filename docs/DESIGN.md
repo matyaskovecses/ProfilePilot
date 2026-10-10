@@ -368,6 +368,13 @@ store are never touched, and `form_autofill_sensitive` refuses browser sources.
 `profile_create` / `profile_update` take `identity` (name or id; `""` unlinks). Type-paste is serialised across
 processes by `<data root>/clipboard.lock`. Tool output never contains sensitive values.
 
+Cookie manager (spec `docs/design/COOKIES.md`): `browser/cookiejar.py` reads and writes a running profile's cookies
+with browser-level `Storage.*` DevTools commands only (plus `Network.deleteCookies` in a short flat page session for
+paths an expired copy cannot reach); identity = (name, domain, path, partitionKey); edits that change the identity
+set the new cookie first and delete the old one only after Chrome accepted it, and never merge into another
+existing cookie without `overwrite`. Used by the Manager's Cookies tab (`/api/profiles/{id}/cookies*`) and
+`profilepilot cookies`; the MCP cookie tools are unchanged (no values to the model).
+
 ShardX (only registered when enabled): `shardx_status`, `shardx_profiles`, `shardx_start(profile)`, `shardx_stop(profile)`.
 
 ## 6. Remote (HTTP) mode

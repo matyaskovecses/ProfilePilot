@@ -170,7 +170,10 @@ async def test_check_via_existing_relay_url(providers_server):
 @pytest.mark.asyncio
 async def test_unreachable_upstream_and_overall_timeout():
     # a "provider" that accepts connections and never answers
+    writers: list[asyncio.StreamWriter] = []
+
     async def hang(reader, writer):
+        writers.append(writer)
         await asyncio.sleep(30)
 
     server = await asyncio.start_server(hang, "127.0.0.1", 0)
@@ -189,8 +192,12 @@ async def test_unreachable_upstream_and_overall_timeout():
         assert not result.ok and "upstream proxy socks5://***:***@127.0.0.1:9 failed" in result.error
         assert "<upstream proxy>" in result.error and result.error.count("127.0.0.1:9") == 1
     finally:
+        # Python 3.12.1+: wait_closed() waits for every open connection, and the hanging handler's
+        # connections stay open until closed here (it hung forever on macOS otherwise).
         server.close()
-        await server.wait_closed()
+        for writer in writers:
+            writer.close()
+        await asyncio.wait_for(server.wait_closed(), 5)
 
 
 @pytest.mark.asyncio

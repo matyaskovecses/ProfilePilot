@@ -1,6 +1,7 @@
-// The profile details drawer: Overview, Tabs, Activity, Settings.
+// The profile details drawer: Overview, Tabs, Cookies, Activity, Settings.
 
 import { api, enc } from "./api.js";
+import { createCookiesPane } from "./cookies.js";
 import { avatar, copyText, debounce, fmt, h, icon, replace } from "./dom.js";
 import { clientLabel, isUserEvent, renderFeed, toolLabel } from "./feed.js";
 import { assistantName, doneButtons, pairingCodeWarning, windowButton } from "./help-banner.js";
@@ -8,7 +9,7 @@ import {
   AUTO_BROWSER_LABEL, BROWSER_LABELS, TIMEZONE_HINT, WINDOW_CHOICES, WINDOW_LABELS, browserOptions, cloneDialog, confirmDelete,
   identityOptions, proxyPicker, timezoneList,
 } from "./profile-dialogs.js";
-import { actions, displayStatus, loadProxies, proxyLabel, state, subscribe, upsertProfile } from "./store.js";
+import { actions, displayStatus, loadProxies, proxyLabel, runWindow, state, subscribe, upsertProfile } from "./store.js";
 import { attachThumb } from "./thumbs.js";
 import {
   busy, changeTracker, chipInput, closeButton, copyable, countryBadge, emptyState, field, nextId, openDrawer, openMenu, segmented,
@@ -56,7 +57,19 @@ export function openProfileDrawer(id, tab = "overview") {
     current.show(tab);
     return;
   }
-  closeProfileDrawer();
+  if (current) {
+    const leaving = current;
+    const closing = leaving.drawer.close();
+    if (leaving.drawer.el.open) {
+      // Unsaved settings: "Discard changes?" is up. Open this profile only once that drawer has closed.
+      closing.then(() => {
+        if (leaving.drawer.el.open) return; // "Keep editing"
+        if (current === leaving) current = null;
+        openProfileDrawer(id, tab);
+      });
+      return;
+    }
+  }
   const p0 = state.profiles.get(id);
   if (!p0) return;
   const ctx = { id, tab, check: null, settingsBuilt: false, settingsDirty: () => false };
@@ -79,9 +92,11 @@ export function openProfileDrawer(id, tab = "overview") {
   const panelId = nextId("panel");
   const panel = h("div.drawer-panel", { id: panelId, attrs: { role: "tabpanel", tabindex: "-1" } });
   drawer.body.append(panel);
-  const panes = { overview: h("div.stack"), tabs: h("div.stack"), activity: h("div.stack"), settings: h("div.stack") };
+  const cookies = createCookiesPane(id);
+  const panes = { overview: h("div.stack"), tabs: h("div.stack"), cookies: cookies.el, activity: h("div.stack"), settings: h("div.stack") };
   const tabButtons = {};
-  const tabDefs = [["overview", "Overview", "info"], ["tabs", "Tabs", "tab"], ["activity", "Activity", "activity"], ["settings", "Settings", "settings"]];
+  const tabDefs = [["overview", "Overview", "info"], ["tabs", "Tabs", "tab"], ["cookies", "Cookies", "cookie"], ["activity", "Activity", "activity"],
+    ["settings", "Settings", "settings"]];
   for (const [key, label, iconName] of tabDefs) {
     const btn = h("button", { id: `${panelId}-${key}`, attrs: { role: "tab", type: "button", "aria-selected": "false", "aria-controls": panelId, tabindex: "-1" }, onclick: () => show(key) }, icon(iconName), label);
     tabButtons[key] = btn;
@@ -120,7 +135,7 @@ export function openProfileDrawer(id, tab = "overview") {
       const reason = ctx.thumbState;
       content = [avatar(p.name, "", p.id), h("div.thumb-state", reason === "minimized" ? [icon("tab"), "Window is minimized"]
         : reason === "page-error" ? [icon("alert"), p.proxy ? "Page couldn't load – check the proxy" : "Page couldn't load"]
-          : p.window === "headless" ? [icon("eye"), "Headless: no window"] : [h("span.spinner.sm"), "Loading preview…"])];
+          : runWindow(p) === "headless" ? [icon("eye"), "Headless: no window"] : [h("span.spinner.sm"), "Loading preview…"])];
     } else {
       content = [avatar(p.name, "", p.id), h("div.thumb-state", statusDot(st.key), st.label)];
     }
@@ -144,10 +159,12 @@ export function openProfileDrawer(id, tab = "overview") {
     panel.setAttribute("aria-labelledby", tabButtons[key].id);
     replace(panel, panes[key]);
     drawer.footer.classList.toggle("hidden", key !== "settings");
+    drawer.el.classList.toggle("cookies-tab", key === "cookies"); // a wider drawer for the cookie list
     const p = state.profiles.get(id);
     if (!p) return;
     if (key === "overview") renderOverview(p);
     if (key === "tabs") renderTabs(p);
+    if (key === "cookies") cookies.show(p);
     if (key === "activity") renderActivity(p);
     if (key === "settings" && !ctx.settingsBuilt) renderSettings(p);
   }
@@ -200,7 +217,7 @@ export function openProfileDrawer(id, tab = "overview") {
     const running = p.state === "running";
     const pending = state.pending.get(id);
     const bar = h("div.action-bar");
-    if (running && p.window !== "headless" && !help.length) bar.append(h("button.btn", { attrs: { type: "button" }, onclick: (e) => busy(e.currentTarget, () => actions.focus(id).catch(() => {})) }, icon("focus"), "Show window"));
+    if (running && runWindow(p) !== "headless" && !help.length) bar.append(h("button.btn", { attrs: { type: "button" }, onclick: (e) => busy(e.currentTarget, () => actions.focus(id).catch(() => {})) }, icon("focus"), "Show window"));
     if (pending) bar.append(h("button.btn", { disabled: true }, h("span.spinner"), pending === "stopping" ? "Stopping…" : "Starting…"));
     else if (running || p.state === "starting") bar.append(h("button.btn", { attrs: { type: "button" }, onclick: () => actions.stop(id).catch(() => {}) }, icon("stop"), "Stop"));
     else if (!help.length) bar.append(h("button.btn", { class: control.paused ? "" : "primary", attrs: { type: "button" }, onclick: () => actions.start(id).catch(() => {}) }, icon("play"), "Start"));
@@ -218,7 +235,7 @@ export function openProfileDrawer(id, tab = "overview") {
     const kv = h("dl.kv");
     const row = (k, ...v) => kv.append(h("dt", k), h("dd", ...v));
     row("Status", statusDot(st.key), statusDetail(p));
-    row("Window", WINDOW_LABELS[(p.runtime && p.runtime.window) || p.window] || p.window);
+    row("Window", WINDOW_LABELS[runWindow(p)] || p.window);
     const browserName = p.browser === "auto" ? AUTO_BROWSER_LABEL : (BROWSER_LABELS[p.browser] || p.browser);
     row("Browser", (p.runtime && p.runtime.browser_version) ? `${browserName} · ${p.runtime.browser_version}` : browserName);
     row("Proxy", ...proxyLine(p));
@@ -456,6 +473,7 @@ export function openProfileDrawer(id, tab = "overview") {
     if (topics.has("profiles") || topics.has("proxies") || topics.has("identities")) {
       header(p);
       if (ctx.tab === "overview") renderOverview(p);
+      if (ctx.tab === "cookies") cookies.update(p);
     }
     if (topics.has("activity")) { refreshActivity(); refreshLastActionSoon(); }
   });

@@ -17,6 +17,7 @@ const SCHEMES = [
 export function createProxiesView() {
   const filters = { q: "", tag: "" };
   const sort = { key: "name", dir: 1 };
+  const openDetails = new Set(); // proxies whose error "Details" are expanded (rows are rebuilt on every update)
   const subtitle = h("p");
   const searchInput = h("input.input", { type: "search", attrs: { placeholder: "Search proxies", "aria-label": "Search proxies", autocomplete: "off" } });
   searchInput.addEventListener("input", () => { filters.q = searchInput.value.trim().toLowerCase(); render(); });
@@ -198,7 +199,10 @@ export function createProxiesView() {
     return h("div.cell-main",
       h("span.badge.red", icon("alert"), "Failed"),
       h("span.cell-sub.reason", c.reason || "No answer"),
-      c.error ? h("details.raw-details", h("summary", "Details"), h("code.raw", c.error)) : null,
+      c.error ? h("details.raw-details", {
+        open: openDetails.has(p.id),
+        ontoggle: (e) => { if (e.currentTarget.open) openDetails.add(p.id); else openDetails.delete(p.id); },
+      }, h("summary", "Details"), h("code.raw", c.error)) : null,
       h("span.cell-sub", fmt.ago(c.checked_at)));
   }
 

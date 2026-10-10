@@ -152,19 +152,64 @@ export async function loadChatGPT() {
 /** A test job started (by this window, a toast, or another window): mark its rows "Testing". */
 export function proxyTestStarted(job) {
   if (!job) return;
+  // The "started" event and the POST's answer both announce a job: the later one must not mark rows the
+  // job already reported (or a job that already finished) as "Testing" again.
+  if (state.proxyTest && state.proxyTest.job === job.job) return;
   state.proxyTest = { job: job.job, done: job.done || 0, total: job.total, finished: false };
   for (const id of job.ids || []) state.proxyTesting.add(id);
   notify("proxy-test", "proxies");
 }
 
-export async function startProxyTest(ids) {
+const queuedTest = new Set(); // proxies to test once the running job ends (asked for while it ran)
+
+export async function startProxyTest(ids, { retry = false } = {}) {
   const job = await api.post("/api/proxies/test", ids && ids.length ? { ids } : {});
+  if (job.already_running) {
+    // The server did not start a job: another one (from another window, a toast or a double click) is
+    // running. Show its progress but leave its rows alone (the ones it already tested are not "Testing"
+    // again); the proxies it does not cover are tested when it finishes.
+    const wanted = ids && ids.length ? ids : state.proxies.map((p) => p.id);
+    if (state.proxyTest && state.proxyTest.job === job.job && state.proxyTest.finished) {
+      // It already reported "finished" and is wrapping up: ask again in a moment.
+      wanted.forEach((id) => queuedTest.add(id));
+      setTimeout(() => proxyTestEnded(), 500);
+      return job;
+    }
+    const covered = new Set(job.ids || []);
+    const missing = wanted.filter((id) => !covered.has(id));
+    missing.forEach((id) => queuedTest.add(id));
+    state.proxyTest = { job: job.job, done: job.done || 0, total: job.total, finished: false };
+    notify("proxy-test", "proxies");
+    if (missing.length && !retry) toast("Another proxy test is running. These are tested when it finishes.", { kind: "info", title: "Proxy test queued" });
+    return job;
+  }
   proxyTestStarted(job);
   return job;
 }
 
+/** The job this window showed is over, or may be (`cancelled`: the user stopped it, so nothing queued runs). */
+export function proxyTestEnded({ cancelled = false } = {}) {
+  const ids = [...queuedTest].filter((id) => proxyById(id)); // (minus the ones deleted meanwhile)
+  queuedTest.clear();
+  if (cancelled || !ids.length) return;
+  startProxyTest(ids, { retry: true }).catch((err) => toast(err.message, { kind: "error" }));
+}
+
+/** Forget the test this window shows: its "finished" event was missed (offline) or never comes. */
+export function proxyTestReset() {
+  state.proxyTest = null;
+  state.proxyTesting.clear();
+  notify("proxy-test", "proxies");
+}
+
 export async function cancelProxyTest() {
-  await api.del("/api/proxies/test");
+  const result = await api.del("/api/proxies/test");
+  if (result && result.cancelled === false) {
+    // Nothing was running: the job ended while this window missed its "finished" event.
+    queuedTest.clear();
+    proxyTestReset();
+  }
+  return result;
 }
 
 // ------------------------------------------------------------------ profile updates
@@ -216,6 +261,11 @@ export function profilesByPriority() {
 }
 
 /** The status shown to the user, combining the runtime state and the control state. */
+/** The window mode of the current run (a headless profile the user took control of runs in a normal window). */
+export function runWindow(p) {
+  return (p.runtime && p.runtime.window) || p.window;
+}
+
 export function displayStatus(p) {
   const pending = state.pending.get(p.id);
   const runtime = pending || p.state;
@@ -264,11 +314,14 @@ async function guarded(promise, success) {
 }
 
 export const actions = {
-  async start(id, window) {
+  /** `background`: off-screen for this run only (headless if that is the profile's own mode). */
+  async start(id, window, { background = false } = {}) {
     state.pending.set(id, "starting");
     notify("profiles");
     try {
-      const view = await guarded(api.post(`/api/profiles/${enc(id)}/start`, window ? { window } : {}));
+      const body = window ? { window } : {};
+      if (background) body.background = true;
+      const view = await guarded(api.post(`/api/profiles/${enc(id)}/start`, body));
       state.pending.delete(id);
       upsertProfile(view);
       return view;

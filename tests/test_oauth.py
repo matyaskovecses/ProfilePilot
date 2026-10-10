@@ -1084,3 +1084,223 @@ def test_serve_rotates_the_code_and_hides_it_from_logs(store):
     assert now not in hidden and "connect status" in hidden
     assert http_mod._is_terminal(io.StringIO()) is False
     assert http_mod._is_terminal(None) is False
+
+
+# ---------------------------------------------------------------------- security review fixes
+
+
+@pytest.mark.asyncio
+async def test_iss_in_a_registered_redirect_uri_does_not_skip_the_redirect_guard(store):
+    """Fix 1: a redirect URI that already has an ``iss`` parameter gets the open-redirect guard like
+    any other, and a client only ever sees this server's ``iss``."""
+    clock = FakeClock()
+    async with oauth_app(store, clock) as (setup, http):
+        landing = "https://evil.example/landing?iss=attacker"
+        evil = await register(http, redirect_uris=[landing], client_name="x")
+        params = {"response_type": "code", "client_id": evil["client_id"], "redirect_uri": landing,
+                  "code_challenge": pkce()[1], "code_challenge_method": "S256", "state": "s",
+                  "resource": "https://other.example/"}
+        refused = await http.get("/authorize?" + urlencode(params))
+        assert refused.status_code == 400 and "location" not in refused.headers
+        assert "invalid_target" in refused.text
+
+        # approved: codes and errors go back to it, each with exactly one iss (this server's)
+        verifier, challenge = pkce()
+        started = await http.get("/authorize?" + urlencode({**params, "resource": MCP_URL,
+                                                             "code_challenge": challenge}))
+        page = await http.get(started.headers["location"])
+        approved = await submit(http, consent_fields(page.text), pairing_code(store))
+        assert approved.status_code == 303
+        query = parse_qs(urlsplit(approved.headers["location"]).query)
+        assert query["iss"] == [BASE]
+        assert (await token_request(http, evil, grant_type="authorization_code", code=query["code"][0],
+                                    redirect_uri=landing, code_verifier=verifier)).status_code == 200
+        again = await http.get("/authorize?" + urlencode(params))
+        assert again.status_code == 302 and again.headers["location"].startswith("https://evil.example/landing?")
+        query = parse_qs(urlsplit(again.headers["location"]).query)
+        assert query["iss"] == [BASE] and query["error"] == ["invalid_target"]
+
+
+@pytest.mark.asyncio
+async def test_first_party_subdomains_do_not_get_their_own_registration_budget(store):
+    """Fix 2: only ChatGPT's and Claude's own hosts have a first-party budget; their subdomains share
+    the budget of every other host, so registrations stay limited (and Claude's own is untouched)."""
+    clock = FakeClock()
+    async with oauth_app(store, clock) as (setup, http):
+        codes = [(await http.post("/register", json={"redirect_uris": [f"https://x{i}.claude.ai/cb"]})).status_code
+                 for i in range(2 * oauth_mod.FIRST_PARTY_REGISTRATIONS_PER_HOUR)]
+        assert codes.count(201) == oauth_mod.MAX_REGISTRATIONS_PER_HOUR
+        assert (await http.post("/register", json={"redirect_uris": ["https://x.chatgpt.com/cb"]})).status_code == 400
+        claude = await http.post("/register", json={"redirect_uris": ["https://claude.ai/api/mcp/auth_callback"],
+                                                     "client_name": "Claude"})
+        assert claude.status_code == 201, claude.text
+    # with every budget used up, fewer clients register within a sign-in than the table holds
+    per_hour = (len(oauth_mod.FIRST_PARTY_HOSTS) * oauth_mod.FIRST_PARTY_REGISTRATIONS_PER_HOUR
+                + oauth_mod.MAX_REGISTRATIONS_PER_HOUR)
+    assert per_hour * oauth_mod.SIGN_IN_WINDOW / 3600 < oauth_mod.MAX_CLIENTS / 2
+
+
+@pytest.mark.asyncio
+async def test_registration_flood_cannot_evict_a_client_that_is_signing_in(store, monkeypatch):
+    """Fix 2: making room for new registrations never evicts a client registered moments ago (it is
+    about to sign in), and evicts the clients idle longest first, not one that just started signing
+    in again; when every client is new or connected, a registration is refused instead."""
+    monkeypatch.setattr(oauth_mod, "MAX_CLIENTS", 10)
+    clock = FakeClock()
+    async with oauth_app(store, clock) as (setup, http):
+        early = await register(http, client_name="Claude Code")  # registered long ago, signs in again now
+        for i in range(6):
+            old = await http.post("/register", json={"redirect_uris": [f"https://old{i}.example/cb"]})
+            assert old.status_code == 201
+        clock.advance(oauth_mod.SIGN_IN_WINDOW + 3600)
+        early_verifier, early_challenge = pkce()
+        _, early_fields = await open_consent(http, early, early_challenge)
+        fresh = await register(http)  # registers and signs in right away
+        fresh_verifier, fresh_challenge = pkce()
+        _, fresh_fields = await open_consent(http, fresh, fresh_challenge)
+
+        # 2 free places, then the 6 old idle clients make room
+        for i in range(8):
+            junk = await http.post("/register", json={"redirect_uris": [f"https://junk{i}.example/cb"]})
+            assert junk.status_code == 201
+        clients = OAuthStore(store.root, clock=clock).read()["clients"]
+        assert early["client_id"] in clients and fresh["client_id"] in clients and len(clients) == 10
+
+        async def finish(fields: dict[str, str], client: dict[str, Any], verifier: str) -> httpx2.Response:
+            page = await http.get(f"/oauth/consent?request={fields['request']}")  # its CSRF cookie
+            response = await submit(http, consent_fields(page.text), pairing_code(store))
+            assert response.status_code == 303, response.text
+            code = parse_qs(urlsplit(response.headers["location"]).query)["code"][0]
+            return await exchange(http, client, code, verifier)
+
+        assert (await finish(early_fields, early, early_verifier)).status_code == 200
+        assert (await finish(fresh_fields, fresh, fresh_verifier)).status_code == 200
+        # now every client is either connected or new: nobody is evicted, the registration is refused
+        full = await http.post("/register", json={"redirect_uris": ["https://late.example/cb"]})
+        assert full.status_code == 400 and "Too many" in full.text
+        # once the junk is no longer new it makes room again; connected clients stay
+        clock.advance(oauth_mod.SIGN_IN_WINDOW + 1)
+        assert (await http.post("/register", json={"redirect_uris": [CHATGPT_REDIRECT_URI]})).status_code == 201
+        clients = OAuthStore(store.root, clock=clock).read()["clients"]
+        assert early["client_id"] in clients and fresh["client_id"] in clients
+
+
+@pytest.mark.asyncio
+async def test_metadata_fetch_budget_is_per_first_party_site(store):
+    """Fix 2 (same cause): subdomains of a first-party host share that site's metadata fetch budget."""
+    clock = FakeClock()
+    fetched: list[str] = []
+
+    async def fetcher(url: str) -> dict[str, Any]:
+        fetched.append(url)
+        raise ValueError("HTTP 404")
+
+    async with oauth_app(store, clock, cimd_fetcher=fetcher) as (setup, http):
+        for i in range(3 * oauth_mod.CIMD_FIRST_PARTY_FETCHES_PER_MINUTE):
+            await start_authorize(http, {"client_id": f"https://x{i}.openai.com/c.json"}, pkce()[1])
+        assert len(fetched) == oauth_mod.CIMD_FIRST_PARTY_FETCHES_PER_MINUTE
+
+
+def test_serve_http_hides_the_pairing_code_from_a_redirected_stderr(store, monkeypatch):
+    """Fix 3: `serve --auth oauth` (which announces through the CLI) only shows the pairing code when
+    stderr is an interactive terminal; otherwise it says where to find it."""
+    import io
+    import sys
+
+    import anyio
+
+    from profilepilot.server import http as http_mod
+
+    class Stderr(io.StringIO):
+        def __init__(self, terminal: bool) -> None:
+            super().__init__()
+            self.terminal = terminal
+
+        def isatty(self) -> bool:
+            return self.terminal
+
+    monkeypatch.setattr(anyio, "run", lambda *a, **k: None)  # build and announce, but do not serve
+    for terminal in (False, True):
+        stderr = Stderr(terminal)
+        monkeypatch.setattr(sys, "stderr", stderr)
+        banners: list[str] = []
+        http_mod.serve_http(auth="oauth", public_hosts=["tunnel.example"], root=store.root, log_level="WARNING",
+                            announce=banners.append)
+        code = pairing_code(Store(store.root))
+        if terminal:
+            assert code in banners[0]
+        else:
+            assert code not in banners[0] and "profilepilot connect status" in banners[0]
+            assert code not in stderr.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_metadata_fetch_tries_each_checked_address(monkeypatch):
+    """Fix 4: the client metadata fetch falls back to the next checked address (IPv6 and IPv4
+    alternating) when one cannot be reached, never to an address that was not checked; an address
+    that answers (even with an error) ends the search."""
+    import httpx
+
+    checked = ["2001:db8::1", "2001:db8::2", "93.184.216.34", "93.184.216.35"]
+    tried: list[str] = []
+    answer: dict[str, int] = {}
+
+    async def resolve(host: str, port: int) -> list[str]:
+        return list(checked)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        tried.append(request.url.host)
+        assert request.headers["host"] == "client.example"
+        if request.url.host not in answer:
+            raise httpx.ConnectError("unreachable", request=request)
+        return httpx.Response(answer[request.url.host], json={"client_id": "https://client.example/c.json"})
+
+    monkeypatch.setattr(oauth_mod, "_resolve_public", resolve)
+    url = "https://client.example/c.json"
+    answer = {"2001:db8::2": 200}
+    document = await oauth_mod.fetch_client_metadata_document(url, transport=httpx.MockTransport(handler))
+    assert document["client_id"] == url
+    assert tried == ["2001:db8::1", "93.184.216.34", "2001:db8::2"]
+
+    tried.clear()
+    answer = {"93.184.216.34": 404, "2001:db8::2": 200}
+    with pytest.raises(ValueError, match="404"):
+        await oauth_mod.fetch_client_metadata_document(url, transport=httpx.MockTransport(handler))
+    assert tried == ["2001:db8::1", "93.184.216.34"]
+
+    tried.clear()
+    answer = {}
+    with pytest.raises(httpx.ConnectError):
+        await oauth_mod.fetch_client_metadata_document(url, transport=httpx.MockTransport(handler))
+    assert sorted(tried) == sorted(checked)
+
+
+@pytest.mark.asyncio
+async def test_registration_metadata_is_limited(store):
+    """Fix 5: registration is unauthenticated and oauth.json is re-read on every OAuth write, so
+    oversized client metadata (long fields, long lists, big documents) is refused, not stored."""
+    clock = FakeClock()
+    async with oauth_app(store, clock) as (setup, http):
+        base = {"redirect_uris": ["https://app.example/cb"], "client_name": "app"}
+        oversized = [
+            {"contacts": [f"c{i}@example.com" for i in range(50)]},
+            {"contacts": ["a" * 5000 + "@example.com"]},
+            {"software_id": "x" * 5000},
+            {"scope": "profilepilot " + "s" * 5000},
+            {"grant_types": ["authorization_code", *(f"urn:x:{i}" for i in range(50))]},
+            {"jwks": {"keys": [{"kty": "oct", "k": "A" * 1000, "kid": str(i)} for i in range(10)]}},
+            {"client_uri": "https://app.example/" + "p" * 3000},
+        ]
+        for extra in oversized:
+            response = await http.post("/register", json={**base, **extra})
+            assert response.status_code == 400, (list(extra), response.text)
+            assert response.json()["error"] == "invalid_client_metadata"
+        huge = await http.post("/register", content=json.dumps({**base, "padding": "x" * 200_000}),
+                               headers={"Content-Type": "application/json"})
+        assert huge.status_code == 413
+        assert OAuthStore(store.root, clock=clock).read()["clients"] == {}
+        ok = await http.post("/register", json={**base, "contacts": ["me@example.com"], "scope": "profilepilot",
+                                                "software_id": "app", "software_version": "1.2.3"})
+        assert ok.status_code == 201, ok.text
+        raw = (store.root / "oauth.json").read_bytes()
+        assert len(raw) < 4 * 1024

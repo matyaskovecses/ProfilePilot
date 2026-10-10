@@ -573,6 +573,16 @@ WHOLE_GROUPS = (frozenset({"first_name", "middle_name", "last_name", "full_name"
                 frozenset(k for k, s in FIELDS.items() if s.group == "address"))
 
 
+def replace_groups(old: dict[str, str], new: dict[str, str]) -> dict[str, str | None]:
+    """Changes that put ``new`` over ``old`` with :data:`WHOLE_GROUPS` replaced whole: keys of a name or
+    address group that ``new`` touches but does not set are removed (``None``)."""
+    changes: dict[str, str | None] = dict(new)
+    for group in WHOLE_GROUPS:
+        if group & new.keys():
+            changes.update({key: None for key in group & old.keys() if key not in new})
+    return changes
+
+
 def merge_live(own: dict[str, str], live: dict[str, str]) -> dict[str, str]:
     """The identity's own values over a linked browser address's. A name or address part the identity
     sets replaces the browser's whole name or address."""
@@ -617,6 +627,10 @@ def _valid_name(name: str) -> str:
     name = (name or "").strip()
     if not name or len(name) > 64 or any(ord(c) < 32 for c in name):
         raise ProfilePilotError("Identity name must be 1-64 printable characters.")
+    from .chrome_autofill import is_source_ref
+
+    if is_source_ref(name):  # identity='chrome' / 'profile' / 'chrome:...' always means the browser's saved data
+        raise ProfilePilotError(f"'{name}' is reserved for the browser's saved addresses; choose another identity name.")
     return name
 
 

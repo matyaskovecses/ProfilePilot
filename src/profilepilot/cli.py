@@ -10,6 +10,7 @@ Commands::
     browsers                                 installed browsers a profile can run in
     identity list|show|create|set|secret|clear|allow|disallow|delete|fields
     proxy list|add|import|remove|test
+    cookies list|export|import|set|delete    a profile's live cookies (values only with --values / export)
     status | stop-all
     install <client> | install print | uninstall <client>
     doctor
@@ -538,13 +539,19 @@ def cmd_identity_sources(args: argparse.Namespace) -> int:
 def cmd_identity_connect_chrome(args: argparse.Namespace) -> int:
     store = _store(args)
     ids = _identities(store)
+    created = False
     try:
         ident = ids.get(args.identity)
     except ProfilePilotError:
         if not args.create:
             raise
-        ident = ids.create(args.identity)
-    ident = ids.connect_chrome(ident.id, args.source, args.address)
+        ident, created = ids.create(args.identity), True
+    try:
+        ident = ids.connect_chrome(ident.id, args.source, args.address)
+    except ProfilePilotError:
+        if created:  # do not leave an empty identity behind
+            ids.delete(ident.id)
+        raise
     _live, note = ids.chrome_values(ident)
     emit(args, ids.masked(ident.id),
          f"Identity '{ident.name}' now takes its name, email, phone and address live from {note}. "
@@ -562,13 +569,15 @@ def cmd_identity_disconnect_chrome(args: argparse.Namespace) -> int:
 def cmd_identity_import_chrome(args: argparse.Namespace) -> int:
     """Copy one browser-saved address into an identity (a snapshot; connect-chrome keeps it live)."""
     from .chrome_autofill import source_values
+    from .identity import replace_groups
 
     store = _store(args)
     ids = _identities(store)
     values, source, chosen = source_values(args.source, address=args.address)
     try:
         ident = ids.get(args.identity)
-        ident = ids.update(ident.id, values)
+        # the browser's name and address replace the identity's whole name and address (never a mix)
+        ident = ids.update(ident.id, replace_groups(ident.values, values))
         verb = "Updated"
     except ProfilePilotError:
         ident = ids.create(args.identity, values)
@@ -885,6 +894,432 @@ def cmd_proxy_test(args: argparse.Namespace) -> int:
         result = anyio.run(lambda: check_proxy(None, timeout=args.timeout))
     emit(args, result.model_dump(mode="json"), _check_text(label, result))
     return 0 if result.ok else 1
+
+
+# ---------------------------------------------------------------------- cookies
+#
+# The live cookie jar of a profile (profilepilot.browser.cookiejar, raw CDP Storage.* only): Chrome
+# encrypts cookies on disk, so they are read and written through the profile's running browser. A
+# stopped profile is started in the background for the command and stopped again afterwards, also
+# when the command fails (--keep-running keeps it after a success). Values are secrets: `list` only
+# shows them with --values, `export` writes them to the file (or stdout with '-'), and messages and
+# Activity entries never contain them.
+
+COOKIE_PROBLEMS_SHOWN = 50
+"""At most this many import problems are listed (the rest are only counted)."""
+
+
+def _n(count: int, one: str, many: str | None = None) -> str:
+    """``1 cookie`` / ``3 cookies``."""
+    return f"{count} {one if count == 1 else (many or one + 's')}"
+
+
+def _cookie_sites(cookies: Iterable[dict[str, Any]]) -> str:
+    """`` on example.com`` / `` on 3 sites`` (for summaries)."""
+    sites = sorted({str(c.get("domain") or "").lstrip(".") for c in cookies} - {""})
+    if not sites:
+        return ""
+    return f" on {sites[0]}" if len(sites) == 1 else f" on {_n(len(sites), 'site')}"
+
+
+def _cookie_profile(args: argparse.Namespace) -> tuple[Store, Profile]:
+    store = _store(args)
+    profile = store.get_profile(args.profile)
+    _check_not_paused(store, profile, args)
+    return store, profile
+
+
+def _cdp(call: Callable[[], Any]) -> Any:
+    """Run one async cookie-jar call; a browser that does not answer is a plain error."""
+    import asyncio
+
+    from .browser.devtools import CdpError
+
+    try:
+        return asyncio.run(call())
+    except CdpError as exc:
+        raise CliError(f"The profile's browser did not answer ({exc}). Is it still open?") from None
+
+
+def _stop_quietly(runtime: Any, profile: Profile) -> None:
+    try:
+        runtime.stop(profile.id)
+    except Exception as exc:  # the command's own result (or error) matters more
+        _err(f"warning: could not stop '{profile.name}' again: {exc}")
+
+
+def _with_live_jar(store: Store, profile: Profile, args: argparse.Namespace,
+                   work: Callable[[str, bool], Any]) -> Any:
+    """``work(ws_url, temporary)`` against the profile's running browser. A stopped profile is started
+    in the background for it (off-screen, or headless when that is its own mode) and stopped again
+    afterwards (``temporary``), also when ``work`` fails; ``--keep-running`` keeps it after a success.
+    A browser another client started (or is starting) is never stopped."""
+    from .models import utcnow
+
+    runtime = _runtime(store)
+    info = runtime.status(profile.id)
+    owned = False
+    try:
+        if info is None:
+            window = "headless" if profile.launch.window == "headless" else "offscreen"
+            _err(f"Starting '{profile.name}' in the background ("
+                 f"{'headless' if window == 'headless' else 'off-screen window'}) for this command ...")
+            owned = not store.runtime_file(profile.id).exists()  # else another client is starting or stopping it
+            since = utcnow()
+            info = runtime.start(profile.id, timeout=args.timeout, window=window)
+            owned = info.started_at >= since
+        if not info.cdp_ws_url:
+            raise CliError(f"'{profile.name}' runs without DevTools access; restart it and try again.")
+        result = work(info.cdp_ws_url, owned and not args.keep_running)
+    except BaseException:
+        if owned:
+            _stop_quietly(runtime, profile)
+        raise
+    if owned and args.keep_running:
+        _err(f"'{profile.name}' keeps running in the background; stop it with: profilepilot profile stop "
+             f"{shell_name(profile.name, profile.id)}")
+    elif owned:
+        _stop_quietly(runtime, profile)
+    return result
+
+
+def _cookie_activity(store: Store, profile: Profile, tool: str, summary: str, started: float) -> None:
+    """An Activity entry (source ``cli``) for a cookie change or export; never fails the command."""
+    from time import perf_counter
+
+    from .control import ActivityEvent, ActivityLog
+
+    try:
+        ActivityLog(store.root).append(ActivityEvent(
+            profile_id=profile.id, profile_name=profile.name, source="cli", tool=tool, summary=summary,
+            ms=int((perf_counter() - started) * 1000)))
+    except Exception as exc:  # pragma: no cover - logging must never fail an action
+        log.debug("activity append failed: %s", exc)
+
+
+def _cookie_flags(view: dict[str, Any]) -> str:
+    flags = [name for key, name in (("http_only", "HttpOnly"), ("secure", "Secure")) if view.get(key)]
+    if view.get("same_site"):
+        flags.append(f"SameSite={view['same_site']}")
+    if view.get("partitioned"):
+        flags.append(f"Partitioned({view['partition_site'] or 'opaque'})")
+    if view.get("priority") not in (None, "Medium"):
+        flags.append(f"Priority={view['priority']}")
+    return " ".join(flags) or "-"
+
+
+def _without_value(view: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in view.items() if k != "value"}
+
+
+def cmd_cookies_list(args: argparse.Namespace) -> int:
+    from .automation.cookies import domain_matches
+    from .browser import cookiejar
+
+    store, profile = _cookie_profile(args)
+    site = cookiejar.filter_domain(args.domain) if args.domain else None
+    cookies = _with_live_jar(store, profile, args, lambda ws, _temporary: _cdp(lambda: cookiejar.list_cookies(ws)))
+    views = [cookiejar.cookie_view(c) for c in cookies if site is None or domain_matches(c["domain"], site)]
+    if not args.values:
+        views = [_without_value(v) for v in views]
+    data = {"profile": profile.name, "cookies": views, "domains": cookiejar.domain_counts(cookies),
+            "total": len(cookies)}
+
+    def text() -> str:
+        if not views:
+            return f"No cookies on {site} ({_n(len(cookies), 'cookie')} in total)." if site else \
+                f"'{profile.name}' has no cookies."
+        rows = [(v["domain"], v["name"], v["path"], v["expires"] or "session", _cookie_flags(v))
+                + ((v["value"],) if args.values else ()) for v in views]
+        sites = len({v["domain"].lstrip(".") for v in views})
+        footer = f"{_n(len(views), 'cookie')} on {_n(sites, 'site')}" + (f" ({len(cookies)} in total)." if site else ".")
+        if not args.values:
+            footer += " Values are hidden; add --values to show them."
+        return table(rows, ["DOMAIN", "NAME", "PATH", "EXPIRES", "FLAGS"] + (["VALUE"] if args.values else [])) \
+            + "\n" + footer
+
+    emit(args, data, text)
+    return 0
+
+
+def _export_target(target: Path, force: bool) -> None:
+    if target.is_dir():
+        raise CliError(f"{target} is a folder; give a file name.")
+    if target.exists() and not force:
+        raise CliError(f"{target} already exists; add --force to replace it.")
+    if not target.parent.is_dir():
+        raise CliError(f"The folder {target.parent} does not exist.")
+
+
+def _write_stdout(text: str) -> None:
+    """Write a cookie file to stdout as UTF-8 (the console encoding could not hold every value)."""
+    stream = getattr(sys.stdout, "buffer", None)
+    if stream is None:
+        sys.stdout.write(text)
+        return
+    sys.stdout.flush()
+    stream.write(text.encode("utf-8"))
+    stream.flush()
+
+
+def cmd_cookies_export(args: argparse.Namespace) -> int:
+    from datetime import datetime
+    from time import perf_counter
+
+    from .automation import cookies as cookie_utils
+    from .browser import cookiejar
+
+    store, profile = _cookie_profile(args)
+    site = cookiejar.filter_domain(args.domain) if args.domain else None
+    fmt = args.format
+    target: Path | None = None
+    if args.file != "-":  # checked before the browser is started
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", profile.name).strip("-.") or profile.id
+        target = Path(args.file).expanduser() if args.file else Path.cwd()
+        if target.is_dir():
+            target = target / f"cookies-{slug}-{datetime.now():%Y%m%d-%H%M%S}.{'txt' if fmt == 'netscape' else 'json'}"
+        fmt = fmt or cookie_utils.format_for_path(target)
+        _export_target(target, args.force)
+    fmt = fmt or "json"
+
+    def work(ws: str, _temporary: bool) -> tuple[list[dict[str, Any]], int, int]:
+        started = perf_counter()
+        cookies = _cdp(lambda: cookiejar.list_cookies(ws))
+        if site:
+            cookies = [c for c in cookies if cookie_utils.domain_matches(c["domain"], site)]
+        # Left out: cookies partitioned for an opaque site (they cannot be set again anywhere) and, in
+        # cookies.txt, partitioned cookies (no column for the partition; the file says so).
+        exportable = [c for c in cookies if not c.get("partitionKeyOpaque")]
+        written = [c for c in exportable if fmt == "json" or not cookie_utils.partition_site(c)]
+        if target is None:
+            _write_stdout(cookie_utils.dumps_cookies(exportable, fmt, skip_partitioned=True, exact_expiry=True))
+        else:
+            _export_target(target, args.force)
+            cookie_utils.export_cookies(exportable, target, fmt, create_parents=False, skip_partitioned=True,
+                                        exact_expiry=True)
+        what = "cookies.txt" if fmt == "netscape" else "JSON"
+        _cookie_activity(store, profile, "export cookies",
+                         f"Exported {_n(len(written), 'cookie')}{_cookie_sites(written)} as {what}.", started)
+        return written, len(exportable) - len(written), len(cookies) - len(exportable)
+
+    written, partitioned, opaque = _with_live_jar(store, profile, args, work)
+    where = "stdout" if target is None else str(target)
+    message = f"Exported {_n(len(written), 'cookie')}{_cookie_sites(written)} to {where} ({fmt})."
+    if partitioned:
+        message += (f" Left out {_n(partitioned, 'partitioned cookie')}: cookies.txt cannot store their partition "
+                    "(export as JSON to keep them).")
+    if opaque:
+        message += f" Left out {_n(opaque, 'cookie')} partitioned for an opaque site (they can't be set again)."
+    if target is not None:
+        message += " The file contains secrets: keep it private."
+    data = {"profile": profile.name, "file": where, "format": fmt, "count": len(written),
+            "omitted": partitioned + opaque}
+    if target is None:  # stdout holds the file itself
+        _err(message)
+    else:
+        emit(args, data, message)
+    return 0
+
+
+def _read_cookie_text(source: str) -> str:
+    """A cookie file, or stdin for '-' (UTF-8, UTF-16 with a BOM)."""
+    if source == "-":
+        if sys.stdin is None:
+            raise CliError("No cookies on stdin.")
+        stream = getattr(sys.stdin, "buffer", None)
+        if stream is None:
+            return sys.stdin.read()
+        raw = stream.read()
+    else:
+        try:
+            raw = Path(source).expanduser().read_bytes()
+        except OSError as exc:
+            raise CliError(f"Cannot read {source}: {exc.strerror or type(exc).__name__}") from None
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16")
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise CliError(f"{'stdin' if source == '-' else source} is not UTF-8 text.") from None
+
+
+def cmd_cookies_import(args: argparse.Namespace) -> int:
+    from time import perf_counter
+
+    from .browser import cookiejar
+
+    store, profile = _cookie_profile(args)
+    mode = "replace_all" if args.replace_all else "replace" if args.replace else "merge"
+    parsed = cookiejar.parse_import(_read_cookie_text(args.file), args.format, domain=args.domain)
+    if not parsed.cookies:  # before the browser is started
+        detail = f" for {cookiejar.filter_domain(args.domain)}." if args.domain else (
+            f": {parsed.problems[0]}" if parsed.problems else ".")
+        raise CliError(f"No cookies to import{detail}")
+
+    def work(ws: str, _temporary: bool) -> tuple[Any, list[dict[str, Any]], str]:
+        started = perf_counter()
+        result = _cdp(lambda: cookiejar.import_cookies(ws, parsed.cookies, mode=mode))
+        refused = set(result.refused)
+        imported = [c for c in parsed.cookies if cookiejar.cookie_label(c) not in refused]
+        summary = f"Imported {_n(result.imported, 'cookie')}{_cookie_sites(imported)}"
+        if mode == "replace":
+            summary += f", replacing {_n(result.removed, 'older cookie')} of those sites"
+        elif mode == "replace_all":
+            summary += f", replacing all other cookies ({result.removed})"
+        summary += "."
+        if result.imported or result.removed:
+            _cookie_activity(store, profile, "import cookies", summary, started)
+        return result, imported, summary
+
+    result, imported, summary = _with_live_jar(store, profile, args, work)
+    problems = parsed.problems + [f"Chrome did not accept {label}." for label in result.refused]
+    skipped = parsed.skipped + len(result.refused)
+    data = {"profile": profile.name, "imported": result.imported, "skipped": skipped, "removed": result.removed,
+            "problems": problems[:COOKIE_PROBLEMS_SHOWN], "domains": cookiejar.domain_counts(imported),
+            "not_removed": result.not_removed}
+
+    def text() -> str:
+        lines = [summary]
+        if skipped:
+            lines.append(f"Skipped {_n(skipped, 'entry', 'entries')}" + (":" if problems else "."))
+            lines += [f"  {p}" for p in problems[:COOKIE_PROBLEMS_SHOWN]]
+            if len(problems) > COOKIE_PROBLEMS_SHOWN:
+                lines.append(f"  ... and {len(problems) - COOKIE_PROBLEMS_SHOWN} more")
+        if result.not_removed:  # the new cookies are in; some older ones could not be deleted
+            lines.append(f"Could not delete {_n(len(result.not_removed), 'older cookie')}: "
+                         + ", ".join(result.not_removed[:COOKIE_PROBLEMS_SHOWN]))
+        return "\n".join(lines)
+
+    emit(args, data, text)
+    return 0 if result.imported else 1
+
+
+def _expires_arg(value: str | None) -> str | None:
+    """--expires: an ISO date-time (UTC unless it has an offset) or unix seconds; None = session."""
+    from datetime import datetime
+
+    text = (value or "").strip()
+    if not text or text.lower() == "session":
+        return None
+    try:
+        float(text)
+        return text
+    except ValueError:
+        pass
+    try:
+        datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return text
+    except ValueError:
+        raise CliError("--expires takes a date-time such as 2027-01-31T12:00:00Z, unix seconds, or 'session'.") from None
+
+
+def _host_only_by_default(domain: str) -> bool:
+    """An IP address or a single-label host (localhost) can only have host-only cookies."""
+    import ipaddress
+
+    host = domain.strip().lower()
+    if host.startswith("."):
+        return False
+    if host.startswith("[") or ":" in host or "." not in host:
+        return True
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def cmd_cookies_set(args: argparse.Namespace) -> int:
+    from time import perf_counter
+
+    from .browser import cookiejar
+
+    store, profile = _cookie_profile(args)
+    value = args.value
+    if value == "-":  # keeps the value out of the process list and the shell history
+        value = _read_secret_input("Cookie value (input is hidden): ").rstrip("\r\n")
+    cookie: dict[str, Any] = {
+        "name": args.name, "value": value, "domain": args.domain,
+        "host_only": args.host_only or _host_only_by_default(args.domain), "path": args.path,
+        "secure": args.secure, "http_only": args.http_only, "same_site": args.same_site,
+    }
+    expires = _expires_arg(args.expires)
+    if expires is None:
+        cookie["session"] = True
+    else:
+        cookie["expires"] = expires
+    cookiejar.validate_cookie(cookiejar.merge_cookie(None, cookie))  # before the browser is started
+
+    def work(ws: str, temporary: bool) -> tuple[dict[str, Any], bool]:
+        started = perf_counter()
+        saved = _cdp(lambda: cookiejar.save_cookie(ws, cookie))
+        _cookie_activity(store, profile, "add cookie",
+                         f"Set cookie '{saved['name']}' on {str(saved['domain']).lstrip('.')}.", started)
+        return saved, temporary
+
+    saved, temporary = _with_live_jar(store, profile, args, work)
+    view = _without_value(cookiejar.cookie_view(saved))
+    host = view["domain"].lstrip(".")
+    scope = f"{host} only (host-only)" if view["host_only"] else f"{host} and its subdomains"
+    flags = _cookie_flags(view)
+    message = (f"Set cookie '{view['name']}' for {scope}: path {view['path']}, "
+               + (f"expires {view['expires']}" if view["expires"] else "session cookie")
+               + (f", {flags}." if flags != "-" else "."))
+    if view["session"] and temporary and not profile.launch.restore_session:
+        message += (f" Note: '{profile.name}' does not restore its last session, so this session cookie ends when "
+                    "its browser closes now; use --expires or --keep-running.")
+    emit(args, {"profile": profile.name, "cookie": view}, message)
+    return 0
+
+
+def cmd_cookies_delete(args: argparse.Namespace) -> int:
+    from time import perf_counter
+
+    from .automation.cookies import domain_matches
+    from .browser import cookiejar
+
+    store, profile = _cookie_profile(args)
+    by_identity = args.name is not None or args.path is not None
+    if args.all and (args.domain or by_identity):
+        raise CliError("--all deletes every cookie of the profile; drop --domain, --name and --path, or drop --all.")
+    if not (args.all or args.domain or by_identity):
+        raise CliError("Say which cookies to delete: --domain D (with its subdomains), --name N, --path P, or --all.")
+    site = cookiejar.filter_domain(args.domain) if args.domain else None
+
+    def work(ws: str, _temporary: bool) -> tuple[int, str, int]:
+        started = perf_counter()
+        unreachable = 0
+        if args.all:
+            deleted = _cdp(lambda: cookiejar.clear_cookies(ws))
+            tool, summary = "clear cookies", f"Cleared all cookies ({deleted})."
+        elif not by_identity:
+            deleted = _cdp(lambda: cookiejar.clear_cookies(ws, domain=site))
+            tool, summary = "clear cookies", f"Cleared {_n(deleted, 'cookie')} on {site}."
+        else:
+            matched = [c for c in _cdp(lambda: cookiejar.list_cookies(ws))
+                       if (site is None or domain_matches(c["domain"], site))
+                       and (args.name is None or c["name"] == args.name) and (args.path is None or c["path"] == args.path)]
+            targets = [c for c in matched if not c.get("partitionKeyOpaque")]  # only --all reaches those
+            unreachable = len(matched) - len(targets)
+            keys = [cookiejar.cookie_key(c) for c in targets]
+            try:
+                deleted = _cdp(lambda: cookiejar.delete_cookies(ws, keys)) if keys else 0
+            except cookiejar.CookieRefusedError as exc:  # some went: record what changed, then report
+                if exc.done:
+                    _cookie_activity(store, profile, "delete cookies", f"Deleted {_n(exc.done, 'cookie')}; "
+                                     f"{_n(len(exc.refused), 'cookie')} could not be deleted.", started)
+                raise
+            tool, summary = "delete cookies", f"Deleted {_n(deleted, 'cookie')}{_cookie_sites(targets)}."
+        if deleted:
+            _cookie_activity(store, profile, tool, summary, started)
+        return deleted, summary, unreachable
+
+    deleted, summary, unreachable = _with_live_jar(store, profile, args, work)
+    message = summary if deleted else "No cookies matched; nothing was deleted."
+    if unreachable:
+        message += f" {_n(unreachable, 'matching cookie')} partitioned for an opaque site can only be removed with --all."
+    emit(args, {"profile": profile.name, "deleted": deleted}, message)
+    return 0
 
 
 # ---------------------------------------------------------------------- status / stop-all
@@ -1399,6 +1834,61 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("ref", nargs="?", help="saved proxy or profile (default: direct connection)")
     p.add_argument("--direct", action="store_true", help="test this computer's direct connection")
     p.add_argument("--timeout", type=float, default=12.0)
+
+    # cookies
+    ck = sub.add_parser("cookies", help="see, set, delete, import and export a profile's cookies", parents=[common],
+                        description="A profile's cookies, live through its browser (Chrome encrypts them on disk). A "
+                                    "stopped profile is started in the background for the command and stopped again "
+                                    "afterwards unless --keep-running.")
+    csub = ck.add_subparsers(dest="action", metavar="<action>", required=True)
+
+    def jar_args(p: argparse.ArgumentParser) -> None:
+        p.add_argument("profile")
+        p.add_argument("--keep-running", action="store_true",
+                       help="keep a stopped profile's browser running afterwards (it is started off-screen)")
+        p.add_argument("--timeout", type=float, default=60.0, help="seconds to wait for the browser to start")
+        p.add_argument("--ignore-pause", action="store_true", help=IGNORE_PAUSE_HELP)
+
+    p = add(csub, "list", "list cookies (values hidden unless --values)", cmd_cookies_list)
+    jar_args(p)
+    p.add_argument("--domain", help="only this domain and its subdomains")
+    p.add_argument("--values", action="store_true", help="also show the values (they are secrets)")
+    p = add(csub, "export", "save cookies (with values) as JSON or cookies.txt", cmd_cookies_export)
+    jar_args(p)
+    p.add_argument("file", nargs="?", help="target file or folder ('-' = stdout; default: cookies-<profile>-<time>.json "
+                                           "here); .txt means cookies.txt")
+    p.add_argument("--format", choices=["json", "netscape"], help="json or netscape (cookies.txt); default from the "
+                                                                  "file name, else json")
+    p.add_argument("--domain", help="only this domain and its subdomains")
+    p.add_argument("--force", action="store_true", help="replace an existing file")
+    p = add(csub, "import", "load cookies from JSON (ours, Cookie-Editor, Playwright) or cookies.txt", cmd_cookies_import)
+    jar_args(p)
+    p.add_argument("file", help="cookie file ('-' = stdin)")
+    p.add_argument("--format", choices=["json", "netscape"], help="default: detected")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--replace", action="store_true",
+                      help="also delete the other cookies of the imported sites (and their subdomains)")
+    mode.add_argument("--replace-all", action="store_true", help="also delete every other cookie of the profile")
+    p.add_argument("--domain", help="only import this domain's cookies (and its subdomains')")
+    p = add(csub, "set", "add or replace one cookie", cmd_cookies_set)
+    jar_args(p)
+    p.add_argument("name")
+    p.add_argument("value", help="the value ('-' = read it from stdin, so it stays out of the process list)")
+    p.add_argument("--domain", required=True, help="e.g. example.com (a domain cookie: also sent to subdomains)")
+    p.add_argument("--host-only", action="store_true", help="only for exactly this host, not its subdomains")
+    p.add_argument("--path", default="/", help="default /")
+    p.add_argument("--expires", metavar="ISO|UNIX|session",
+                   help="e.g. 2027-01-31T12:00:00Z (UTC unless it has an offset) or unix seconds; default: session")
+    p.add_argument("--secure", action="store_true", help="only sent over HTTPS")
+    p.add_argument("--http-only", action="store_true", help="hidden from page scripts")
+    p.add_argument("--same-site", type=str.capitalize, choices=["Strict", "Lax", "None"],
+                   help="Strict, Lax or None (None needs --secure)")
+    p = add(csub, "delete", "delete cookies by domain, name or path, or all of them", cmd_cookies_delete)
+    jar_args(p)
+    p.add_argument("--domain", help="this domain and its subdomains")
+    p.add_argument("--name", help="cookies with exactly this name")
+    p.add_argument("--path", help="cookies with exactly this path")
+    p.add_argument("--all", action="store_true", help="every cookie of the profile")
 
     p = add(sub, "status", "list running profiles", cmd_status)
     p = add(sub, "stop-all", "stop every running profile (except paused ones)", cmd_stop_all)

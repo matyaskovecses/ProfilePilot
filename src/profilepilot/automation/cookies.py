@@ -6,10 +6,12 @@ Three shapes are involved:
   (``{name, value, domain, path, expires(-1 = session), httpOnly, secure, sameSite, partitionKey?}``)
   and what ``BrowserContext.add_cookies()`` accepts (``SetCookieParam``).
 * **Portable JSON** - the ShardX/ShardBrowser shape used for files and tool input:
-  ``{domain, name, value, path, expires (unix seconds | null), secure, httpOnly, sameSite}``.
-  On input the common browser-extension export shape (Cookie-Editor / EditThisCookie:
-  ``expirationDate``, ``hostOnly``, ``session``, ``sameSite: "no_restriction"``), ``http_only`` /
-  ``same_site`` aliases and Playwright ``storage_state`` files are accepted too.
+  ``{domain, name, value, path, expires (unix seconds | null), secure, httpOnly, sameSite}``, plus
+  Chrome's ``partitionKey`` (CHIPS: the CDP object ``{topLevelSite, hasCrossSiteAncestor}`` kept as
+  is, or Playwright's top-level-site string), ``priority``, ``sourceScheme`` and ``sourcePort`` when
+  the cookie has them. On input the common browser-extension export shape (Cookie-Editor /
+  EditThisCookie: ``expirationDate``, ``hostOnly``, ``session``, ``sameSite: "no_restriction"``),
+  ``http_only`` / ``same_site`` aliases and Playwright ``storage_state`` files are accepted too.
 * **Netscape cookies.txt** - the curl / wget / yt-dlp format, including ``#HttpOnly_`` lines.
 
 Cookies always move through CDP (never the SQLite file). Cookie *values* are secrets: they are
@@ -38,6 +40,8 @@ log = logging.getLogger("profilepilot.cookies")
 CookieFormat = Literal["json", "netscape"]
 NETSCAPE_HEADER = "# Netscape HTTP Cookie File"
 _SAME_SITE = {"strict": "Strict", "lax": "Lax", "none": "None", "no_restriction": "None"}
+_PRIORITY = {"low": "Low", "medium": "Medium", "high": "High"}
+_SOURCE_SCHEME = {"unset": "Unset", "nonsecure": "NonSecure", "secure": "Secure"}
 
 
 class CookieFormatError(ProfilePilotError, ValueError):
@@ -53,19 +57,22 @@ def _same_site(value: Any) -> str | None:
     return _SAME_SITE.get(str(value).strip().lower())
 
 
-def _expires(value: Any) -> int | None:
-    """Normalise an expiry to unix seconds, or None for a session cookie."""
+def _expires(value: Any, *, exact: bool = False) -> int | float | None:
+    """Normalise an expiry to unix seconds, or None for a session cookie. Whole seconds, unless
+    ``exact`` keeps a fraction (Chrome's expiries have microseconds) for exact round trips."""
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
         if not math.isfinite(value) or value <= 0:
             return None
+        if exact and not float(value).is_integer():
+            return round(float(value), 6)
         return int(value)
     text = str(value).strip()
     if not text or text.lower() in ("session", "-1", "0", "null", "none"):
         return None
     try:
-        return _expires(float(text))
+        return _expires(float(text), exact=exact)
     except ValueError:
         pass
     try:
@@ -74,7 +81,7 @@ def _expires(value: Any) -> int | None:
         raise CookieFormatError("Unrecognised cookie expiry.") from None  # never echo file content
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return int(dt.timestamp())
+    return _expires(dt.timestamp(), exact=exact)
 
 
 def _bool(value: Any) -> bool:
@@ -93,8 +100,9 @@ def _first(data: Mapping[str, Any], *keys: str) -> Any:
 # ---------------------------------------------------------------------- conversions
 
 
-def to_portable(cookie: Mapping[str, Any]) -> dict[str, Any]:
-    """Playwright (or any accepted) cookie -> portable JSON shape (ShardX compatible)."""
+def to_portable(cookie: Mapping[str, Any], *, exact_expiry: bool = False) -> dict[str, Any]:
+    """Playwright (or any accepted) cookie -> portable JSON shape (ShardX compatible).
+    ``expires`` is in whole seconds unless ``exact_expiry`` keeps Chrome's fraction."""
     if not isinstance(cookie, Mapping):
         raise CookieFormatError(f"A cookie must be an object, got {type(cookie).__name__}.")
     name = _first(cookie, "name")
@@ -110,7 +118,7 @@ def to_portable(cookie: Mapping[str, Any]) -> dict[str, Any]:
     if host_only is not None:
         domain = domain.lstrip(".") if _bool(host_only) else "." + domain.lstrip(".")
     expires = None if _bool(cookie.get("session", False)) else _expires(
-        _first(cookie, "expires", "expirationDate", "expiry", "expiration")
+        _first(cookie, "expires", "expirationDate", "expiry", "expiration"), exact=exact_expiry
     )
     out: dict[str, Any] = {
         "domain": domain,
@@ -122,10 +130,41 @@ def to_portable(cookie: Mapping[str, Any]) -> dict[str, Any]:
         "httpOnly": _bool(_first(cookie, "httpOnly", "http_only", "httponly") or False),
         "sameSite": _same_site(_first(cookie, "sameSite", "same_site", "samesite")),
     }
-    partition = cookie.get("partitionKey")
-    if isinstance(partition, str) and partition:
-        out["partitionKey"] = partition
+    out.update(_extras(cookie))
     return out
+
+
+def _extras(cookie: Mapping[str, Any]) -> dict[str, Any]:
+    """Chrome's attributes beyond the portable core, passed through when present and well-formed:
+    ``partitionKey`` (CDP object kept as is, or Playwright's top-level-site string), ``priority``,
+    ``sourceScheme`` and ``sourcePort``. Anything malformed is dropped, like an unknown SameSite."""
+    out: dict[str, Any] = {}
+    partition = cookie.get("partitionKey")
+    if isinstance(partition, Mapping) and isinstance(partition.get("topLevelSite"), str) and partition["topLevelSite"]:
+        out["partitionKey"] = {"topLevelSite": partition["topLevelSite"],
+                               "hasCrossSiteAncestor": _bool(partition.get("hasCrossSiteAncestor", False))}
+    elif isinstance(partition, str) and partition:
+        cross = cookie.get("_crHasCrossSiteAncestor")  # Playwright storage_state keeps Chrome's bit here
+        out["partitionKey"] = {"topLevelSite": partition, "hasCrossSiteAncestor": cross} if isinstance(cross, bool) else partition
+    priority = _PRIORITY.get(str(cookie.get("priority") or "").strip().lower())
+    if priority:
+        out["priority"] = priority
+    scheme = _SOURCE_SCHEME.get(str(_first(cookie, "sourceScheme", "source_scheme") or "").strip().lower())
+    if scheme:
+        out["sourceScheme"] = scheme
+    port = _first(cookie, "sourcePort", "source_port")
+    if isinstance(port, int) and not isinstance(port, bool) and -1 <= port <= 65535:
+        out["sourcePort"] = port
+    return out
+
+
+def partition_site(cookie: Mapping[str, Any]) -> str | None:
+    """The top-level site a partitioned (CHIPS) cookie belongs to, or None for an unpartitioned one."""
+    partition = cookie.get("partitionKey")
+    if isinstance(partition, Mapping):
+        site = partition.get("topLevelSite")
+        return str(site) if site else None
+    return str(partition) if isinstance(partition, str) and partition else None
 
 
 def to_playwright(cookie: Mapping[str, Any]) -> dict[str, Any]:
@@ -148,8 +187,9 @@ def to_playwright(cookie: Mapping[str, Any]) -> dict[str, Any]:
         same_site = None
     if same_site:
         out["sameSite"] = same_site
-    if portable.get("partitionKey"):
-        out["partitionKey"] = portable["partitionKey"]
+    site = partition_site(portable)
+    if site:
+        out["partitionKey"] = site  # Playwright takes the top-level site as a string
     return out
 
 
@@ -217,11 +257,21 @@ def from_cookiejar(jar: Iterable[http.cookiejar.Cookie]) -> list[dict[str, Any]]
 # ---------------------------------------------------------------------- Netscape format
 
 
-def to_netscape(cookies: Iterable[Mapping[str, Any]]) -> str:
-    """Render cookies as a Netscape ``cookies.txt`` document."""
-    lines = [NETSCAPE_HEADER, "# Exported by ProfilePilot. This file contains secrets - keep it private.", ""]
-    for raw in cookies:
-        c = to_portable(raw)
+def to_netscape(cookies: Iterable[Mapping[str, Any]], *, skip_partitioned: bool = False) -> str:
+    """Render cookies as a Netscape ``cookies.txt`` document.
+
+    cookies.txt has no partition column: a partitioned (CHIPS) cookie is written like any other
+    cookie, unless ``skip_partitioned`` leaves it out (a header line then says how many)."""
+    portable = [to_portable(raw) for raw in cookies]
+    left_out = sum(1 for c in portable if partition_site(c)) if skip_partitioned else 0
+    lines = [NETSCAPE_HEADER, "# Exported by ProfilePilot. This file contains secrets - keep it private."]
+    if left_out:
+        lines.append(f"# Left out {left_out} partitioned (CHIPS) cookie(s): cookies.txt cannot store their partition. "
+                     "Export as JSON to keep them.")
+    lines.append("")
+    for c in portable:
+        if left_out and partition_site(c):
+            continue
         domain = c["domain"]
         include_sub = "TRUE" if domain.startswith(".") else "FALSE"
         prefix = "#HttpOnly_" if c["httpOnly"] else ""
@@ -235,47 +285,54 @@ def to_netscape(cookies: Iterable[Mapping[str, Any]]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _netscape_line(lineno: int, raw_line: str) -> dict[str, Any] | None:
+    """One cookies.txt line -> a portable cookie (None for blank and comment lines)."""
+    line = raw_line.strip("\r\n")
+    if not line.strip():
+        return None
+    http_only = False
+    if line.startswith("#HttpOnly_"):
+        http_only = True
+        line = line[len("#HttpOnly_"):]
+    elif line.lstrip().startswith("#"):
+        return None
+    # Tabs only: a whitespace fallback would turn any line of prose into a "cookie".
+    fields = line.split("\t")
+    if len(fields) == 6:
+        fields.append("")
+    if len(fields) != 7:
+        raise CookieFormatError(f"cookies.txt line {lineno}: expected 7 tab-separated fields, got {len(fields)}.")
+    domain, include_sub, path, secure, expires, name, value = fields
+    domain = domain.strip()
+    if not domain or not name:
+        raise CookieFormatError(f"cookies.txt line {lineno}: missing domain or name.")
+    if include_sub.strip().upper() == "TRUE":
+        domain = "." + domain.lstrip(".")
+    else:
+        domain = domain.lstrip(".")
+    try:
+        exp = _expires(int(expires.strip() or 0))
+    except ValueError:
+        raise CookieFormatError(f"cookies.txt line {lineno}: invalid expiry.") from None  # no file content
+    return {
+        "domain": domain,
+        "name": name,
+        "value": value,
+        "path": path or "/",
+        "expires": exp,
+        "secure": secure.strip().upper() == "TRUE",
+        "httpOnly": http_only,
+        "sameSite": None,
+    }
+
+
 def parse_netscape(text: str) -> list[dict[str, Any]]:
     """Parse a Netscape ``cookies.txt`` document into portable cookies."""
     cookies: list[dict[str, Any]] = []
     for lineno, raw_line in enumerate(text.splitlines(), 1):
-        line = raw_line.strip("\r\n")
-        if not line.strip():
-            continue
-        http_only = False
-        if line.startswith("#HttpOnly_"):
-            http_only = True
-            line = line[len("#HttpOnly_"):]
-        elif line.lstrip().startswith("#"):
-            continue
-        # Tabs only: a whitespace fallback would turn any line of prose into a "cookie".
-        fields = line.split("\t")
-        if len(fields) == 6:
-            fields.append("")
-        if len(fields) != 7:
-            raise CookieFormatError(f"cookies.txt line {lineno}: expected 7 tab-separated fields, got {len(fields)}.")
-        domain, include_sub, path, secure, expires, name, value = fields
-        domain = domain.strip()
-        if not domain or not name:
-            raise CookieFormatError(f"cookies.txt line {lineno}: missing domain or name.")
-        if include_sub.strip().upper() == "TRUE":
-            domain = "." + domain.lstrip(".")
-        else:
-            domain = domain.lstrip(".")
-        try:
-            exp = _expires(int(expires.strip() or 0))
-        except ValueError:
-            raise CookieFormatError(f"cookies.txt line {lineno}: invalid expiry.") from None  # no file content
-        cookies.append({
-            "domain": domain,
-            "name": name,
-            "value": value,
-            "path": path or "/",
-            "expires": exp,
-            "secure": secure.strip().upper() == "TRUE",
-            "httpOnly": http_only,
-            "sameSite": None,
-        })
+        cookie = _netscape_line(lineno, raw_line)
+        if cookie is not None:
+            cookies.append(cookie)
     return cookies
 
 
@@ -285,6 +342,17 @@ def parse_netscape(text: str) -> list[dict[str, Any]]:
 def parse_json_cookies(data: Any, *, quiet: bool = False) -> list[dict[str, Any]]:
     """Portable cookies from decoded JSON: a list, ``{"cookies": [...]}`` (ShardX API,
     Playwright ``storage_state``) or a single cookie object. ``quiet``: see :func:`to_playwright_list`."""
+    out = []
+    for i, item in enumerate(_json_cookie_list(data)):
+        try:
+            out.append(to_portable(item))
+        except CookieFormatError as exc:
+            detail = "missing or invalid name, domain or expiry" if quiet else str(exc)
+            raise CookieFormatError(f"Cookie #{i + 1}: {detail}") from None
+    return out
+
+
+def _json_cookie_list(data: Any) -> list[Any]:
     if isinstance(data, Mapping):
         if isinstance(data.get("cookies"), list):
             data = data["cookies"]
@@ -294,14 +362,7 @@ def parse_json_cookies(data: Any, *, quiet: bool = False) -> list[dict[str, Any]
             raise CookieFormatError("JSON cookie data must be a list of cookies or an object with a 'cookies' list.")
     if not isinstance(data, list):
         raise CookieFormatError("JSON cookie data must be a list of cookies.")
-    out = []
-    for i, item in enumerate(data):
-        try:
-            out.append(to_portable(item))
-        except CookieFormatError as exc:
-            detail = "missing or invalid name, domain or expiry" if quiet else str(exc)
-            raise CookieFormatError(f"Cookie #{i + 1}: {detail}") from None
-    return out
+    return data
 
 
 def detect_format(text: str) -> CookieFormat:
@@ -327,27 +388,68 @@ def parse_cookies_text(text: str, fmt: CookieFormat | None = None, *, quiet: boo
     raise CookieFormatError(f"Unknown cookie format {fmt!r}; use 'json' or 'netscape'.")
 
 
+def parse_cookies_report(text: str, fmt: CookieFormat | None = None) -> tuple[CookieFormat, list[dict[str, Any]], list[str]]:
+    """Like :func:`parse_cookies_text`, but entries that cannot be understood are skipped instead of
+    failing the whole text: returns ``(format, portable cookies, problems)``. A problem names the
+    entry by position (``Cookie #3: ...``, ``cookies.txt line 7: ...``) and never quotes a value; a
+    text that cannot be read at all (invalid JSON, no cookie list) gives no cookies and one problem.
+    Expiries keep their fractions (``exact_expiry``), so an export imports back exactly."""
+    text = text.lstrip("﻿")
+    fmt = fmt or detect_format(text)
+    cookies: list[dict[str, Any]] = []
+    problems: list[str] = []
+    if fmt == "json":
+        try:
+            entries = _json_cookie_list(json.loads(text))
+        except json.JSONDecodeError as exc:
+            return fmt, [], [f"Invalid JSON: {exc.msg} (line {exc.lineno})."]
+        except CookieFormatError as exc:
+            return fmt, [], [str(exc)]
+        for i, item in enumerate(entries, 1):
+            try:
+                cookies.append(to_portable(item, exact_expiry=True))
+            except CookieFormatError as exc:
+                problems.append(f"Cookie #{i}: {exc}")
+        return fmt, cookies, problems
+    if fmt == "netscape":
+        for lineno, raw_line in enumerate(text.splitlines(), 1):
+            try:
+                cookie = _netscape_line(lineno, raw_line)
+            except CookieFormatError as exc:
+                problems.append(str(exc))
+                continue
+            if cookie is not None:
+                cookies.append(cookie)
+        return fmt, cookies, problems
+    raise CookieFormatError(f"Unknown cookie format {fmt!r}; use 'json' or 'netscape'.")
+
+
 def format_for_path(path: Path | str) -> CookieFormat:
     """``.txt`` / ``.cookies`` -> netscape, anything else -> json."""
     return "netscape" if Path(path).suffix.lower() in (".txt", ".cookies") else "json"
 
 
-def dumps_cookies(cookies: Iterable[Mapping[str, Any]], fmt: CookieFormat = "json") -> str:
+def dumps_cookies(cookies: Iterable[Mapping[str, Any]], fmt: CookieFormat = "json", *,
+                  skip_partitioned: bool = False, exact_expiry: bool = False) -> str:
+    """Cookies as a JSON list or a cookies.txt document (``skip_partitioned``: see :func:`to_netscape`;
+    ``exact_expiry``: JSON keeps Chrome's sub-second expiries, cookies.txt is always whole seconds)."""
     if fmt == "json":
-        return json.dumps([to_portable(c) for c in cookies], indent=2, ensure_ascii=False) + "\n"
+        return json.dumps([to_portable(c, exact_expiry=exact_expiry) for c in cookies], indent=2,
+                          ensure_ascii=False) + "\n"
     if fmt == "netscape":
-        return to_netscape(cookies)
+        return to_netscape(cookies, skip_partitioned=skip_partitioned)
     raise CookieFormatError(f"Unknown cookie format {fmt!r}; use 'json' or 'netscape'.")
 
 
 def export_cookies(cookies: Iterable[Mapping[str, Any]], path: Path | str, fmt: CookieFormat | None = None, *,
-                   create_parents: bool = True) -> Path:
+                   create_parents: bool = True, skip_partitioned: bool = False, exact_expiry: bool = False) -> Path:
     """Write cookies to ``path`` (JSON list or Netscape cookies.txt; inferred from the suffix when
     ``fmt`` is None). The file is created with owner-only permissions where the OS supports it.
-    ``create_parents=False`` refuses to create missing folders."""
+    ``create_parents=False`` refuses to create missing folders. ``skip_partitioned`` /
+    ``exact_expiry``: see :func:`dumps_cookies`."""
     target = Path(path).expanduser()
     fmt = fmt or format_for_path(target)
-    payload = dumps_cookies(list(cookies), fmt)
+    payload = dumps_cookies(list(cookies), fmt, skip_partitioned=skip_partitioned, exact_expiry=exact_expiry)
     if create_parents:
         target.parent.mkdir(parents=True, exist_ok=True)
     elif not target.parent.is_dir():

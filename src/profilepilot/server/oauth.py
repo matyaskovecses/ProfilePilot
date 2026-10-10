@@ -62,7 +62,7 @@ from dataclasses import dataclass, field
 from hmac import compare_digest
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Sequence
-from urllib.parse import parse_qs, urlsplit, urlunsplit
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit
 
 import anyio
 import anyio.to_thread
@@ -117,13 +117,27 @@ the wrong-code limit is used up (the code is new, so earlier guesses are worthle
 MAX_REQUEST_ID = 8192
 MAX_CLOSED_REQUESTS = 10_000
 MAX_CLIENTS = 100
+SIGN_IN_WINDOW = PENDING_TTL + CODE_TTL
+"""Seconds after its registration during which a client is never evicted to make room for another
+one (it is probably signing in right now)."""
 MAX_REGISTRATIONS_PER_HOUR = 30
 """Dynamic client registrations per hour for all redirect hosts except ChatGPT's and Claude's,
 together (so junk registrations cannot block those)."""
 REGISTRATIONS_PER_HOST_PER_HOUR = 10
-FIRST_PARTY_REGISTRATIONS_PER_HOUR = 60
+FIRST_PARTY_REGISTRATIONS_PER_HOUR = 20
+"""Per first-party host (``FIRST_PARTY_HOSTS`` exactly, not their subdomains). With every budget
+used up, fewer than ``MAX_CLIENTS / 2`` clients register within ``SIGN_IN_WINDOW``, so a flood cannot
+fill the table with clients that may not be evicted."""
 MAX_REDIRECT_URIS = 10
 MAX_FORM_BYTES = 16 * 1024
+MAX_REGISTRATION_BYTES = 16 * 1024
+"""Largest ``/register`` request body (registration is unauthenticated)."""
+MAX_CLIENT_RECORD_BYTES = 8 * 1024
+"""Largest stored metadata of one registered client (``oauth.json`` is re-read on every OAuth write)."""
+MAX_METADATA_ITEMS = 10
+"""Most entries in a list-valued client metadata field (``contacts``, ``grant_types``, ...)."""
+MAX_METADATA_TEXT = 2000
+"""Longest text value (or list entry) in the client metadata."""
 
 CHATGPT_REDIRECT_URI = "https://chatgpt.com/connector_platform_oauth_redirect"
 """ChatGPT's stable redirect URI (used because this server supports RFC 9207 ``iss``)."""
@@ -135,7 +149,9 @@ KNOWN_REDIRECT_URIS = {
 }
 """Exact redirect URIs that earn the green product badge on the consent page."""
 FIRST_PARTY_HOSTS = ("chatgpt.com", "chat.openai.com", "openai.com", "claude.ai", "claude.com", "anthropic.com")
-"""Hosts with their own registration / metadata-fetch budgets (not shared with arbitrary hosts)."""
+"""Hosts with their own registration / metadata-fetch budgets (not shared with arbitrary hosts).
+Registrations: these exact hosts only. Metadata fetches: also their subdomains, which share the
+budget of their site (one budget per subdomain would make fetches unlimited)."""
 APP_SCHEMES = frozenset({"cursor", "vscode", "vscode-insiders", "claude"})
 """Private-use redirect schemes accepted besides the reverse-DNS form of RFC 8252 7.1."""
 _LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "[::1]", "::1")
@@ -149,6 +165,11 @@ wrong-code limit for ``UNLOCK_TTL`` seconds, so it must resist unlimited guessin
 
 CIMD_MAX_BYTES = 32 * 1024
 CIMD_TIMEOUT = 5.0
+CIMD_CONNECT_TIMEOUT = 3.0
+"""Seconds to reach one address of the metadata host before the next one is tried."""
+CIMD_TOTAL_TIMEOUT = 10.0
+"""Seconds for the whole metadata fetch, every address tried included."""
+CIMD_MAX_ADDRESSES = 6
 CIMD_CACHE_TTL = 3600
 CIMD_NEGATIVE_TTL = 60
 CIMD_FETCHES_PER_MINUTE = 10
@@ -254,9 +275,20 @@ def _unb64(text: str) -> bytes:
     return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
 
 
-def _first_party_host(host: str) -> bool:
+def _first_party_site(host: str) -> str | None:
+    """The entry of ``FIRST_PARTY_HOSTS`` that ``host`` is or is a subdomain of (the most specific
+    one), or None."""
     host = (host or "").lower().rstrip(".")
-    return any(host == h or host.endswith("." + h) for h in FIRST_PARTY_HOSTS)
+    sites = [h for h in FIRST_PARTY_HOSTS if host == h or host.endswith("." + h)]
+    return max(sites, key=len) if sites else None
+
+
+def _with_issuer(uri: str, issuer: str) -> str:
+    """``uri`` with ``iss=<issuer>`` (RFC 9207) instead of any ``iss`` it had: the client must only
+    ever see this server's (a registered redirect URI may carry its own)."""
+    parts = urlsplit(uri)
+    query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k != "iss"]
+    return urlunsplit(parts._replace(query=urlencode([*query, ("iss", issuer)])))
 
 
 def _redirect_base(uri: str) -> str:
@@ -351,6 +383,18 @@ def _with_allowed_redirects(client: OAuthClientInformationFull) -> OAuthClientIn
     if not allowed:
         return None
     return client.model_copy(update={"redirect_uris": allowed})
+
+
+def _check_client_metadata(info: dict[str, Any]) -> None:
+    """Refuse oversized metadata of a dynamically registered client (registration is unauthenticated
+    and ``oauth.json`` is re-read on every OAuth write): at most ``MAX_METADATA_ITEMS`` entries per
+    list, ``MAX_METADATA_TEXT`` characters per text and ``MAX_CLIENT_RECORD_BYTES`` in all."""
+    for key, value in info.items():
+        items = value if isinstance(value, list) else [value]
+        if len(items) > MAX_METADATA_ITEMS or any(isinstance(v, str) and len(v) > MAX_METADATA_TEXT for v in items):
+            raise RegistrationError("invalid_client_metadata", f"{key[:40]} is too long.")
+    if len(json.dumps(info, separators=(",", ":"))) > MAX_CLIENT_RECORD_BYTES:
+        raise RegistrationError("invalid_client_metadata", "The client metadata is too large.")
 
 
 # ---------------------------------------------------------------------- persistent store
@@ -655,6 +699,7 @@ class PairingOAuthProvider(OAuthAuthorizationServerProvider[StoredCode, StoredRe
         self._cimd_by_host: dict[str, _RateLimiter] = {}
         self._cimd_cache: dict[str, tuple[float, OAuthClientInformationFull | None]] = {}
         self._cimd_good: dict[str, float] = {}  # metadata URLs that worked before -> when
+        self._sign_ins: dict[str, float] = {}  # client ID -> when it last started a sign-in (not stored)
         self._last_touch: dict[str, float] = {}
 
     # -- helpers
@@ -690,12 +735,13 @@ class PairingOAuthProvider(OAuthAuthorizationServerProvider[StoredCode, StoredRe
 
     def _registration_allowed(self, uris: Sequence[str], now: float) -> bool:
         """Budgets per redirect host (so junk registrations for other hosts cannot use up ChatGPT's or
-        Claude's) plus one shared budget for every host that is not theirs."""
+        Claude's) plus one shared budget for every host that is not theirs. Only their exact hosts
+        count as theirs: their redirect URIs are there, and a budget per subdomain would be no limit."""
         groups = sorted({_redirect_group(u) for u in uris})
-        first_party = all(_first_party_host(g) for g in groups)
+        first_party = all(g in FIRST_PARTY_HOSTS for g in groups)
         limiters = [
             _budget(self._registrations_by_host, g,
-                    FIRST_PARTY_REGISTRATIONS_PER_HOUR if _first_party_host(g) else REGISTRATIONS_PER_HOST_PER_HOUR,
+                    FIRST_PARTY_REGISTRATIONS_PER_HOUR if g in FIRST_PARTY_HOSTS else REGISTRATIONS_PER_HOST_PER_HOUR,
                     3600, now)
             for g in groups
         ]
@@ -722,17 +768,27 @@ class PairingOAuthProvider(OAuthAuthorizationServerProvider[StoredCode, StoredRe
                 raise RegistrationError("invalid_redirect_uri", str(exc)) from None
         if client_info.client_name and len(client_info.client_name) > 200:
             raise RegistrationError("invalid_client_metadata", "client_name is too long.")
+        info = client_info.model_dump(mode="json", exclude_none=True)
+        _check_client_metadata(info)
         if not self._registration_allowed(uris, now):
             raise RegistrationError("invalid_client_metadata", "Too many registrations; try again later.")
-        info = client_info.model_dump(mode="json", exclude_none=True)
+        sign_ins = dict(self._sign_ins)
 
         def apply(data: dict[str, Any]) -> None:
             clients = data["clients"]
             if len(clients) >= MAX_CLIENTS:
+                # Never a connected client, one with an unused code or one registered moments ago (it is
+                # probably signing in); of the others, the one idle longest (starting a sign-in counts).
                 in_use = {g.get("client_id") for g in data["grants"].values()}
-                idle = sorted((c for c in clients if c not in in_use), key=lambda c: clients[c].get("created_at", 0))
+                in_use |= {c.get("client_id") for c in data["codes"].values()}
+                idle = sorted(
+                    (c for c in clients
+                     if c not in in_use and now - float(clients[c].get("created_at") or 0) >= SIGN_IN_WINDOW),
+                    key=lambda c: max(float(clients[c].get("created_at") or 0), sign_ins.get(c, 0.0)),
+                )
                 if not idle:
-                    raise RegistrationError("invalid_client_metadata", "Too many connected clients.")
+                    raise RegistrationError("invalid_client_metadata",
+                                            "Too many clients are connected or signing in; try again later.")
                 for cid in idle[: len(clients) - MAX_CLIENTS + 1]:
                     del clients[cid]
             clients[client_info.client_id] = {"info": info, "created_at": now, "kind": "dcr"}
@@ -742,11 +798,13 @@ class PairingOAuthProvider(OAuthAuthorizationServerProvider[StoredCode, StoredRe
 
     def _cimd_fetch_allowed(self, url: str, host: str, now: float) -> bool:
         """A URL that worked before may always be refreshed (it is cached for an hour); others share a
-        per-host budget, and hosts other than ChatGPT's / Claude's also one global budget."""
+        per-host budget (ChatGPT's / Claude's: per site, subdomains included), and hosts other than
+        theirs also one global budget."""
         if url in self._cimd_good:
             return True
-        first_party = _first_party_host(host)
-        per_host = _budget(self._cimd_by_host, host,
+        site = _first_party_site(host)
+        first_party = site is not None
+        per_host = _budget(self._cimd_by_host, site or host,
                            CIMD_FIRST_PARTY_FETCHES_PER_MINUTE if first_party else CIMD_FETCHES_PER_MINUTE, 60, now)
         if per_host.blocked_for(now) or (not first_party and self._cimd_fetches.blocked_for(now)):
             return False
@@ -826,10 +884,21 @@ class PairingOAuthProvider(OAuthAuthorizationServerProvider[StoredCode, StoredRe
     def _sign(self, label: str, text: str) -> str:
         return _b64(hmac.new(self._key, f"{label}|{text}".encode(), hashlib.sha256).digest())
 
+    def _note_sign_in(self, client_id: str, now: float) -> None:
+        """Remember (in memory: ``/authorize`` writes nothing) that a registered client started
+        signing in, so making room for a new registration evicts clients idle longer first."""
+        if client_id.startswith("https://"):  # a metadata document client is not stored
+            return
+        if len(self._sign_ins) >= 4 * MAX_CLIENTS:
+            for old in sorted(self._sign_ins, key=self._sign_ins.__getitem__)[: 2 * MAX_CLIENTS]:
+                del self._sign_ins[old]
+        self._sign_ins[client_id] = now
+
     async def authorize(self, client: OAuthClientInformationFull, params: AuthorizationParams) -> str:
         if not self._resource_ok(params.resource):
             raise AuthorizeError("invalid_target", "This authorization server only issues tokens for "
                                                    f"{self.resource}.")
+        self._note_sign_in(client.client_id, self.clock())
         # One scope exists. Others (e.g. "openid") are ignored rather than refused (RFC 6749 3.3: the
         # server may grant fewer scopes); the token response tells the client what it got.
         body = {
@@ -986,7 +1055,7 @@ class PairingOAuthProvider(OAuthAuthorizationServerProvider[StoredCode, StoredRe
         await self._mutate(apply)
         await anyio.to_thread.run_sync(lambda: rotate_pairing_code(self.store))
         log.info("OAuth: the user approved %r", (pending.client_name or pending.client_id)[:80])
-        return construct_redirect_uri(pending.redirect_uri, code=code, state=pending.state, iss=self.issuer)
+        return _with_issuer(construct_redirect_uri(pending.redirect_uri, code=code, state=pending.state), self.issuer)
 
     async def _wrong_code(self, pending: PendingAuthorization, now: float, *, counted: bool = True) -> None:
         """Bookkeeping after a wrong code. ``counted``: it was counted against the global limit
@@ -1012,10 +1081,10 @@ class PairingOAuthProvider(OAuthAuthorizationServerProvider[StoredCode, StoredRe
 
     def deny(self, pending: PendingAuthorization) -> str:
         self._close(pending)
-        return construct_redirect_uri(
+        return _with_issuer(construct_redirect_uri(
             pending.redirect_uri, error="access_denied", error_description="The user denied the request.",
-            state=pending.state, iss=self.issuer,
-        )
+            state=pending.state,
+        ), self.issuer)
 
     # -- codes and tokens
 
@@ -1307,20 +1376,35 @@ async def _resolve_public(host: str, port: int) -> list[str]:
     return addresses
 
 
+def _alternate_families(addresses: Sequence[str]) -> list[str]:
+    """IPv6 and IPv4 addresses taken in turn, starting with the resolver's first family (the order
+    of RFC 8305 "happy eyeballs"), at most ``CIMD_MAX_ADDRESSES``."""
+    if not addresses:
+        return []
+    first = [a for a in addresses if (":" in a) == (":" in addresses[0])]
+    other = [a for a in addresses if (":" in a) != (":" in addresses[0])]
+    mixed = [a for pair in zip(first, other) for a in pair]
+    n = min(len(first), len(other))
+    return (mixed + first[n:] + other[n:])[:CIMD_MAX_ADDRESSES]
+
+
 async def fetch_client_metadata_document(url: str, *, transport: Any = None) -> dict[str, Any]:
     """Fetch a client ID metadata document: https only, public addresses only (the connection goes
-    to the address that was checked; TLS still verifies the host name), no redirects, at most
-    32 KB, 5 s timeout, JSON object. ``transport`` is for tests."""
+    to an address that was checked, never another; TLS still verifies the host name), no redirects,
+    at most 32 KB, JSON object. An address that cannot be reached within ``CIMD_CONNECT_TIMEOUT``
+    makes it try the next checked one (IPv6 / IPv4 in turn); ``CIMD_TOTAL_TIMEOUT`` for it all.
+    ``transport`` is for tests."""
     import httpx
 
     check_cimd_url(url)
     parts = urlsplit(url)
     host = (parts.hostname or "").lower()
-    address = (await _resolve_public(host, 443))[0]
-    target = urlunsplit(("https", f"[{address}]" if ":" in address else address, parts.path, "", ""))
+    addresses = _alternate_families(await _resolve_public(host, 443))
     host_header = f"[{host}]" if ":" in host else host
-    async with httpx.AsyncClient(follow_redirects=False, timeout=CIMD_TIMEOUT, trust_env=False, transport=transport,
-                                 headers={"Accept": "application/json", "User-Agent": "ProfilePilot-OAuth"}) as http:
+    timeout = httpx.Timeout(CIMD_TIMEOUT, connect=CIMD_CONNECT_TIMEOUT)
+
+    async def fetch(http: httpx.AsyncClient, address: str) -> bytes:
+        target = urlunsplit(("https", f"[{address}]" if ":" in address else address, parts.path, "", ""))
         async with http.stream("GET", target, headers={"Host": host_header},
                                extensions={"sni_hostname": host}) as response:
             if response.status_code != 200:
@@ -1330,7 +1414,22 @@ async def fetch_client_metadata_document(url: str, *, transport: Any = None) -> 
                 body += chunk
                 if len(body) > CIMD_MAX_BYTES:
                     raise ValueError("client metadata document is too large")
-    document = json.loads(bytes(body).decode("utf-8"))
+        return bytes(body)
+
+    body = b""
+    headers = {"Accept": "application/json", "User-Agent": "ProfilePilot-OAuth"}
+    with anyio.fail_after(CIMD_TOTAL_TIMEOUT):
+        async with httpx.AsyncClient(follow_redirects=False, timeout=timeout, trust_env=False, transport=transport,
+                                     headers=headers) as http:
+            for index, address in enumerate(addresses):
+                try:
+                    body = await fetch(http, address)
+                    break
+                except (httpx.ConnectError, httpx.ConnectTimeout):  # not reached: the next checked address
+                    if index == len(addresses) - 1:
+                        raise
+                    log.debug("OAuth: client metadata host unreachable at one address; trying the next")
+    document = json.loads(body.decode("utf-8"))
     if not isinstance(document, dict):
         raise ValueError("client metadata document is not a JSON object")
     return document
@@ -1587,6 +1686,8 @@ class OAuthGateway:
             await self._consent(scope, receive, send)
         elif path == "/authorize":
             await self.app(scope, receive, self._with_iss(send))
+        elif path == "/register" and scope.get("method") == "POST":
+            await self._register(scope, receive, send)
         elif path == self._mcp_path or path.startswith(self._mcp_path + "/"):
             await self.app(scope, receive, self._with_scope_challenge(send))
         else:
@@ -1611,10 +1712,11 @@ class OAuthGateway:
     # -- redirects
 
     def _with_iss(self, send: Any) -> Any:
-        """``iss`` on every redirect back to a client (RFC 9207); an *error* redirect to a client the
-        user never approved becomes an error page instead (no open redirect via ``/authorize``)."""
+        """``iss`` on every redirect back to a client (RFC 9207, replacing any ``iss`` its redirect URI
+        has); a redirect to a client the user never approved (only errors go to clients from here)
+        becomes an error page instead (no open redirect via ``/authorize``)."""
         issuer = self.setup.issuer
-        consent_prefix = f"{issuer}{CONSENT_PATH}"
+        consent = _redirect_base(f"{issuer}{CONSENT_PATH}")
         replaced = False
 
         async def wrapped(message: dict[str, Any]) -> None:
@@ -1626,21 +1728,46 @@ class OAuthGateway:
                 for name, value in message.get("headers") or []:
                     if name.lower() == b"location":
                         location = value.decode("latin-1")
-                        query = parse_qs(urlsplit(location).query)
-                        if not location.startswith(consent_prefix) and "iss" not in query and (
-                            "code" in query or "error" in query
-                        ):
-                            if "error" in query and not self.setup.provider.trusted_redirect(location):
+                        if _redirect_base(location) != consent:
+                            if not self.setup.provider.trusted_redirect(location):
                                 replaced = True
-                                await self._error_page(send, query)
+                                await self._error_page(send, parse_qs(urlsplit(location).query))
                                 return
-                            location = construct_redirect_uri(location, iss=issuer)
+                            location = _with_issuer(location, issuer)
                         value = location.encode("latin-1")
                     headers.append((name, value))
                 message = {**message, "headers": headers}
             await send(message)
 
         return wrapped
+
+    async def _register(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        """Dynamic client registration with a bounded request body (the SDK reads it whole)."""
+        from starlette.responses import JSONResponse
+
+        body = bytearray()
+        more = True
+        while more:
+            message = await receive()
+            if message.get("type") != "http.request":
+                return  # the client went away
+            body += message.get("body", b"")
+            more = bool(message.get("more_body"))
+            if len(body) > MAX_REGISTRATION_BYTES:
+                await JSONResponse({"error": "invalid_client_metadata",
+                                    "error_description": "The registration request is too large."},
+                                   status_code=413)(scope, receive, send)
+                return
+        replayed = False
+
+        async def replay() -> dict[str, Any]:
+            nonlocal replayed
+            if replayed:
+                return await receive()
+            replayed = True
+            return {"type": "http.request", "body": bytes(body), "more_body": False}
+
+        await self.app(scope, replay, send)
 
     async def _error_page(self, send: Any, query: dict[str, list[str]]) -> None:
         nonce = secrets.token_urlsafe(16)

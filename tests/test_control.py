@@ -218,6 +218,48 @@ def test_scrub_text_masks_secrets_in_urls_json_and_key_shapes() -> None:
     assert scrub_text(f"token {github}") == "token ***"
 
 
+def test_scrub_text_masks_the_whole_value_of_a_secret_field() -> None:
+    # Values with spaces used to be masked only up to the first space.
+    assert scrub_text('Response {"client_secret": "correct horse battery staple", "expires_in": 3600}') == \
+        'Response {"client_secret": "***", "expires_in": 3600}'
+    assert scrub_text("{'session_key': 'a b\\' c d', 'n': 1}") == "{'session_key': '***', 'n': 1}"
+    assert scrub_text('{"access_token": "cut off in the middle of a value') == '{"access_token": "***"'
+    assert scrub_text('{"apiKey" : null, "name": "two words"}') == '{"apiKey" : ***, "name": "two words"}'
+    # Other fields keep their values, and do not hide a secret field that follows a malformed one.
+    assert scrub_text('{"a": "Error, "auth_code": "abc def"}') == '{"a": "Error, "auth_code": "***"}'
+
+
+def test_scrub_text_stays_linear_on_long_adversarial_input() -> None:
+    """Tool errors can carry long page-controlled strings, and scrubbing holds the GIL (the whole server
+    waits): 200 KB that made the secret-name patterns backtrack quadratically (minutes) takes milliseconds."""
+    from profilepilot.control import _SECRET_FIELD, _SECRET_QUERY, SCRUB_SCAN_MAX
+
+    size = 200_000
+    words = "key" * (size // 3)  # a secret word at every position of one long name
+    inputs = [
+        "Opened https://x.test/?" + words,  # no '=' after the parameter name
+        '{"' + words,  # no closing quote
+        '{"' + words + '" x',  # no ':' after the field name
+        "?" + "x" * size, '"' + "x" * size,  # no secret word at all
+        "!" * size, "ab." * (size // 3), "eyJ-" * (size // 4),  # shapes other patterns backtrack on
+    ]
+    scrub_text("warm up")  # imports redact_secrets
+    for text in inputs:
+        started = time.perf_counter()
+        _SECRET_QUERY.sub(r"\1***", text)
+        _SECRET_FIELD.sub("***", text)
+        assert len(scrub_text(text)) == 200
+        assert time.perf_counter() - started < 2.0, text[:30]
+    # Only the start of a long line is scanned (and kept); what is kept is still scrubbed.
+    text = scrub_text("GET https://x.test/cb?code=SECRET1 " + "x" * size, limit=SCRUB_SCAN_MAX)
+    assert text.startswith("GET https://x.test/cb?code=*** xxx") and text.endswith(" …")
+    assert len(text) <= SCRUB_SCAN_MAX
+    # A card number cut in half by the scan limit is dropped, not shown in part.
+    padding = "a " * ((SCRUB_SCAN_MAX - 12) // 2)
+    text = scrub_text(padding + "4242 4242 4242 4242 end", limit=SCRUB_SCAN_MAX)
+    assert "42" not in text and text.endswith("a …")
+
+
 def test_activity_event_blocked_flag(tmp_path: Path) -> None:
     log = ActivityLog(tmp_path)
     log.append(ActivityEvent(tool="browser_click", ok=False, blocked=True, summary="The user has taken control"))
@@ -555,6 +597,110 @@ async def test_tool_guard_stops_a_page_tool_when_the_user_takes_control_mid_call
     with pytest.raises(ToolError, match="browser_type was stopped before it finished. Profile 'shop-us' is waiting"):
         await guarded(ctx=ctx, profile="shop-us", text="y" * 200)
     await helper
+
+
+@pytest.mark.asyncio
+async def test_tool_guard_stops_a_page_tool_paused_right_after_the_pre_call_check(store: Store, monkeypatch) -> None:
+    """The watcher notes control.json before the pre-call check: a pause written just after that check
+    (before the call starts) used to look like the file's original state and went unnoticed."""
+    import asyncio
+
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    from profilepilot.server import tools_control
+    from profilepilot.server.app import tool_guard
+
+    monkeypatch.setattr(tools_control, "PAUSE_POLL_S", 0.05)
+    store.create_profile("shop-us")
+    ctx = _fake_ctx(store)
+    real_check = ControlStore.check_not_paused
+
+    def check_then_pause(self: ControlStore, ref: str) -> None:
+        real_check(self, ref)
+        self.pause(ref)  # the user takes control right after the check passed
+
+    monkeypatch.setattr(ControlStore, "check_not_paused", check_then_pause)
+
+    async def browser_wait_for(ctx: Context, profile: str) -> str:
+        await asyncio.sleep(2)
+        return "Waited"
+
+    with pytest.raises(ToolError, match="browser_wait_for was stopped before it finished. The user has taken control"):
+        await asyncio.wait_for(tool_guard(browser_wait_for)(ctx=ctx, profile="shop-us"), 5)
+
+
+@pytest.mark.asyncio
+async def test_tool_guard_reads_a_pause_again_after_a_failed_read(store: Store, monkeypatch) -> None:
+    """A read of control.json that fails (its writer or a scanner still holds it) does not use up the
+    change: the next poll reads it again, so the pause still stops the call."""
+    import asyncio
+
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    from profilepilot import control as control_mod
+    from profilepilot.server import tools_control
+    from profilepilot.server.app import tool_guard
+
+    monkeypatch.setattr(tools_control, "PAUSE_POLL_S", 0.05)
+    monkeypatch.setattr(control_mod, "READ_ATTEMPTS", 1)
+    store.create_profile("shop-us")
+    ctx = _fake_ctx(store)
+    locked = {"reads": 0}
+    real = Path.read_bytes
+
+    def read_bytes(self: Path) -> bytes:
+        if self.name == "control.json" and locked["reads"] > 0:
+            locked["reads"] -= 1
+            raise PermissionError(13, "The process cannot access the file")
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+
+    async def browser_type(ctx: Context, profile: str, text: str) -> str:
+        await asyncio.to_thread(ControlStore(store).pause, profile)  # the user takes control mid-call
+        locked["reads"] = 2  # and the file stays locked for the next two reads
+        await asyncio.sleep(2)
+        return f"Typed {len(text)} characters"
+
+    with pytest.raises(ToolError, match="browser_type was stopped before it finished. The user has taken control"):
+        await asyncio.wait_for(tool_guard(browser_type)(ctx=ctx, profile="shop-us", text="abc"), 5)
+    assert locked["reads"] == 0
+
+
+@pytest.mark.asyncio
+async def test_tool_guard_keeps_the_result_of_a_call_that_finished_while_the_pause_was_read(
+        store: Store, monkeypatch) -> None:
+    """A call that completed while its watcher was reading the new pause is not reported as stopped:
+    its work is done, so its result is returned (the pause refuses the next call)."""
+    import asyncio
+
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    from profilepilot.server import tools_control
+    from profilepilot.server.app import tool_guard
+
+    monkeypatch.setattr(tools_control, "PAUSE_POLL_S", 0.05)
+    store.create_profile("shop-us")
+    ctx = _fake_ctx(store)
+    real_state = ControlStore.state_by_id
+
+    def slow_state(self: ControlStore, profile_id: str, *, strict: bool = True) -> Any:
+        time.sleep(0.4)  # the call finishes during this read
+        return real_state(self, profile_id, strict=strict)
+
+    monkeypatch.setattr(ControlStore, "state_by_id", slow_state)
+
+    async def browser_click(ctx: Context, profile: str) -> str:
+        await asyncio.to_thread(ControlStore(store).pause, profile)  # the user takes control as the click lands
+        await asyncio.sleep(0.1)
+        return "Clicked"
+
+    guarded = tool_guard(browser_click)
+    assert await guarded(ctx=ctx, profile="shop-us") == "Clicked"
+    last = ActivityLog(store.root).tail(1)[0]
+    assert last.tool == "browser_click" and last.ok and not last.blocked
+    with pytest.raises(ToolError, match="The user has taken control of profile 'shop-us'"):
+        await guarded(ctx=ctx, profile="shop-us")
 
 
 def test_python_client_respects_the_pause(store: Store) -> None:

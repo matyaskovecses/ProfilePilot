@@ -192,13 +192,15 @@ def tool_guard(fn: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
 
     @functools.wraps(fn)
     async def wrapper(*args: Any, **kwargs: Any) -> T:
-        from .tools_control import enforce_pause, log_activity  # lazy: tools_control imports .app
+        from .tools_control import enforce_pause, log_activity, run_unless_paused  # lazy: tools_control imports .app
 
         started = time.perf_counter()
         ctx = kwargs.get("ctx")
         try:
-            await enforce_pause(ctx, fn.__name__, kwargs)
-            result = await fn(*args, **kwargs)
+            # The pre-call check runs inside run_unless_paused, after it stamped control.json, so a pause
+            # written in between is caught; a page tool is also stopped if its profile is paused mid-call.
+            result = await run_unless_paused(ctx, fn.__name__, kwargs, lambda: fn(*args, **kwargs),
+                                             check=lambda: enforce_pause(ctx, fn.__name__, kwargs))
         except Exception as exc:  # cancellation (a BaseException) passes through untouched
             crash = await _crash_instead(exc, kwargs)
             error = to_tool_error(crash or exc, fn.__name__)

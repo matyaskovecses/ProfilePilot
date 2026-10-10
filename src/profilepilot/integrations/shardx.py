@@ -100,14 +100,25 @@ _JWT = re.compile(r"\beyJ[\w\-]*\.[\w\-]+\.[\w\-]+")
 _JSON_SECRET_FIELD = re.compile(r'(?i)("(?:password|api_secret|token|secret)"\s*:\s*")[^"]*(")')
 
 
+REDACT_MAX = 4096
+"""Longest text :func:`redact_secrets` scans. Its patterns backtrack, so a long text with no
+separators (an error message a web page controls) would take quadratic time: longer texts are cut
+first, together with the word the cut falls into, so no part of a secret survives the cut."""
+
+
 def redact_secrets(text: str) -> str:
     """Mask proxy credentials, bearer tokens and JWTs in free text (error messages, logs).
 
     Handles ``scheme://user:pass@host``, ``user:pass@host``, the provider-list format
     ``host:port:user:pass``, ``Bearer <token>``, bare JWTs and JSON ``"password": "..."`` fields.
+    Texts longer than :data:`REDACT_MAX` are shortened (ending in ``[truncated]``).
     """
     if not text:
         return text
+    if len(text) > REDACT_MAX:
+        head = text[:REDACT_MAX]
+        cut = max(head.rfind(" "), head.rfind("\n"), head.rfind("\t"))
+        text = (head[:cut] if cut > 0 else "") + " [truncated]"
     text = _URL_CREDENTIALS.sub(r"\1***:***@", text)
     text = _BARE_CREDENTIALS.sub("***:***@", text)
     text = _HOST_PORT_USER_PASS.sub(r"\1:\2:***:***", text)

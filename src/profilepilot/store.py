@@ -421,6 +421,17 @@ class Store:
                 write_json(self._profile_file(pid), profile.model_dump(mode="json"))
             return profile
 
+    def purge_trash_entries(self, trash_ids: list[str]) -> int:
+        """Permanently delete exactly these trash entries (those still in the trash; unknown ids are
+        ignored): what the user saw when they confirmed, never a profile trashed afterwards."""
+        wanted = set(trash_ids)
+        removed = 0
+        for entry in self.list_trash():
+            if entry.trash_id in wanted:
+                _rmtree(self.trash_dir / entry.trash_id)
+                removed += 1
+        return removed
+
     def purge_trash(self, older_than_days: float = 7.0) -> int:
         cutoff = utcnow() - timedelta(days=older_than_days)
         removed = 0

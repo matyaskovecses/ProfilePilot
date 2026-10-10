@@ -1,7 +1,8 @@
 """ProfilePilot Manager in a real browser: every view renders without console errors.
 
 The test seeds a temporary data root with obviously fake profiles, proxies, identities, help requests
-and activity, starts three of the profiles for real (headless, local test pages), serves the
+and activity, starts three of the profiles for real (headless, local test pages; one gets a jar of sample
+cookies), serves the
 Manager and opens it in a throwaway Chrome driven by Playwright. Screenshots of every view and of the
 main dialogs, in the light and the dark theme, are saved to ``docs/img/manager/`` for the README
 (``PROFILEPILOT_UI_SHOTS=0`` skips writing them).
@@ -13,6 +14,7 @@ phone range, and Stripe's public test card number.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import json
 import os
@@ -81,6 +83,47 @@ IDENTITIES = {
         "origins": [],
     },
 }
+
+
+def sample_cookies(now: float) -> list[dict[str, Any]]:
+    """The demo shop profile's cookie jar: example.com / .net / .org sites only, obviously fake values
+    (the random parts are made at run time)."""
+    day = 86400
+    demo = lambda n: f"demo-{secrets.token_hex(n)}"  # noqa: E731
+    shop = {"domain": "shop.example.com", "path": "/"}
+    return [
+        {**shop, "name": "session", "value": demo(12), "expires": None, "secure": True, "httpOnly": True, "sameSite": "Lax"},
+        {**shop, "name": "__Host-csrf", "value": demo(8), "expires": None, "secure": True, "httpOnly": True, "sameSite": "Strict"},
+        {**shop, "name": "cart_id", "value": "demo-cart-1042", "expires": now + 7 * day, "sameSite": "Lax"},
+        {**shop, "name": "currency", "value": "USD", "expires": now + 365 * day},
+        {**shop, "name": "recently_viewed", "value": "trail-shoes,rain-shell", "path": "/products", "expires": now + 30 * day,
+         "sameSite": "Lax"},
+        {"domain": ".example.com", "path": "/", "name": "consent", "value": "necessary-only", "expires": now + 180 * day,
+         "sameSite": "Lax"},
+        {"domain": ".example.com", "path": "/", "name": "_demo_visitor", "value": demo(6), "expires": now + 395 * day},
+        {"domain": "accounts.example.net", "path": "/", "name": "remember_me", "value": demo(16), "expires": now + 30 * day,
+         "secure": True, "httpOnly": True, "sameSite": "Strict"},
+        {"domain": "accounts.example.net", "path": "/", "name": "lang", "value": "en-US", "expires": now + 365 * day,
+         "secure": True, "sameSite": "Lax"},
+        {"domain": "news.example.org", "path": "/", "name": "theme", "value": "dark", "expires": now + 90 * day},
+        {"domain": "news.example.org", "path": "/", "name": "free_articles", "value": "3", "expires": now + 5 * 3600},
+        {"domain": "widgets.example.net", "path": "/", "name": "__Host-widget_state", "value": demo(6), "expires": now + 14 * day,
+         "secure": True, "sameSite": "None", "partitionKey": {"topLevelSite": "https://example.com", "hasCrossSiteAncestor": False}},
+    ]
+
+
+def seed_cookies(ws_url: str) -> list[dict[str, Any]]:
+    """Replace the jar of the browser at ``ws_url`` with :func:`sample_cookies`; returns them."""
+    from profilepilot.browser import cookiejar
+
+    cookies = sample_cookies(time.time())
+
+    async def seed() -> None:
+        await cookiejar.clear_cookies(ws_url)
+        await cookiejar.set_cookies(ws_url, cookies)
+
+    asyncio.run(seed())
+    return cookies
 
 
 def seed_store(store: Store) -> dict[str, str]:
@@ -306,6 +349,7 @@ def test_manager_views_render_without_console_errors(tmp_path: Path, monkeypatch
     from playwright.sync_api import sync_playwright
 
     from profilepilot import chrome_autofill
+    from profilepilot.browser import cookiejar
     from profilepilot.browser.runtime import RuntimeManager
 
     from .chrome_helper import launch_chrome
@@ -334,6 +378,9 @@ def test_manager_views_render_without_console_errors(tmp_path: Path, monkeypatch
                 runtime.start(profile.id, window="headless", start_url=f"{pages}{path}", timeout=60)
                 if saved_proxy:
                     store.update_profile(profile.id, proxy_id=saved_proxy)  # shown on the card; not used by the run
+                if name == "shop-us":
+                    shop_ws = str(runtime.status(profile.id).cdp_ws_url)
+                    shop_cookies = seed_cookies(shop_ws)
                 # Present them as normal windows on the screenshots (they are headless only for the test).
                 runtime_file = store.runtime_file(profile.id)
                 data = read_json(runtime_file)
@@ -389,6 +436,14 @@ def test_manager_views_render_without_console_errors(tmp_path: Path, monkeypatch
                     if path.stat().st_size > MAX_SHOT_BYTES:
                         page.screenshot(path=str(path), scale="css", clip={"x": 0, "y": 0, "width": 1320, "height": 760})
                     assert path.stat().st_size <= MAX_SHOT_BYTES, f"{path.name} is {path.stat().st_size} bytes"
+
+                def jar() -> list[dict[str, Any]]:
+                    """The demo shop's cookies, read from its browser (in a thread: Playwright owns this one's loop)."""
+                    with concurrent.futures.ThreadPoolExecutor(1) as pool:
+                        return pool.submit(asyncio.run, cookiejar.list_cookies(shop_ws)).result()
+
+                def cookie_row(drawer: Any, name: str) -> Any:
+                    return drawer.locator(".ck-row", has=page.get_by_role("button", name=name, exact=True))
 
                 def alex_card() -> Any:
                     # (the "Personal" card mentions "Alex Sample" too: its browser address' summary)
@@ -453,6 +508,43 @@ def test_manager_views_render_without_console_errors(tmp_path: Path, monkeypatch
                     shoot(f"drawer-profile-{theme}")
                     page.locator("dialog.drawer[open] .drawer-tabs button", has_text="Tabs").click()
                     page.wait_for_selector("dialog.drawer[open] .list-item")
+                    # Cookies: the sample jar by site, values masked until revealed (text only, never markup).
+                    page.locator("dialog.drawer[open] .drawer-tabs button", has_text="Cookies").click()
+                    page.wait_for_selector("dialog.drawer[open] .ck-row")
+                    drawer = page.locator("dialog.drawer[open]")
+                    assert drawer.locator(".ck-row").count() == len(shop_cookies)
+                    assert drawer.locator(".ck-group").count() == len({c["domain"].lstrip(".") for c in shop_cookies})
+                    session_value = next(c["value"] for c in shop_cookies if c["name"] == "session")
+                    assert session_value not in drawer.inner_text()
+                    lang = cookie_row(drawer, "lang")
+                    lang.get_by_role("button", name="Show the value of lang").click()
+                    assert lang.locator(".ck-val").inner_text() == "en-US"
+                    page.mouse.move(0, 0)
+                    page.wait_for_timeout(300)
+                    shoot(f"drawer-cookies-{theme}")
+                    if theme == "light":
+                        cookie_row(drawer, "remember_me").locator(".ck-name").click()
+                        page.wait_for_selector("dialog.ck-editor[open]")
+                        remember = next(c for c in shop_cookies if c["name"] == "remember_me")
+                        assert page.locator("dialog.ck-editor[open] textarea").input_value() == remember["value"]
+                        page.wait_for_timeout(300)
+                        shoot("dialog-cookie-edit-light")
+                        page.keyboard.press("Escape")  # nothing changed: closes without asking
+                        page.wait_for_selector("dialog.ck-editor", state="detached")
+                        # The import preview: format, cookies, sites and problems (nothing is written yet).
+                        drawer.get_by_role("button", name="Import", exact=True).click()
+                        page.locator("dialog.ck-import[open] textarea").fill(json.dumps([
+                            {"domain": ".example.org", "name": "visitor", "value": "demo", "path": "/"},
+                            {"domain": "news.example.org", "name": "theme", "value": "light", "path": "/",
+                             "expirationDate": time.time() + 86400},
+                            {"name": "no-domain", "value": "x"}]))
+                        page.wait_for_selector("dialog.ck-import[open] .ck-preview .badge.green")
+                        preview = page.locator("dialog.ck-import[open] .ck-preview").inner_text()
+                        assert all(t in preview for t in ("2 cookies", "on 2 sites", "JSON", "1 problem")), preview
+                        page.keyboard.press("Escape")
+                        page.locator("dialog.narrow[open]").get_by_role("button", name="Discard", exact=True).click()
+                        page.wait_for_selector("dialog.ck-import", state="detached")
+                        assert len(jar()) == len(shop_cookies)
                     page.keyboard.press("Escape")
                     page.wait_for_selector("dialog[open]", state="detached")
 
@@ -499,7 +591,80 @@ def test_manager_views_render_without_console_errors(tmp_path: Path, monkeypatch
                 assert alex.chrome_address and alex.chrome_source == "chrome:chrome/Default"
                 alex_card().get_by_role("button", name="Disconnect").click()
                 wait_until(lambda: IdentityStore(store).get(alex.id).chrome_source is None, 10)
+                # Unsaved identity details: its "Used by" link asks before throwing them away.
+                alex_card().locator(".ic-name").click()
+                page.wait_for_selector("dialog.drawer[open] .secret-row")
+                page.locator("dialog.drawer[open] input.input").first.fill("Alex Edited")
+                page.locator("dialog.drawer[open] .titles a").first.click()
+                page.locator("dialog.narrow[open]").get_by_role("button", name="Keep editing").click()
+                assert page.locator("dialog.drawer[open] input.input").first.input_value() == "Alex Edited"
+                discard_with_escape()
+                # A live update keeps a failing proxy's "Details" open.
+                page.evaluate("location.hash = '#/proxies'")
+                failing = page.locator("table.table tbody tr", has_text="jp-tokyo")
+                failing.locator("summary", has_text="Details").click()
+                page.evaluate("async () => (await import('/static/store.js')).notify('proxies')")
+                page.wait_for_timeout(300)
+                assert failing.locator("details[open]").count() == 1
+                # A saved ShardX token can be removed while the integration is off (a fake JWT-shaped token).
+                fake_token = ".".join(["e30", "x" * 12, "y" * 12])
+                page.evaluate("async (t) => { await (await import('/static/api.js')).api.put('/api/settings/shardx-token', { token: t }); }",
+                              fake_token)
+                page.evaluate("location.hash = '#/settings'")
+                page.get_by_role("button", name="Remove", exact=True).click()
+                wait_until(lambda: page.get_by_role("button", name="Remove", exact=True).count() == 0, 10)
                 page.evaluate("location.hash = '#/profiles'")
+                # Unsaved profile settings: opening another profile asks first, never stacking a second drawer.
+                page.locator(".profile-card", has_text="research").locator(".pc-name").click()
+                page.locator("dialog.drawer[open] .drawer-tabs button", has_text="Settings").click()
+                page.locator("dialog.drawer[open] input.input").first.fill("research-edited")
+                page.evaluate("async (id) => (await import('/static/profile-drawer.js')).openProfileDrawer(id)", ids["news-ca"])
+                page.wait_for_selector("dialog.narrow[open]")
+                assert page.locator("dialog.drawer[open]").count() == 1
+                page.locator("dialog.narrow[open]").get_by_role("button", name="Discard", exact=True).click()
+                page.wait_for_selector("dialog.drawer[open][aria-label='Profile news-ca']")
+                page.keyboard.press("Escape")
+                page.wait_for_selector("dialog[open]", state="detached")
+                assert store.get_profile(ids["research"]).name == "research"
+                # Cookies from the card menu. A stopped profile offers to start in the background ...
+                page.locator(".profile-card", has_text="travel-fr").get_by_role("button", name="More actions for travel-fr").click()
+                page.get_by_role("menuitem", name="Cookies…").click()
+                page.wait_for_selector("dialog.drawer[open] .ck-pane .empty")
+                assert page.locator("dialog.drawer[open]").get_by_role("button", name="Start in background").count() == 1
+                page.keyboard.press("Escape")
+                page.wait_for_selector("dialog[open]", state="detached")
+                # ... a running one: add a cookie whose value looks like markup (stored and shown as text) ...
+                page.locator(".profile-card", has_text="shop-us").get_by_role("button", name="More actions for shop-us").click()
+                page.get_by_role("menuitem", name="Cookies…").click()
+                page.wait_for_selector("dialog.drawer[open] .ck-row")
+                drawer = page.locator("dialog.drawer[open]")
+                drawer.get_by_role("button", name="Add", exact=True).click()
+                editor = page.locator("dialog.ck-editor[open]")
+                editor.get_by_label("Name", exact=True).fill("note")
+                editor.locator("textarea").fill("<b>not bold</b>")
+                editor.get_by_label("Domain", exact=True).fill("shop.example.com")
+                editor.get_by_role("button", name="Add cookie").click()
+                page.wait_for_selector("dialog.ck-editor", state="detached")
+                note = cookie_row(drawer, "note")
+                note.get_by_role("button", name="Show the value of note").click()
+                assert note.locator(".ck-val").inner_text() == "<b>not bold</b>" and note.locator("b").count() == 0
+                assert [c["value"] for c in jar() if c["name"] == "note"] == ["<b>not bold</b>"]
+                # ... edit a value (Chrome's exact expiry and the other attributes stay) ...
+                before = next(c for c in jar() if c["name"] == "lang")
+                drawer.get_by_role("button", name="lang", exact=True).click()
+                page.locator("dialog.ck-editor[open] textarea").fill("de-DE")
+                page.locator("dialog.ck-editor[open]").get_by_role("button", name="Save", exact=True).click()
+                page.wait_for_selector("dialog.ck-editor", state="detached")
+                wait_until(lambda: next(c for c in jar() if c["name"] == "lang")["value"] == "de-DE", 10)
+                after = next(c for c in jar() if c["name"] == "lang")
+                assert abs(after["expires"] - before["expires"]) < 0.001
+                assert (after["secure"], after["httpOnly"], after["sameSite"], after["domain"]) == (True, False, "Lax", "accounts.example.net")
+                # ... and delete one from its row menu.
+                note.get_by_role("button", name="More actions for cookie note").click()
+                page.get_by_role("menuitem", name="Delete").click()
+                wait_until(lambda: "note" not in {c["name"] for c in jar()}, 10)
+                page.keyboard.press("Escape")
+                page.wait_for_selector("dialog[open]", state="detached")
                 # The help banner's "I'm done" button resolves the request.
                 page.locator(".help-banner").get_by_role("button", name="I'm done").click()
                 page.wait_for_selector(".help-banner", state="detached", timeout=10000)

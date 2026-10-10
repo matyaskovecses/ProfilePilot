@@ -1,0 +1,81 @@
+name: Release
+
+# Push a tag like v0.1.0 (it must match pyproject.toml and have a CHANGELOG.md section).
+# Builds the wheel, the sdist and the Claude Desktop extension (profilepilot.mcpb), and creates a
+# DRAFT GitHub release with them; publish the draft by hand after a last look.
+# PyPI: opt-in with the repository variable PYPI_PUBLISH=true after adding this workflow as a
+# trusted publisher on pypi.org (environment "pypi"); no token is stored in the repository.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Check the tag against pyproject.toml and CHANGELOG.md
+        env:
+          TAG: ${{ github.ref_name }}
+        run: python scripts/release_notes.py "$TAG" --check > release-notes.md
+      - name: Install
+        run: python -m pip install -e ".[test,scrapling]" build
+      - name: Fast tests (no browser, no network)
+        env:
+          PROFILEPILOT_SECRETS: file
+        run: python -m pytest -m "not chrome and not network" -q
+      - name: Build wheel and sdist
+        run: python -m build
+      - name: Build the Claude Desktop extension
+        run: python scripts/build_mcpb.py --out dist/profilepilot.mcpb
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: |
+            dist/
+            release-notes.md
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" dist/* --draft --verify-tag \
+            --title "ProfilePilot ${TAG#v}" --notes-file release-notes.md
+
+  pypi:
+    needs: build
+    if: vars.PYPI_PUBLISH == 'true'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+      - name: Keep only the Python packages
+        run: rm -f dist/*.mcpb dist/SHA256SUMS
+      - uses: pypa/gh-action-pypi-publish@release/v1

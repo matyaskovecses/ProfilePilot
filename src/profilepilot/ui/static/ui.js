@@ -16,7 +16,7 @@ export function nextId(prefix = "pp") {
  * The toast stays while the pointer or the keyboard focus is on it.
  */
 export function toast(text, { kind = "info", title, timeout, action, details } = {}) {
-  const host = document.getElementById("toasts");
+  const host = toastHost();
   if (!host) return () => {};
   const icons = { success: "check", error: "alert", info: "info", warn: "alert" };
   const kindIcon = icon(icons[kind] || "info", "toast-icon");
@@ -49,6 +49,27 @@ export function toast(text, { kind = "info", title, timeout, action, details } =
   while (host.children.length > 3) host.firstElementChild.remove();
   arm();
   return dismiss;
+}
+
+/**
+ * Where toasts go: the page's #toasts, or while a modal dialog or drawer is open a host inside the
+ * topmost one (everything outside it is inert, so an "Undo" button there could not be clicked). Its
+ * toasts move back to the page when that dialog closes.
+ */
+function toastHost() {
+  const main = document.getElementById("toasts");
+  const top = [...document.querySelectorAll("dialog[open]")].pop();
+  if (!top || !main) return main;
+  let host = top.querySelector(":scope > .toasts");
+  if (!host) {
+    host = h("div.toasts", { attrs: { role: "status", "aria-live": "polite", "aria-atomic": "false" } });
+    top.append(host);
+    top.addEventListener("close", () => {
+      for (const el of [...host.children]) if (!el.classList.contains("leaving")) main.append(el);
+      host.remove();
+    }, { once: true });
+  }
+  return host;
 }
 
 // ------------------------------------------------------------------ dialogs
@@ -202,7 +223,8 @@ export function openMenu(anchor, items) {
     const next = hr.nextElementSibling;
     if (!prev || !next || next.tagName === "HR") hr.remove();
   }
-  document.body.append(menu);
+  // A menu opened from a drawer or dialog lives inside it: the rest of the page is inert while a modal is open.
+  (anchor.closest("dialog[open]") || document.body).append(menu);
   const rect = anchor.getBoundingClientRect();
   const mw = menu.offsetWidth;
   const mh = menu.offsetHeight;
@@ -218,7 +240,7 @@ export function openMenu(anchor, items) {
   const onKey = (event) => {
     const buttons = [...menu.querySelectorAll("button")];
     const index = buttons.indexOf(document.activeElement);
-    if (event.key === "Escape") { event.stopPropagation(); closeMenu(); anchor.focus(); }
+    if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); closeMenu(); anchor.focus(); } // (not the drawer too)
     else if (event.key === "Tab") { event.preventDefault(); closeMenu(); anchor.focus(); }
     else if (event.key === "ArrowDown") { event.preventDefault(); buttons[(index + 1) % buttons.length].focus(); }
     else if (event.key === "ArrowUp") { event.preventDefault(); buttons[(index - 1 + buttons.length) % buttons.length].focus(); }

@@ -6,7 +6,7 @@ import { notifyHelp, renderHelpBanners } from "./help-banner.js";
 import { closeProfileDrawer, openProfileDrawer } from "./profile-drawer.js";
 import {
   loadChatGPT, loadIdentities, loadMeta, loadOverview, loadProxies, loadSettings, loadTrash, markAiActive, notify,
-  proxyTestStarted, removeProfile, setLive, state, subscribe, upsertProfile,
+  proxyTestEnded, proxyTestReset, proxyTestStarted, removeProfile, setLive, state, subscribe, upsertProfile,
 } from "./store.js";
 import { applyTheme, currentTheme, onThemeChange } from "./theme-switch.js";
 import { closeMenu, openDialog, toast } from "./ui.js";
@@ -158,6 +158,7 @@ function show(key) {
 
 function startEvents() {
   let offlineTimer = null;
+  let dropped = false;
   connectEvents({
     activity(e) {
       markAiActive(e);
@@ -191,6 +192,7 @@ function startEvents() {
         state.proxyTesting.clear();
         if (data.cancelled) toast(`Stopped after ${data.done} of ${data.total}.`, { kind: "info", title: "Proxy test stopped" });
         else toast(`${data.ok} of ${data.total} working.`, { kind: data.ok === data.total ? "success" : "warn", title: "Proxy test finished" });
+        proxyTestEnded({ cancelled: !!data.cancelled });
       }
       notify("proxy-test", "proxies");
     },
@@ -199,6 +201,14 @@ function startEvents() {
     clearTimeout(offlineTimer);
     if (live) offlineBanner.classList.add("hidden");
     else offlineTimer = setTimeout(() => { if (!state.live) offlineBanner.classList.remove("hidden"); }, 4000);
+    if (!live) dropped = true;
+    else if (dropped) {
+      dropped = false;
+      // Proxy-test events sent while the stream was down are lost: a missed "finished" would leave the
+      // progress stuck. A job that is still running shows up again with its next event.
+      if (state.proxyTest && !state.proxyTest.finished) proxyTestReset();
+      proxyTestEnded();
+    }
     if (live && state.ready) loadOverview().catch(() => {});
   });
 }

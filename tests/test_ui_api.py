@@ -279,6 +279,12 @@ async def test_profile_crud_and_trash(env) -> None:
         r = await call("POST", f"/api/trash/{trash[0]['trash_id']}/restore")
         assert r.status_code == 200 and r.json()["name"] == "shop-usa"
         await call("DELETE", f"/api/profiles/{p['id']}")
+        confirmed = [t["trash_id"] for t in (await call("GET", "/api/trash")).json()["trash"]]
+        await call("DELETE", f"/api/profiles/{clone.json()['id']}")  # trashed after the user confirmed
+        r = await call("DELETE", "/api/trash", json={"ids": confirmed + ["not-in-trash"]})
+        assert r.json()["removed"] == 1  # only what the confirmation showed
+        assert [t["name"] for t in (await call("GET", "/api/trash")).json()["trash"]] == ["shop-copy"]
+        assert (await call("DELETE", "/api/trash", json={"ids": "all"})).status_code == 400
         assert (await call("DELETE", "/api/trash")).json()["removed"] == 1
         assert (await call("GET", "/api/trash")).json()["trash"] == []
         assert (await call("POST", "/api/trash/..%2F..%2Fx/restore")).status_code in (400, 404)
@@ -788,6 +794,368 @@ async def test_starting_on_an_untested_proxy_checks_it_and_error_pages_are_named
         r = await c.get(f"/api/profiles/{p.id}/screenshot")
         assert r.status_code == 204 and r.headers["x-thumb-state"] == "page-error"
     await env["app"].api.aclose()
+
+
+# ---------------------------------------------------------------------- cookies
+
+COOKIE_SECRET = "c00kie-S3cret-value"
+SOON = int(time.time()) + 86400 * 10
+CHIPS_KEY = {"topLevelSite": "https://top.example", "hasCrossSiteAncestor": False}
+
+
+def jar_cookie(name: str, domain: str = "example.com", path: str = "/", **kw: Any) -> dict[str, Any]:
+    return {"name": name, "value": kw.pop("value", f"{name}-{COOKIE_SECRET}"), "domain": domain, "path": path,
+            "expires": kw.pop("expires", SOON), "secure": kw.pop("secure", True), "httpOnly": kw.pop("httpOnly", False),
+            **kw}
+
+
+class FakeJar:
+    """The live jar behind the cookie routes, in memory: replaces the browser-facing functions of
+    :mod:`profilepilot.browser.cookiejar` (the routes' parsing, validation, keys and views stay real).
+    Chrome's own refusal is played by domain cookies for the public suffix ``.co.uk``."""
+
+    def __init__(self, monkeypatch, cookies: list[dict[str, Any]] = ()) -> None:  # type: ignore[assignment]
+        from profilepilot.browser import cookiejar
+
+        self.cj = cookiejar
+        self.jar: dict[str, dict[str, Any]] = {}
+        self.calls: list[str] = []
+        for c in cookies:
+            self._put(cookiejar.validate_cookie(c))
+        for name in ("list_cookies", "save_cookie", "delete_cookies", "clear_cookies", "import_cookies"):
+            monkeypatch.setattr(cookiejar, name, getattr(self, name))
+
+    def _put(self, valid: dict[str, Any]) -> dict[str, Any]:
+        c = self.cj.normalize_cookie(valid)
+        self.jar[self.cj.cookie_key(c)] = c
+        return c
+
+    @staticmethod
+    def _refused(valid: dict[str, Any]) -> bool:
+        return valid["domain"] == ".co.uk"
+
+    def values(self) -> set[tuple[str, str, str]]:
+        return {(c["name"], c["domain"], c["value"]) for c in self.jar.values()}
+
+    async def list_cookies(self, ws_url: str, *, cdp: Any = None) -> list[dict[str, Any]]:
+        assert ws_url.startswith("ws://127.0.0.1:9/devtools/browser/")
+        self.calls.append("list")
+        return sorted(self.jar.values(), key=lambda c: (c["domain"].lstrip("."), c["name"], c["path"]))
+
+    async def save_cookie(self, ws_url: str, cookie: dict[str, Any], *, replace: str | None = None,
+                          overwrite: bool = False, cdp: Any = None) -> dict[str, Any]:
+        self.calls.append("save")
+        base = None
+        if replace is not None:
+            base = self.jar.get(replace)
+            if base is None:
+                from profilepilot.errors import NotFoundError
+
+                raise NotFoundError("That cookie no longer exists (it expired or was deleted). Refresh the list.")
+        valid = self.cj.validate_cookie(self.cj.merge_cookie(base, cookie))
+        if replace is not None and not overwrite and self.cj.cookie_key(valid) != replace                 and self.cj.cookie_key(valid) in self.jar:
+            label = self.cj.cookie_label(valid)
+            raise self.cj.CookieExistsError(f"There already is a cookie {label}.", existing=label)
+        if self._refused(valid):
+            label = self.cj.cookie_label(valid)
+            raise self.cj.CookieRefusedError(f"Chrome did not store this cookie: {label}.", refused=[label])
+        saved = self._put(valid)
+        if replace is not None and self.cj.cookie_key(saved) != replace:
+            del self.jar[replace]
+        return saved
+
+    async def delete_cookies(self, ws_url: str, keys: Any, *, cdp: Any = None) -> int:
+        self.calls.append("delete")
+        return sum(self.jar.pop(k, None) is not None for k in set(keys))
+
+    async def clear_cookies(self, ws_url: str, *, domain: str | None = None, cdp: Any = None) -> int:
+        from profilepilot.automation.cookies import domain_matches
+
+        self.calls.append("clear")
+        site = self.cj.filter_domain(domain) if domain is not None else None
+        gone = [k for k, c in self.jar.items() if site is None or domain_matches(c["domain"], site)]
+        for k in gone:
+            del self.jar[k]
+        return len(gone)
+
+    async def import_cookies(self, ws_url: str, cookies: Any, *, mode: str = "merge", cdp: Any = None) -> Any:
+        from profilepilot.automation.cookies import domain_matches
+
+        self.calls.append(f"import:{mode}")
+        valid = [self.cj.validate_cookie(c) for c in cookies]
+        refused = [c for c in valid if self._refused(c)]
+        stored = [self._put(c) for c in valid if not self._refused(c)]
+        removed = 0
+        if mode != "merge" and stored:
+            keep = {self.cj.cookie_key(c) for c in stored}
+            sites = {c["domain"].lstrip(".") for c in valid}
+            stale = [k for k, c in self.jar.items() if k not in keep
+                     and (mode == "replace_all" or any(domain_matches(c["domain"], s) for s in sites))]
+            for k in stale:
+                del self.jar[k]
+            removed = len(stale)
+        return self.cj.ImportResult(imported=len(stored), refused=[self.cj.cookie_label(c) for c in refused],
+                                    removed=removed)
+
+
+async def cookie_activity(c: httpx.AsyncClient, profile_id: str) -> list[dict[str, Any]]:
+    events = (await c.get(f"/api/activity?profile={profile_id}")).json()["events"]
+    return [e for e in events if "cookie" in e["tool"]]
+
+
+@pytest.mark.asyncio
+async def test_cookie_routes_need_the_token_and_a_running_profile(env, monkeypatch) -> None:
+    jar = FakeJar(monkeypatch, [jar_cookie("sid")])
+    p = env["store"].create_profile("jar")
+    base = f"/api/profiles/{p.id}/cookies"
+    async with client(env["app"], token=False) as anon:
+        assert (await anon.get(base)).status_code == 401
+        assert (await anon.post("/api/cookies/parse", json={"text": "[]"})).status_code == 401
+        assert (await anon.get(f"{base}/export")).status_code == 401
+    async with client(env["app"]) as c:
+        code = (await c.post("/api/launch-code")).json()["code"]
+        async with client(env["app"], token=False) as anon:
+            sid = (await anon.get(f"/?t={code}")).headers["set-cookie"].split(";")[0].split("=", 1)[1]
+        # Not running: 409 not_running (the UI offers "Start in background"); the browser is never asked.
+        for method, url, body in [("GET", base, None), ("POST", base, {"cookie": jar_cookie("x")}),
+                                  ("DELETE", base, {"all": True}), ("POST", f"{base}/import", {"text": "[]"}),
+                                  ("GET", f"{base}/export", None), ("POST", f"{base}/export", {"format": "json"})]:
+            r = await c.request(method, url, json=body)
+            assert r.status_code == 409 and r.json()["code"] == "not_running", (method, url, r.text)
+        assert jar.calls == []
+        assert (await c.post("/api/cookies/parse", json={"text": "[]"})).status_code == 200  # no profile needed
+        assert (await c.post(f"/api/profiles/{p.id}/start", json={})).status_code == 200
+        assert (await c.get(base)).status_code == 200
+        assert (await c.get("/api/profiles/nope/cookies")).status_code == 404
+    async with client(env["app"], token=False, cookies={f"pp_session_{PORT}": sid}) as browser:
+        assert (await browser.get(base)).json()["total"] == 1  # the Manager page's own session
+        # Changes need the Manager's Origin; cross-site requests are refused even for reads and downloads.
+        assert (await browser.request("DELETE", base, json={"all": True})).status_code == 403
+        assert (await browser.request("DELETE", base, json={"all": True}, headers={"Origin": "http://evil.test"})).status_code == 403
+        assert (await browser.post(f"{base}/import", json={"text": "[]"})).status_code == 403
+        assert (await browser.get(f"{base}/export", headers={"Sec-Fetch-Site": "cross-site"})).status_code == 403
+        assert (await browser.get(base, headers={"Sec-Fetch-Site": "cross-site"})).status_code == 403
+        assert len(jar.jar) == 1
+        r = await browser.request("DELETE", base, json={"all": True}, headers={**ORIGIN, "Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 200 and r.json() == {"deleted": 1}
+
+
+@pytest.mark.asyncio
+async def test_an_edit_that_lands_on_another_cookie_asks_first(env, monkeypatch) -> None:
+    jar = FakeJar(monkeypatch, [jar_cookie("sid", value="host"), jar_cookie("sid", ".example.com", value="wide")])
+    p = env["store"].create_profile("shop")
+    base = f"/api/profiles/{p.id}/cookies"
+    async with client(env["app"]) as c:
+        await c.post(f"/api/profiles/{p.id}/start", json={})
+        host_only = next(v for v in (await c.get(base)).json()["cookies"] if v["host_only"])
+        r = await c.post(base, json={"cookie": {"host_only": False}, "replace": host_only["key"]})
+        assert r.status_code == 409 and r.json()["code"] == "cookie_exists" and "wide" not in r.text
+        assert {v["value"] for v in (await c.get(base)).json()["cookies"]} == {"host", "wide"}  # nothing changed
+        r = await c.post(base, json={"cookie": {"host_only": False}, "replace": host_only["key"], "overwrite": True})
+        assert r.status_code == 200 and r.json()["cookie"]["value"] == "host"
+        assert [v["value"] for v in (await c.get(base)).json()["cookies"]] == ["host"]
+    assert jar.calls.count("save") == 2
+
+
+@pytest.mark.asyncio
+async def test_cookie_list_add_edit_and_delete(env, monkeypatch) -> None:
+    jar = FakeJar(monkeypatch, [jar_cookie("sid", httpOnly=True, sameSite="Lax"), jar_cookie("sid", ".example.com"),
+                                jar_cookie("pref", "shop.example.com", "/app", expires=None, secure=False),
+                                jar_cookie("chips", "widget.example", partitionKey=CHIPS_KEY),
+                                jar_cookie("other", "other.test", value="needle-in-value")])
+    p = env["store"].create_profile("shop")
+    base = f"/api/profiles/{p.id}/cookies"
+    async with client(env["app"]) as c:
+        await c.post(f"/api/profiles/{p.id}/start", json={})
+        listing = (await c.get(base)).json()
+        assert listing["total"] == 5 and len(listing["cookies"]) == 5
+        assert listing["domains"] == [{"domain": "example.com", "count": 2}, {"domain": "other.test", "count": 1},
+                                      {"domain": "shop.example.com", "count": 1}, {"domain": "widget.example", "count": 1}]
+        sid = next(v for v in listing["cookies"] if v["name"] == "sid" and v["host_only"])
+        assert sid["value"] == f"sid-{COOKIE_SECRET}" and sid["http_only"] and sid["same_site"] == "Lax"
+        assert sid["expires"].endswith("Z") and sid["session"] is False and sid["priority"] == "Medium"
+        chips = next(v for v in listing["cookies"] if v["name"] == "chips")
+        assert chips["partitioned"] and chips["partition_site"] == "https://top.example"
+        # Filters: a domain with its subdomains, a substring of name / domain / value; totals stay the jar's.
+        shown = (await c.get(f"{base}?domain=Example.com")).json()
+        assert {(v["name"], v["domain"]) for v in shown["cookies"]} == {("sid", "example.com"), ("sid", ".example.com"),
+                                                                       ("pref", "shop.example.com")}
+        assert shown["total"] == 5 and len(shown["domains"]) == 4
+        assert [v["name"] for v in (await c.get(f"{base}?q=NEEDLE")).json()["cookies"]] == ["other"]
+        assert [v["name"] for v in (await c.get(f"{base}?q=widget")).json()["cookies"]] == ["chips"]
+        assert (await c.get(f"{base}?domain=.")).status_code == 400
+
+        # Add (Add dialog field names), edit (rename keeps everything else), and the errors.
+        r = await c.post(base, json={"cookie": {"name": "new", "value": COOKIE_SECRET, "domain": "example.com",
+                                                "host_only": False, "session": True, "same_site": "Strict",
+                                                "http_only": True, "secure": True}})
+        assert r.status_code == 201, r.text
+        new = r.json()["cookie"]
+        assert (new["domain"], new["session"], new["same_site"], new["http_only"]) == (".example.com", True, "Strict", True)
+        r = await c.post(base, json={"cookie": {"name": "renamed"}, "replace": sid["key"]})
+        assert r.status_code == 200, r.text
+        renamed = r.json()["cookie"]
+        assert renamed["value"] == sid["value"] and renamed["http_only"] and renamed["expires"] == sid["expires"]
+        assert sid["key"] not in jar.jar and renamed["key"] in jar.jar
+        r = await c.post(base, json={"cookie": {"value": "x"}, "replace": sid["key"]})
+        assert r.status_code == 404 and r.json()["code"] == "not_found"
+        r = await c.post(base, json={"cookie": {"name": "bad", "value": COOKIE_SECRET + ";", "domain": "example.com"}})
+        assert r.status_code == 400 and r.json()["code"] == "invalid" and COOKIE_SECRET not in r.text
+        r = await c.post(base, json={"cookie": {"name": "n", "value": "v", "domain": "example.com", "same_site": "None"}})
+        assert r.status_code == 400 and "Secure" in r.json()["error"]
+        r = await c.post(base, json={"cookie": {"name": "n", "value": COOKIE_SECRET, "domain": ".co.uk", "secure": True}})
+        assert r.status_code == 422 and r.json()["code"] == "refused" and COOKIE_SECRET not in r.text
+        assert (await c.post(base, json={"cookie": "sid=1"})).status_code == 400
+        assert (await c.post(base, json={"cookie": {"name": "n"}, "replace": 5})).status_code in (400, 404)
+
+        # Delete: by keys, by domain (with subdomains), everything; exactly one way at a time.
+        r = await c.request("DELETE", base, json={"keys": [renamed["key"], chips["key"], renamed["key"]]})
+        assert r.json() == {"deleted": 2}
+        for body in ({}, {"keys": [renamed["key"]], "all": True}, {"keys": "not-a-list!"}, {"keys": ["%%%"]},
+                     {"all": "yes"}, {"domain": 3.5, "all": True}):
+            r = await c.request("DELETE", base, json=body)
+            assert r.status_code == 400, body
+        r = await c.request("DELETE", base, json={"domain": "example.com"})
+        assert r.json() == {"deleted": 3}  # sid on .example.com, new, pref on shop.example.com
+        assert {name for name, _d, _v in jar.values()} == {"other"}
+        assert (await c.request("DELETE", base, json={"all": True})).json() == {"deleted": 1}
+        assert (await c.request("DELETE", base, json={"all": True})).json() == {"deleted": 0}
+
+        events = await cookie_activity(c, p.id)
+        assert [e["tool"] for e in reversed(events)] == ["add cookie", "edit cookie", "delete cookies", "clear cookies",
+                                                        "clear cookies"]
+        assert all(e["source"] == "ui" and e["ok"] for e in events)
+        assert [e["summary"] for e in reversed(events)] == [
+            "Added cookie 'new' on example.com.", "Edited cookie 'renamed' on example.com.",
+            "Deleted 2 cookies on 2 sites.", "Cleared 3 cookies on example.com.", "Cleared all cookies (1)."]
+        assert not any(COOKIE_SECRET in json.dumps(e) or "needle" in json.dumps(e) for e in events)
+
+
+@pytest.mark.asyncio
+async def test_cookie_import_preview_and_modes(env, monkeypatch) -> None:
+    jar = FakeJar(monkeypatch, [jar_cookie("old", "example.com"), jar_cookie("old", "sub.example.com"),
+                                jar_cookie("keep", "other.test")])
+    p = env["store"].create_profile("importer")
+    base = f"/api/profiles/{p.id}/cookies"
+    text = json.dumps([jar_cookie("new", ".example.com"), {"name": "nodomain", "value": COOKIE_SECRET},
+                       jar_cookie("gone", expires=int(time.time()) - 60), jar_cookie("p", ".co.uk"),
+                       jar_cookie("chips", "widget.example", partitionKey=CHIPS_KEY)])
+    async with client(env["app"]) as c:
+        # Preview: no profile involved, nothing written, problems by position / name - never values.
+        r = await c.post("/api/cookies/parse", json={"text": text})
+        assert r.status_code == 200
+        preview = r.json()
+        assert (preview["format"], preview["count"], preview["skipped"]) == ("json", 3, 2)
+        assert preview["domains"] == [{"domain": "co.uk", "count": 1}, {"domain": "example.com", "count": 1},
+                                      {"domain": "widget.example", "count": 1}]
+        assert len(preview["problems"]) == 2 and preview["problems"][0].startswith("Cookie #2")
+        assert "already expired" in preview["problems"][1] and COOKIE_SECRET not in r.text
+        netscape = (await c.post("/api/cookies/parse", json={"text": ".example.com\tTRUE\t/\tTRUE\t0\ta\tb\n"})).json()
+        assert (netscape["format"], netscape["count"]) == ("netscape", 1)
+        assert (await c.post("/api/cookies/parse", json={"text": text, "format": "json"})).json()["count"] == 3
+        assert (await c.post("/api/cookies/parse", json={"text": text, "format": "xml"})).status_code == 400
+        assert (await c.post("/api/cookies/parse", json={"text": 5})).status_code == 200  # numbers are text, nothing found
+        assert (await c.post("/api/cookies/parse", content=b"x" * (9 * 1024 * 1024))).status_code == 413
+        assert jar.calls == []
+
+        await c.post(f"/api/profiles/{p.id}/start", json={})
+        # merge: everything else stays; Chrome's refusal is reported per cookie.
+        r = await c.post(f"{base}/import", json={"text": text, "mode": "merge"})
+        assert r.status_code == 200, r.text
+        result = r.json()
+        assert (result["imported"], result["skipped"], result["removed"]) == (2, 3, 0)
+        assert result["problems"][-1] == "Chrome did not accept 'p' on co.uk."
+        assert result["domains"] == [{"domain": "example.com", "count": 1}, {"domain": "widget.example", "count": 1}]
+        assert len(jar.jar) == 5
+        # replace: the other cookies of the imported sites go (with their subdomains); other sites stay.
+        r = await c.post(f"{base}/import", json={"text": text, "mode": "replace"})
+        assert r.json()["removed"] == 2
+        assert {(n, d) for n, d, _v in jar.values()} == {("new", ".example.com"), ("chips", "widget.example"),
+                                                         ("keep", "other.test")}
+        # domain: only that domain's cookies of the text; replace_all clears everything else.
+        r = await c.post(f"{base}/import", json={"text": text, "mode": "replace_all", "domain": "widget.example"})
+        assert (r.json()["imported"], r.json()["removed"]) == (1, 2)
+        assert {(n, d) for n, d, _v in jar.values()} == {("chips", "widget.example")}
+        r = await c.post(f"{base}/import", json={"text": text, "domain": "nothing.test"})
+        assert r.status_code == 400 and r.json()["code"] == "nothing_to_import" and "nothing.test" in r.json()["error"]
+        r = await c.post(f"{base}/import", json={"text": "[{oops"})
+        assert r.status_code == 400 and "Invalid JSON" in r.json()["error"]
+        assert (await c.post(f"{base}/import", json={"text": text, "mode": "wipe"})).status_code == 400
+
+        events = await cookie_activity(c, p.id)
+        assert [e["summary"] for e in reversed(events)] == [
+            "Imported 2 cookies on 2 sites.",
+            "Imported 2 cookies on 2 sites, replacing 2 older cookies of those sites.",
+            "Imported 1 cookie on widget.example, replacing all other cookies (2)."]
+        assert not any(COOKIE_SECRET in json.dumps(e) for e in events)
+
+
+@pytest.mark.asyncio
+async def test_cookie_export_headers_and_formats(env, monkeypatch) -> None:
+    FakeJar(monkeypatch, [jar_cookie("sid", httpOnly=True, expires=SOON + 0.704219),
+                          jar_cookie("pref", ".shop.example.com", "/app", expires=None, secure=False),
+                          jar_cookie("chips", "widget.example", partitionKey=CHIPS_KEY, priority="High")])
+    p = env["store"].create_profile("My Shop/1")
+    base = f"/api/profiles/{p.id}/cookies/export"
+    async with client(env["app"]) as c:
+        await c.post(f"/api/profiles/{p.id}/start", json={})
+        r = await c.get(base)
+        assert r.status_code == 200 and r.headers["content-type"].startswith("application/json")
+        disposition = r.headers["content-disposition"]
+        assert disposition.startswith('attachment; filename="cookies-My-Shop-1-') and disposition.endswith('.json"')
+        assert r.headers["cache-control"] == "no-store" and r.headers["x-cookie-count"] == "3"
+        assert r.headers["x-cookies-omitted"] == "0"
+        exported = {x["name"]: x for x in r.json()}
+        assert exported["sid"]["value"] == f"sid-{COOKIE_SECRET}" and exported["sid"]["expires"] == SOON + 0.704219
+        assert exported["chips"]["partitionKey"] == CHIPS_KEY and exported["chips"]["priority"] == "High"
+        assert exported["pref"]["expires"] is None and exported["pref"]["domain"] == ".shop.example.com"
+        # The export imports back as the same cookies.
+        preview = (await c.post("/api/cookies/parse", json={"text": r.text})).json()
+        assert (preview["count"], preview["problems"]) == (3, [])
+
+        r = await c.get(f"{base}?format=netscape")
+        assert r.status_code == 200 and r.headers["content-type"].startswith("text/plain")
+        assert r.headers["content-disposition"].endswith('.txt"')
+        assert r.text.startswith("# Netscape HTTP Cookie File") and "Left out 1 partitioned" in r.text
+        assert "\tchips\t" not in r.text and f"#HttpOnly_example.com\tFALSE\t/\tTRUE\t{SOON}\tsid\t" in r.text
+        assert (r.headers["x-cookie-count"], r.headers["x-cookies-omitted"]) == ("2", "1")
+
+        # The current filter or a selection: ?domain=, ?keys=k1,k2 (GET) or a keys list (POST).
+        r = await c.get(f"{base}?domain=shop.example.com")
+        assert [x["name"] for x in r.json()] == ["pref"]
+        keys = [v["key"] for v in (await c.get(f"/api/profiles/{p.id}/cookies")).json()["cookies"] if v["name"] != "pref"]
+        r = await c.get(f"{base}?keys={','.join(keys)}")
+        assert sorted(x["name"] for x in r.json()) == ["chips", "sid"]
+        r = await c.post(base, json={"format": "netscape", "keys": keys[:1]})  # sid (sorted by site)
+        assert r.status_code == 200 and r.headers["x-cookie-count"] == "1" and "\tsid\t" in r.text
+        assert (await c.get(f"{base}?format=xml")).status_code == 400
+        assert (await c.get(f"{base}?keys=a%2C%2C")).status_code == 200  # empty ids are ignored
+
+        events = await cookie_activity(c, p.id)
+        assert events[-1]["summary"] == "Exported 3 cookies on 3 sites as JSON."
+        assert events[-2]["summary"] == "Exported 2 cookies on 2 sites as cookies.txt."
+        assert not any(COOKIE_SECRET in json.dumps(e) for e in events)
+
+
+@pytest.mark.asyncio
+async def test_start_in_the_background(env) -> None:
+    store: Store = env["store"]
+    async with client(env["app"]) as c:
+        normal = (await c.post("/api/profiles", json={"name": "visible", "window": "normal"})).json()
+        headless = (await c.post("/api/profiles", json={"name": "quiet", "window": "headless"})).json()
+        assert (await c.post(f"/api/profiles/{normal['id']}/start", json={"background": "yes"})).status_code == 400
+        r = await c.post(f"/api/profiles/{normal['id']}/start", json={"background": True})
+        assert r.status_code == 200 and r.json()["runtime"]["window"] == "offscreen"
+        await c.post(f"/api/profiles/{headless['id']}/start", json={"background": True, "window": "normal"})
+        await c.post(f"/api/profiles/{headless['id']}/stop")
+        await c.post(f"/api/profiles/{headless['id']}/start", json={"background": True})
+        assert env["runtime"].started == [(normal["id"], "offscreen"), (headless["id"], "offscreen"),
+                                          (headless["id"], "headless")]
+        assert store.get_profile(normal["id"]).launch.window == "normal"  # for this run only
+        events = (await c.get(f"/api/activity?profile={normal['id']}")).json()["events"]
+        assert events[0]["summary"] == "Started 'visible' in the background (off-screen window)."
+        events = (await c.get(f"/api/activity?profile={headless['id']}")).json()["events"]
+        assert events[0]["summary"] == "Started 'quiet' in the background (headless)."
 
 
 # ---------------------------------------------------------------------- identities linked to browser-saved addresses

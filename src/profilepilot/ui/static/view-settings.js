@@ -76,7 +76,7 @@ export function createSettingsView() {
           render();
         } catch (err) { sxToken.value = ""; toast(err.message, { kind: "error" }); }
       });
-    } }, sxToken, sxSave, sx.token_set ? h("button.btn.sm.ghost", { disabled: !sx.enabled, attrs: { type: "button" }, onclick: async () => {
+    } }, sxToken, sxSave, sx.token_set ? h("button.btn.sm.ghost", { attrs: { type: "button" }, onclick: async () => {
       try { state.settings = await api.del("/api/settings/shardx-token"); render(); toast("ShardX token removed.", { kind: "success" }); }
       catch (err) { toast(err.message, { kind: "error" }); }
     } }, "Remove") : null);
@@ -118,7 +118,8 @@ export function createSettingsView() {
         setting("Desktop notifications", "Get a notification when the AI needs you while this window is in the background.", notifyControl)),
       group("ShardX", "link",
         setting("Use ShardX profiles", "Let the AI use profiles from the ShardX launcher as shardx:<name>.", sxToggle),
-        h("div.setting-group", { class: sx.enabled ? "" : "disabled", attrs: { "aria-disabled": String(!sx.enabled) } },
+        // (no aria-disabled on the group: it would disable "Remove" too, which works while ShardX is off)
+        h("div.setting-group", { class: sx.enabled ? "" : "disabled" },
           setting("Launcher address", sx.enabled ? "Must be on this computer." : "Turn on ShardX profiles to change this.", sxUrl),
           setting("API token", "From ShardX → Settings → Automation API. Write-only: it is never shown again.", sxForm))),
       group("Advanced", "settings",
@@ -133,7 +134,7 @@ export function createSettingsView() {
       items && items.length ? h("button.btn.sm.danger", { attrs: { type: "button" }, onclick: async () => {
         const yes = await confirmDialog({ title: "Empty the trash?", message: `${fmt.plural(items.length, "profile")} and their cookies, logins and history will be deleted permanently. This cannot be undone.`, confirmLabel: "Delete permanently", danger: true });
         if (!yes) return;
-        try { const r = await api.del("/api/trash"); toast(`Deleted ${fmt.plural(r.removed, "profile")} permanently.`, { kind: "success" }); await loadTrash(); }
+        try { const r = await api.del("/api/trash", { ids: items.map((t) => t.trash_id) }); toast(`Deleted ${fmt.plural(r.removed, "profile")} permanently.`, { kind: "success" }); await loadTrash(); }
         catch (err) { toast(err.message, { kind: "error" }); }
       } }, "Empty trash") : null);
     let content;

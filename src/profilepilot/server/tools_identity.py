@@ -374,7 +374,7 @@ class FillSource:
 async def resolve_fill_source(state: AppState, profile: str, identity: str | None,
                               address: str | None) -> tuple[FillSource, dict[str, str] | None]:
     """The identity (or browser source) to fill from, with the browser values already read."""
-    from ..chrome_autofill import is_source_ref, source_values
+    from ..chrome_autofill import discover_sources, is_source_ref, source_values
 
     def browser(ref: str) -> tuple[FillSource, dict[str, str]]:
         prof = None if is_shardx_ref(profile) else state.store.get_profile(profile)
@@ -391,10 +391,14 @@ async def resolve_fill_source(state: AppState, profile: str, identity: str | Non
             ident = resolve_identity_sync(state, profile, identity)
             return FillSource(f"identity '{ident.name}'", ident=ident), None
         except ProfilePilotError as missing:
-            # No identity given or linked: the browser's own saved addresses, when the user allows it.
-            if not is_blank(identity) or not state.store.load_config().autofill_from_browser:
+            # Only a profile with no identity at all falls back to the browser's own saved addresses, when the
+            # user allows it: never a named or linked identity that failed to load (a deleted persona must not
+            # turn into the user's real address), never a ShardX profile (its own antidetect persona).
+            if (not is_blank(identity) or is_shardx_ref(profile) or state.store.get_profile(profile).identity_id
+                    or not state.store.load_config().autofill_from_browser):
                 raise
-            for ref in ("profile", "chrome"):
+            refs = ["profile"] + [s.ref for s in discover_sources() if s.active]
+            for ref in refs:
                 try:
                     return browser(ref)
                 except ProfilePilotError:

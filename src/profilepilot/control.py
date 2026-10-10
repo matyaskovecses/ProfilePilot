@@ -498,13 +498,22 @@ def control_status_lines(control: ControlStore, profile_id: str, *, now: datetim
 
 _CARDISH = re.compile(r"(?<![\d.])(?:\d[ -]?){12,18}\d(?![\d.])")
 _SSN = re.compile(r"(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)")
-_SECRET_NAME = (
-    r"[\w.\-\[\]]*(?:token|secret|passw(?:or)?d|pwd|passcode|api[_-]?key|apikey|access[_-]?key|private[_-]?key|"
-    r"key|code|auth|session|sessid|ticket|sig|otp|jwt|credential|nonce|hash)[\w.\-\[\]]*"
+_SECRET_WORDS = (
+    r"token|secret|passw(?:or)?d|pwd|passcode|api[_-]?key|apikey|access[_-]?key|private[_-]?key|"
+    r"key|code|auth|session|sessid|ticket|sig|otp|jwt|credential|nonce|hash"
 )
-"""Names of URL parameters / JSON fields whose values are masked (any name *containing* one of the words)."""
+_SECRET_NAME = rf"(?=[\w.\-\[\]]*?(?:{_SECRET_WORDS}))[\w.\-\[\]]+"
+"""Names of URL parameters / JSON fields whose values are masked (any name *containing* one of the words).
+The word is found by a lookahead, which never backtracks into the name: ``[...]*(?:words)[...]*``
+retried the tail after every word it found, quadratic in the length of a long page-controlled name."""
 _SECRET_QUERY = re.compile(rf"(?i)([?&#;](?:{_SECRET_NAME}|sid|pass|pw|t|k)=)[^&#\s'\"<>]+")
-_SECRET_FIELD = re.compile(rf"(?i)([\"'](?:{_SECRET_NAME})[\"']\s*:\s*[\"']?)([^\"'\s,;}}\]]+)")
+_SECRET_FIELD = re.compile(
+    rf"(?i)([\"']{_SECRET_NAME}[\"']\s*:\s*)"
+    r"(?:(\")[^\"\\]*(?:\\.[^\"\\]*)*\"?|(')[^'\\]*(?:\\.[^'\\]*)*'?|[^\"'\s,;}\]]+)"
+)
+"""A JSON (or Python dict) field with a secret name. Its whole value is masked: a quoted one up to its
+closing quote (spaces and escaped quotes included, or to the end of a cut-off line), a bare one up to
+the next delimiter."""
 _KNOWN_KEYS = re.compile(
     r"\b(?:(?:AKIA|ASIA|AGPA|AIDA|AROA)[0-9A-Z]{16}|AIza[0-9A-Za-z_\-]{30,}|gh[pousr]_[A-Za-z0-9]{20,}|"
     r"github_pat_[A-Za-z0-9_]{20,}|xox[abposr]-[A-Za-z0-9\-]{10,}|(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{8,}|"
@@ -513,6 +522,24 @@ _KNOWN_KEYS = re.compile(
 """Well-known API key shapes (AWS access key ids, Google, GitHub, Slack, Stripe, OpenAI-style)."""
 _PATH_SEGMENT = re.compile(r"(?<=/)[A-Za-z0-9_\-]{16,}(?=[/?#&\s'\"<>]|$)")
 _LONG_TOKEN = re.compile(r"(?<![A-Za-z0-9_\-])[A-Za-z0-9_\-]{32,}(?![A-Za-z0-9_\-])")
+SCRUB_SCAN_MAX = 2048
+"""How much of a line :func:`scrub_text` scans. It keeps at most ``limit`` characters anyway; the cap
+keeps every pattern it applies (also ``redact_secrets``'s) fast on a long page-controlled tool error,
+which would otherwise hold the GIL and freeze the whole server."""
+
+
+def _mask_field(m: re.Match[str]) -> str:
+    quote = m.group(2) or m.group(3) or ""
+    return f"{m.group(1)}{quote}***{quote}"
+
+
+def _cut(line: str, size: int) -> str:
+    """The first ``size`` characters of ``line`` and an ellipsis, without the word cut in half (nor a run
+    of digit groups before it): it could be the head of a secret too short to be recognised on its own."""
+    head = line[:size]
+    space = head.rfind(" ", size - 64)
+    head = head[:space] if space > 0 else head[: size - 64]
+    return head.rstrip("0123456789 -") + " …"
 
 
 def _opaque(word: str) -> bool:
@@ -558,7 +585,8 @@ def scrub_text(text: Any, *, extra: Iterable[str] = (), redact: Callable[[str], 
     URL parameters (any name containing token, secret, key, code, password, auth, sig, session,
     ticket ...), JSON fields with such names, well-known API key shapes, token-like URL path segments,
     long opaque tokens, card numbers and SSNs are masked, as are the ``extra`` strings (e.g. values a
-    sensitive autofill typed) and whatever ``redact`` replaces."""
+    sensitive autofill typed) and whatever ``redact`` replaces. Only the first :data:`SCRUB_SCAN_MAX`
+    characters are scanned (and kept), so the time stays linear in the length of ``text``."""
     raw = "" if text is None else str(text)
     line = ""
     for candidate in raw.splitlines():
@@ -575,6 +603,8 @@ def scrub_text(text: Any, *, extra: Iterable[str] = (), redact: Callable[[str], 
     for secret in extra:
         if secret and len(secret) >= 4:
             line = line.replace(secret, "[redacted]")
+    if len(line) > SCRUB_SCAN_MAX:
+        line = _cut(line, SCRUB_SCAN_MAX)
     try:
         from .integrations.shardx import redact_secrets
 
@@ -582,7 +612,7 @@ def scrub_text(text: Any, *, extra: Iterable[str] = (), redact: Callable[[str], 
     except Exception:  # pragma: no cover - keep a minimal fallback
         line = re.sub(r"://[^\s/@]*@", "://***@", line)
     line = _SECRET_QUERY.sub(r"\1***", line)
-    line = _SECRET_FIELD.sub(r"\1***", line)
+    line = _SECRET_FIELD.sub(_mask_field, line)
     line = _KNOWN_KEYS.sub("***", line)
 
     def card(m: re.Match[str]) -> str:

@@ -219,7 +219,8 @@ def stopped_message(profile_name: str, tool: str, pause: Any) -> str:
     return f"{tool} was stopped before it finished. " + refusal_message(profile_name, pause)
 
 
-async def run_unless_paused(ctx: Any, tool: str, kwargs: dict[str, Any], call: Callable[[], Awaitable[T]]) -> T:
+async def run_unless_paused(ctx: Any, tool: str, kwargs: dict[str, Any], call: Callable[[], Awaitable[T]], *,
+                            check: Callable[[], Awaitable[None]] | None = None) -> T:
     """Run a tool body (``call()``), cancelling it the moment its profile gets paused.
 
     :func:`enforce_pause` only checks *before* a call. A page tool can run for seconds (humanized
@@ -227,28 +228,36 @@ async def run_unless_paused(ctx: Any, tool: str, kwargs: dict[str, Any], call: C
     profile), the call is cancelled at once - so typing never continues into whatever field the user
     has focused - and :class:`ProfilePausedError` reports it. Only page tools (:data:`GUARDED_PREFIXES`)
     are watched; the check is a ``stat`` of ``control.json`` every :data:`PAUSE_POLL_S` seconds, and the
-    file is only read when it changed."""
-    if not tool.startswith(GUARDED_PREFIXES):
-        return await call()
-    state = _state_of(ctx if ctx is not None else kwargs.get("ctx"))
+    file is only read when it changed (a read that fails is retried at the next poll). A call that
+    finished meanwhile keeps its result.
+
+    ``check`` is the pre-call check (:func:`enforce_pause`). It runs after the watcher noted the file,
+    so a pause written between the two cannot slip through."""
+    state = _state_of(ctx if ctx is not None else kwargs.get("ctx")) if tool.startswith(GUARDED_PREFIXES) else None
     ref = _profile_ref(kwargs)
-    if state is None or ref is None:
-        return await call()
-    try:
-        profile = await run_sync(state.store.get_profile, ref)
-    except Exception:  # unknown / ambiguous: the tool reports it
+    profile = None
+    if state is not None and ref is not None:
+        try:
+            profile = await run_sync(state.store.get_profile, ref)
+        except Exception:  # unknown / ambiguous: the tool reports it
+            pass
+    if profile is None:  # not watched
+        if check is not None:
+            await check()
         return await call()
     control = ControlStore(state.store)
     path = state.store.profile_dir(profile.id) / CONTROL_FILE
 
-    def stamp() -> tuple[int, int] | None:
+    def stamp() -> tuple[int, int, int] | None:
         try:
             st = path.stat()
         except OSError:
             return None
-        return st.st_mtime_ns, st.st_size
+        return st.st_ino, st.st_mtime_ns, st.st_size  # the file id changes with every (atomic) write
 
     seen = stamp()
+    if check is not None:
+        await check()
     task = asyncio.ensure_future(call())
     try:
         while True:
@@ -258,16 +267,20 @@ async def run_unless_paused(ctx: Any, tool: str, kwargs: dict[str, Any], call: C
             now = stamp()
             if now == seen:
                 continue
-            seen = now
             try:
-                pause = await run_sync(lambda: control.state_by_id(profile.id, strict=False).effective)
-            except Exception as exc:  # pragma: no cover - a display-grade read; enforce_pause guards the next call
+                pause = await run_sync(lambda: control.state_by_id(profile.id).effective)
+            except Exception as exc:  # e.g. still locked by its writer: the next poll reads it again
                 log.debug("in-flight pause check failed for %s: %s", tool, exc)
                 continue
+            seen = now
             if pause is None:
                 continue
+            if task.done():  # it finished while the pause was read: its result stands
+                return task.result()
             task.cancel()
             await asyncio.wait({task}, timeout=5)
+            if task.done() and not task.cancelled() and task.exception() is None:
+                return task.result()  # it completed before the cancellation reached it
             log.info("%s on profile %s was stopped: the profile was paused while it ran", tool, profile.id)
             raise ProfilePausedError(stopped_message(profile.name, tool, pause), profile_id=profile.id, pause=pause)
     finally:

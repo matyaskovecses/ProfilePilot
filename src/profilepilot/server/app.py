@@ -515,9 +515,10 @@ def tool_guard(fn: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
         started = time.perf_counter()
         ctx = kwargs.get("ctx")
         try:
-            await enforce_pause(ctx, fn.__name__, kwargs)
-            # A pause that starts while a page tool runs (the user took control) stops the call.
-            result = await run_unless_paused(ctx, fn.__name__, kwargs, lambda: fn(*args, **kwargs))
+            # The pause check runs once the watcher has noted the control file: a pause that starts
+            # before the call is refused, one that starts while a page tool runs stops the call.
+            result = await run_unless_paused(ctx, fn.__name__, kwargs, lambda: fn(*args, **kwargs),
+                                             check=lambda: enforce_pause(ctx, fn.__name__, kwargs))
         except Exception as exc:  # cancellation (a BaseException) passes through untouched
             blocked = is_pause_refusal(exc)
             crash = None if blocked else await _crash_instead(exc, kwargs)

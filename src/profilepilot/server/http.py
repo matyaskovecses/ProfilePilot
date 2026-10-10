@@ -274,13 +274,16 @@ def serve_http(
     log_level: str = "INFO",
     announce: Callable[[str], None] | None = None,
     allow_sensitive_autofill: bool = False,
+    show_pairing_code: bool | None = None,
 ) -> None:
     """Run the remote MCP server until interrupted (blocking).
 
     ``announce`` receives the startup banner with the endpoint URL(s); by default it is written to
     stderr. It contains the secret path / generated token and is shown exactly once. The OAuth
     pairing code is only included when stderr is an interactive terminal (never in a log file or a
-    parent process's pipe; ``profilepilot connect status`` shows it).
+    parent process's pipe; the banner says to run ``profilepilot connect status`` instead), also
+    with ``announce`` (the CLI's writes to stderr). ``show_pairing_code`` overrides that check, for
+    an ``announce`` that writes somewhere else.
     """
     import anyio
     import uvicorn
@@ -290,10 +293,11 @@ def serve_http(
         allow_private=allow_private, i_understand=i_understand, new_secret=new_secret, root=root,
         log_level=log_level, allow_sensitive_autofill=allow_sensitive_autofill,
     )
+    show = _is_terminal(sys.stderr) if show_pairing_code is None else show_pairing_code
     if announce is not None:
-        announce(describe_plan(plan))
+        announce(describe_plan(plan, show_pairing_code=show))
     else:
-        sys.stderr.write(describe_plan(plan, show_pairing_code=_is_terminal(sys.stderr)) + "\n")
+        sys.stderr.write(describe_plan(plan, show_pairing_code=show) + "\n")
         sys.stderr.flush()
     config = uvicorn.Config(
         plan.app, host=host, port=int(port), log_level="warning", access_log=False, lifespan="on",

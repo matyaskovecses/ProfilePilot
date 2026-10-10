@@ -11,6 +11,9 @@ Conventions:
   ``visa •••• 4242``. Proxy usernames are shown masked too.
 * Executable paths and extra Chrome switches cannot be set through this API (a compromised page
   could otherwise make a profile run any program); the CLI keeps those for the user.
+* Cookies (``/api/profiles/{pid}/cookies...``) are the exception to "never returned": the cookie
+  editor shows and exports values (the UI masks them until revealed). They go through the running
+  browser only (:mod:`profilepilot.browser.cookiejar`) and never into Activity entries.
 
 Routes are listed in :meth:`ManagerAPI.routes`; the security layer (token, Host / Origin checks,
 CSP) lives in :mod:`profilepilot.ui.server`.
@@ -43,6 +46,8 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from .. import __version__
+from ..automation import cookies as cookie_utils
+from ..browser import cookiejar
 from ..control import ActivityEvent, ActivityLog, ControlStore
 from ..errors import (
     AmbiguousError,
@@ -100,6 +105,8 @@ HISTORY_KEEP = 24
 TEST_CONCURRENCY = 4
 MAX_BODY = 1024 * 1024
 MAX_IMPORT_BODY = 8 * 1024 * 1024
+MAX_PROBLEMS = 50
+"""At most this many problems are listed for a cookie import (the rest are only counted)."""
 CLIENTS_TTL = 60.0
 BROWSERS_TTL = 300.0
 
@@ -141,6 +148,8 @@ def endpoint(fn: Callable[..., Awaitable[Response]]) -> Callable[..., Awaitable[
                                   "devtools")
         except ProxyParseError:  # the parser may quote its input (with the password)
             return error_response(400, PROXY_FORMAT_HELP, "proxy_format")
+        except cookiejar.CookieRefusedError as exc:  # Chrome itself said no (after our own checks passed)
+            return error_response(422, _scrub(str(exc)), "refused")
         except NotFoundError as exc:
             return error_response(404, _scrub(str(exc)), "not_found")
         except AmbiguousError as exc:
@@ -937,11 +946,16 @@ class ManagerAPI:
 
     @endpoint
     async def start_profile(self, request: Request) -> Response:
+        """``{window?, background?}``: ``background: true`` starts it off-screen for this run (headless
+        if that is the profile's own mode), e.g. to manage its cookies without a window."""
         data = await read_body(request)
         window = data.get("window")
         if window is not None and window not in WINDOW_MODES:
             raise ApiError(400, "window must be normal, offscreen or headless.", "invalid")
+        background = bool(_bool(data, "background"))
         profile = await run(self._resolve, request.path_params["pid"])
+        if background:
+            window = "headless" if (window or profile.launch.window) == "headless" else "offscreen"
         started = time.perf_counter()
         self.hub.publish("profile", {**(await run(self.profile_view, profile)), "state": "starting"})
         try:
@@ -951,8 +965,11 @@ class ManagerAPI:
                       ms=int((time.perf_counter() - started) * 1000))
             await self._publish_profile(profile.id)
             raise
-        await run(self._log, "start", f"Started '{profile.name}'" + (f" ({window} window)." if window else "."),
-                  profile=profile, ms=int((time.perf_counter() - started) * 1000))
+        how = f" ({window} window)." if window else "."
+        if background:
+            how = " in the background" + (" (headless)." if window == "headless" else " (off-screen window).")
+        await run(self._log, "start", f"Started '{profile.name}'{how}", profile=profile,
+                  ms=int((time.perf_counter() - started) * 1000))
         await self._check_untested_proxy(profile)
         return ok(await self._publish_profile(profile.id))
 
@@ -1162,6 +1179,201 @@ class ManagerAPI:
         if not done:
             raise ApiError(404, "That tab is gone.", "not_found")
         return ok()
+
+    # ------------------------------------------------------------------ cookies
+    #
+    # The live jar of a running profile (see profilepilot.browser.cookiejar). Values are part of the
+    # views - this is the user's own UI behind its token - but never of Activity entries. The Manager
+    # is the user, so it may manage the cookies of a paused profile.
+
+    async def _jar(self, request: Request) -> tuple[Profile, str]:
+        """The profile and its browser websocket; 409 ``not_running`` when it is not running."""
+        profile = await run(self._resolve, request.path_params["pid"])
+        info = await self._running_info(profile)
+        return profile, str(info.cdp_ws_url)
+
+    async def _cookies_changed(self, profile: Profile, tool: str, summary: str, started: float) -> None:
+        await run(self._log, tool, summary, profile=profile, ms=int((time.perf_counter() - started) * 1000))
+        await self._publish_profile(profile.id)
+
+    @staticmethod
+    def _cookie_format(data: dict[str, Any]) -> Any:
+        fmt = data.get("format") or None
+        if fmt in (None, "auto"):
+            return None
+        if fmt not in ("json", "netscape"):
+            raise ApiError(400, "format must be json or netscape (cookies.txt).", "invalid")
+        return fmt
+
+    @staticmethod
+    def _cookie_keys(value: Any) -> list[str]:
+        if isinstance(value, str):
+            value = [k for k in value.split(",") if k.strip()]
+        if not isinstance(value, list) or not all(isinstance(k, str) and 0 < len(k) <= cookiejar.MAX_KEY for k in value):
+            raise ApiError(400, "'keys' must be a list of cookie ids.", "invalid")
+        if len(value) > cookiejar.MAX_BATCH:
+            raise ApiError(400, f"Too many cookies at once (at most {cookiejar.MAX_BATCH}).", "invalid")
+        return [k.strip() for k in value]
+
+    @staticmethod
+    def _where(cookies: list[dict[str, Any]]) -> str:
+        """`` on example.com`` / `` on 3 sites`` for Activity summaries."""
+        sites = sorted({str(c.get("domain") or "").lstrip(".") for c in cookies} - {""})
+        if not sites:
+            return ""
+        return f" on {sites[0]}" if len(sites) == 1 else f" on {plural(len(sites), 'site')}"
+
+    @endpoint
+    async def list_cookies(self, request: Request) -> Response:
+        """``?domain=`` (that domain and its subdomains) ``&q=`` (substring of name, domain or value)."""
+        profile, ws_url = await self._jar(request)
+        q = request.query_params
+        domain = (q.get("domain") or "").strip()
+        needle = (q.get("q") or "").strip().casefold()
+        cookies = await cookiejar.list_cookies(ws_url)
+        shown = cookies
+        if domain:
+            site = cookiejar.filter_domain(domain)
+            shown = [c for c in shown if cookie_utils.domain_matches(c["domain"], site)]
+        if needle:
+            shown = [c for c in shown if any(needle in str(c.get(k) or "").casefold() for k in ("name", "domain", "value"))]
+        return ok({"cookies": [cookiejar.cookie_view(c) for c in shown], "domains": cookiejar.domain_counts(cookies),
+                   "total": len(cookies)})
+
+    @endpoint
+    async def save_cookie(self, request: Request) -> Response:
+        """``{cookie, replace?}``: create a cookie, or edit the one whose key is ``replace`` (``cookie``
+        then holds the changed fields; everything else is kept)."""
+        data = await read_body(request)
+        cookie = data.get("cookie")
+        if not isinstance(cookie, dict):
+            raise ApiError(400, "'cookie' must be an object.", "invalid")
+        replace = _str(data, "replace", limit=cookiejar.MAX_KEY) or None
+        overwrite = bool(_bool(data, "overwrite"))
+        profile, ws_url = await self._jar(request)
+        started = time.perf_counter()
+        try:
+            saved = await cookiejar.save_cookie(ws_url, cookie, replace=replace, overwrite=overwrite)
+        except cookiejar.CookieExistsError as exc:  # the page asks, then sends overwrite: true
+            raise ApiError(409, str(exc), "cookie_exists") from None
+        site = str(saved["domain"]).lstrip(".")
+        if replace:
+            await self._cookies_changed(profile, "edit cookie", f"Edited cookie '{saved['name']}' on {site}.", started)
+        else:
+            await self._cookies_changed(profile, "add cookie", f"Added cookie '{saved['name']}' on {site}.", started)
+        return ok({"cookie": cookiejar.cookie_view(saved)}, 200 if replace else 201)
+
+    @endpoint
+    async def delete_cookies(self, request: Request) -> Response:
+        """``{keys: [...]}`` or ``{domain}`` (with its subdomains) or ``{all: true}`` -> ``{deleted}``."""
+        data = await read_body(request, limit=MAX_IMPORT_BODY)  # a large selection of keys
+        keys = self._cookie_keys(data["keys"]) if data.get("keys") is not None else None
+        domain = (_str(data, "domain", limit=300) or "").strip() or None
+        everything = bool(_bool(data, "all"))
+        if sum((keys is not None, domain is not None, everything)) != 1:
+            raise ApiError(400, "Say which cookies to delete: 'keys', a 'domain' or 'all'.", "invalid")
+        targets = [cookiejar.parse_key(k) for k in keys or ()]  # 400 for a malformed key, before connecting
+        profile, ws_url = await self._jar(request)
+        started = time.perf_counter()
+        if keys is not None:
+            try:
+                deleted = await cookiejar.delete_cookies(ws_url, keys)
+            except cookiejar.CookieRefusedError as exc:  # some went: record what changed, then report
+                if exc.done:
+                    await self._cookies_changed(profile, "delete cookies", f"Deleted {plural(exc.done, 'cookie')}; "
+                                                f"{plural(len(exc.refused), 'cookie')} could not be deleted.", started)
+                raise
+            summary = f"Deleted {plural(deleted, 'cookie')}{self._where(targets)}."
+            tool = "delete cookies"
+        elif domain is not None:
+            deleted = await cookiejar.clear_cookies(ws_url, domain=domain)
+            summary = f"Cleared {plural(deleted, 'cookie')} on {cookiejar.filter_domain(domain)}."
+            tool = "clear cookies"
+        else:
+            deleted = await cookiejar.clear_cookies(ws_url)
+            summary = f"Cleared all cookies ({deleted})."
+            tool = "clear cookies"
+        if deleted:
+            await self._cookies_changed(profile, tool, summary, started)
+        return ok({"deleted": deleted})
+
+    @endpoint
+    async def parse_cookies(self, request: Request) -> Response:
+        """``{text, format?}`` -> a preview of an import (no profile needed, nothing is written)."""
+        data = await read_body(request, limit=MAX_IMPORT_BODY)
+        text = _str(data, "text", limit=MAX_IMPORT_BODY) or ""
+        parsed = await run(cookiejar.parse_import, text, self._cookie_format(data))
+        return ok({"format": parsed.format, "count": len(parsed.cookies), "skipped": parsed.skipped,
+                   "domains": cookiejar.domain_counts(parsed.cookies), "problems": parsed.problems[:MAX_PROBLEMS]})
+
+    @endpoint
+    async def import_cookies(self, request: Request) -> Response:
+        """``{text, format?, mode: merge | replace | replace_all, domain?}``. ``replace`` also deletes the
+        other cookies of the imported sites, ``replace_all`` every other cookie (both only after the
+        new ones were written)."""
+        data = await read_body(request, limit=MAX_IMPORT_BODY)
+        text = _str(data, "text", limit=MAX_IMPORT_BODY) or ""
+        mode = data.get("mode") or "merge"
+        if mode not in ("merge", "replace", "replace_all"):
+            raise ApiError(400, "mode must be merge, replace or replace_all.", "invalid")
+        domain = (_str(data, "domain", limit=300) or "").strip() or None
+        fmt = self._cookie_format(data)
+        profile, ws_url = await self._jar(request)
+        parsed = await run(partial(cookiejar.parse_import, text, fmt, domain=domain))
+        if not parsed.cookies:
+            detail = f" for {domain}." if domain else (f": {parsed.problems[0]}" if parsed.problems else ".")
+            raise ApiError(400, f"No cookies to import{detail}", "nothing_to_import")
+        started = time.perf_counter()
+        result = await cookiejar.import_cookies(ws_url, parsed.cookies, mode=mode)
+        problems = parsed.problems + [f"Chrome did not accept {label}." for label in result.refused] + \
+            [f"Could not delete the older cookie {label}." for label in result.not_removed]
+        refused = set(result.refused)
+        imported = [c for c in parsed.cookies if cookiejar.cookie_label(c) not in refused]
+        summary = f"Imported {plural(result.imported, 'cookie')}{self._where(imported)}"
+        if mode == "replace":
+            summary += f", replacing {plural(result.removed, 'older cookie')} of those sites"
+        elif mode == "replace_all":
+            summary += f", replacing all other cookies ({result.removed})"
+        if result.imported or result.removed:
+            await self._cookies_changed(profile, "import cookies", summary + ".", started)
+        return ok({"imported": result.imported, "skipped": parsed.skipped + len(result.refused),
+                   "removed": result.removed, "problems": problems[:MAX_PROBLEMS],
+                   "domains": cookiejar.domain_counts(imported)})
+
+    @endpoint
+    async def export_cookies(self, request: Request) -> Response:
+        """GET ``?format=json|netscape&domain=&keys=k1,k2`` or POST ``{format, domain?, keys?: [...]}``
+        (for long selections) -> the file, as an attachment."""
+        if request.method == "POST":
+            data = await read_body(request, limit=MAX_IMPORT_BODY)
+        else:
+            data = dict(request.query_params)
+        fmt = self._cookie_format(data) or "json"
+        domain = (_str(data, "domain", limit=300) or "").strip() or None
+        keys = set(self._cookie_keys(data["keys"])) if data.get("keys") else None
+        profile, ws_url = await self._jar(request)
+        cookies = await cookiejar.list_cookies(ws_url)
+        if domain:
+            site = cookiejar.filter_domain(domain)
+            cookies = [c for c in cookies if cookie_utils.domain_matches(c["domain"], site)]
+        if keys is not None:
+            cookies = [c for c in cookies if cookiejar.cookie_key(c) in keys]
+        # Left out: cookies partitioned for an opaque site (they cannot be set again anywhere) and, in
+        # cookies.txt, partitioned cookies (no column for the partition; the file says so).
+        exportable = [c for c in cookies if not c.get("partitionKeyOpaque")]
+        written = [c for c in exportable if fmt == "json" or not cookie_utils.partition_site(c)]
+        body = await run(partial(cookie_utils.dumps_cookies, exportable, fmt, skip_partitioned=True, exact_expiry=True))
+        count, omitted = len(written), len(cookies) - len(written)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", profile.name).strip("-.") or profile.id
+        filename = f"cookies-{slug}-{stamp}.{'txt' if fmt == 'netscape' else 'json'}"
+        what = "cookies.txt" if fmt == "netscape" else "JSON"
+        await run(self._log, "export cookies", f"Exported {plural(count, 'cookie')}{self._where(written)} as {what}.",
+                  profile=profile)
+        return Response(body.encode("utf-8"), media_type="text/plain" if fmt == "netscape" else "application/json",
+                        headers={"Content-Disposition": f'attachment; filename="{filename}"',
+                                 "Cache-Control": "no-store", "X-Cookie-Count": str(count),
+                                 "X-Cookies-Omitted": str(omitted)})
 
     # ------------------------------------------------------------------ proxies
 
@@ -1643,7 +1855,15 @@ class ManagerAPI:
 
     @endpoint
     async def empty_trash(self, request: Request) -> Response:
-        removed = await run(partial(self.store.purge_trash, 0))
+        """``{ids: [...]}`` deletes exactly the entries the user confirmed; no body empties the whole trash."""
+        data = await read_body(request)
+        ids = data.get("ids")
+        if ids is not None:
+            if not isinstance(ids, list) or len(ids) > 10000 or not all(isinstance(i, str) for i in ids):
+                raise ApiError(400, "'ids' must be a list of trash ids.", "invalid")
+            removed = await run(self.store.purge_trash_entries, ids)
+        else:
+            removed = await run(partial(self.store.purge_trash, 0))
         await run(self._log, "empty trash", f"Permanently deleted {plural(removed, 'profile')} from the trash.")
         self.hub.publish("trash", {})
         return ok({"removed": removed})
@@ -1940,6 +2160,12 @@ class ManagerAPI:
             r("/api/profiles/{pid}/screenshot", self.screenshot, methods=["GET"]),
             r("/api/profiles/{pid}/tabs", self.tabs, methods=["GET"]),
             r("/api/profiles/{pid}/tabs/{target}/{action}", self.tab_action, methods=["POST"]),
+            r("/api/profiles/{pid}/cookies", self.list_cookies, methods=["GET"]),
+            r("/api/profiles/{pid}/cookies", self.save_cookie, methods=["POST"]),
+            r("/api/profiles/{pid}/cookies", self.delete_cookies, methods=["DELETE"]),
+            r("/api/profiles/{pid}/cookies/import", self.import_cookies, methods=["POST"]),
+            r("/api/profiles/{pid}/cookies/export", self.export_cookies, methods=["GET", "POST"]),
+            r("/api/cookies/parse", self.parse_cookies, methods=["POST"]),
             r("/api/proxies", self.list_proxies, methods=["GET"]),
             r("/api/proxies", self.add_proxies, methods=["POST"]),
             r("/api/proxies/parse", self.parse_proxies, methods=["POST"]),

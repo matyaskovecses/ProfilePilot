@@ -25,6 +25,19 @@
 - **Browser-saved addresses:** autofill can use the addresses you saved in Chrome, Edge or Brave (`identity="chrome"`, `autofill_sources`, `profilepilot identity connect-chrome`). They're read live and read-only, and only names, email, phone, company and address; cards, passwords and form history are never opened.
 - **ShardX backend (optional):** drive ShardX/ShardBrowser profiles with the same tools.
 
+### Cookie manager
+- **In ProfilePilot Manager:** a Cookies tab for every profile. Cookies are grouped by site with search, masked values
+  you can reveal or copy, and an editor for every attribute, including host-only vs domain cookies, expiry,
+  SameSite and partitioned (CHIPS) cookies.
+  - Import Cookie-Editor / EditThisCookie JSON, Playwright storage state or `cookies.txt` with a preview: merge,
+    replace those sites, or replace everything.
+  - Export all cookies, a filter or a selection as JSON or `cookies.txt`.
+- **On the command line:** `profilepilot cookies list | export | import | set | delete`. A stopped profile is started
+  off-screen for the command and stopped again.
+- **Exact and invisible:** every attribute round-trips, a single cookie is deleted without touching its host-only or
+  other-path twins, and only browser-level DevTools commands are used, so pages cannot notice.
+- The AI's cookie tools are unchanged: it still never sees cookie values.
+
 ### ProfilePilot Manager and human handoff
 - **ProfilePilot Manager** (`profilepilot ui`) is a local app window for profiles, proxies, identities, activity and connections.
   - **Profiles:** live thumbnails, start/stop/focus, and opening a page in a profile.

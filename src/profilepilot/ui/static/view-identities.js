@@ -154,6 +154,7 @@ export function connectBrowserDialog(ident, { onChange } = {}) {
   const recheck = h("button.btn", { attrs: { type: "button" } }, icon("refresh"), "Check again");
   const group = nextId("src");
   let choices = [];
+  let loads = 0;
 
   function option(value, title, sub, checked) {
     const input = h("input", { type: "radio", checked, attrs: { name: group } });
@@ -162,6 +163,7 @@ export function connectBrowserDialog(ident, { onChange } = {}) {
   }
 
   async function load() {
+    const seq = ++loads;
     replace(list, h("div.skeleton.skeleton-line"), h("div.skeleton.skeleton-line"));
     connect.disabled = true;
     choices = [];
@@ -169,9 +171,12 @@ export function connectBrowserDialog(ident, { onChange } = {}) {
     try {
       sources = (await api.get("/api/autofill/sources")).sources;
     } catch (err) {
-      replace(list, h("div.callout.warn", icon("alert"), h("span", err.message)));
+      if (seq === loads) replace(list, h("div.callout.warn", icon("alert"), h("span", err.message)));
       return;
     }
+    // "Check again" while loading: only the newest answer fills the list (and `choices`), so Connect
+    // links the address shown as selected.
+    if (seq !== loads) return;
     const usable = sources.filter((s) => s.addresses.length);
     if (!usable.length) {
       replace(list, emptyState({
@@ -361,11 +366,17 @@ export function openIdentityDrawer(id) {
     unsaved.classList.toggle("hidden", !dirty);
   }
 
+  /** A "Used by" link leaves the drawer like its close button: unsaved details ask "Discard changes?" first. */
+  async function openUser(profileId) {
+    await drawer.close();
+    if (!drawer.el.open) openProfileDrawer(profileId);
+  }
+
   function headerRender() {
     title.textContent = ident.name;
     replace(avatarHost, avatar(ident.name, "md", ident.id));
     const used = ident.used_by || [];
-    replace(sub, used.length ? h("span", "Used by ", used.map((u, i) => [i ? ", " : "", h("a", { href: "#/profiles", onclick: (e) => { e.preventDefault(); drawer.forceClose(); openProfileDrawer(u.id); } }, u.name)])) : "Not linked to a profile (link it in a profile's settings)");
+    replace(sub, used.length ? h("span", "Used by ", used.map((u, i) => [i ? ", " : "", h("a", { href: "#/profiles", onclick: (e) => { e.preventDefault(); openUser(u.id); } }, u.name)])) : "Not linked to a profile (link it in a profile's settings)");
   }
 
   function plainControl(f) {

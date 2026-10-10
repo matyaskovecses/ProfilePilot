@@ -16,6 +16,8 @@ from profilepilot.automation.cookies import (
     filter_cookies,
     from_cookiejar,
     load_cookie_file,
+    partition_site,
+    parse_cookies_report,
     parse_cookies_text,
     parse_json_cookies,
     parse_netscape,
@@ -219,3 +221,67 @@ def test_domain_filtering():
     assert not domain_matches("example.org", "")
     assert [c["name"] for c in filter_cookies(PW_COOKIES, domain="example.org")] == ["pref"]
     assert len(filter_cookies(PW_COOKIES)) == 3
+
+
+# ---------------------------------------------------------------------- Chrome's extra attributes
+
+
+CHIPS = {"name": "chips", "value": "c", "domain": "widget.example", "path": "/", "expires": FUTURE + 0.704219,
+         "httpOnly": False, "secure": True, "sameSite": "None", "priority": "High", "sourceScheme": "Secure",
+         "sourcePort": 8443, "partitionKey": {"topLevelSite": "https://top.example", "hasCrossSiteAncestor": True}}
+
+
+def test_partition_priority_and_source_pass_through():
+    c = to_portable(CHIPS)
+    assert c["partitionKey"] == CHIPS["partitionKey"] and c["priority"] == "High"
+    assert (c["sourceScheme"], c["sourcePort"], c["expires"]) == ("Secure", 8443, FUTURE)  # whole seconds by default
+    assert to_portable(CHIPS, exact_expiry=True)["expires"] == FUTURE + 0.704219
+    assert partition_site(c) == "https://top.example" and partition_site(PW_COOKIES[0]) is None
+    # Playwright's storage_state: the site as a string, Chrome's cross-site bit next to it.
+    pw = dict(CHIPS, partitionKey="https://top.example", _crHasCrossSiteAncestor=False)
+    assert to_portable(pw)["partitionKey"] == {"topLevelSite": "https://top.example", "hasCrossSiteAncestor": False}
+    assert to_portable(dict(pw, _crHasCrossSiteAncestor=None))["partitionKey"] == "https://top.example"
+    assert to_playwright(CHIPS)["partitionKey"] == "https://top.example"  # Playwright takes the site only
+    # Malformed extras are dropped, like an unknown SameSite.
+    odd = to_portable(dict(CHIPS, priority="urgent", sourceScheme="ftp", sourcePort=70000, partitionKey={"x": 1}))
+    assert not {"priority", "sourceScheme", "sourcePort", "partitionKey"} & set(odd)
+    assert "priority" not in to_portable(PW_COOKIES[0])  # plain cookies keep the plain shape
+
+
+def test_exact_expiry_only_on_request():
+    assert to_portable({**PW_COOKIES[0], "expires": "2030-01-01T00:00:00.250Z"})["expires"] == 1893456000
+    assert to_portable({**PW_COOKIES[0], "expires": "2030-01-01T00:00:00.250Z"}, exact_expiry=True)["expires"] == 1893456000.25
+    assert json.loads(dumps_cookies([CHIPS], "json"))[0]["expires"] == FUTURE
+    exact = json.loads(dumps_cookies([CHIPS], "json", exact_expiry=True))[0]
+    assert exact["expires"] == FUTURE + 0.704219 and exact["partitionKey"] == CHIPS["partitionKey"]
+    assert f"\t{FUTURE}\tchips\t" in to_netscape([CHIPS])  # cookies.txt: whole seconds
+
+
+def test_netscape_can_leave_partitioned_cookies_out():
+    text = to_netscape([CHIPS, PW_COOKIES[0]], skip_partitioned=True)
+    assert "Left out 1 partitioned" in text and "\tchips\t" not in text and "\tsid\t" in text
+    assert "Left out" not in to_netscape([PW_COOKIES[0]], skip_partitioned=True)
+    assert "\tchips\t" in to_netscape([CHIPS])  # by default written like any other cookie
+    assert dumps_cookies([CHIPS, PW_COOKIES[0]], "netscape", skip_partitioned=True) == text
+
+
+def test_export_file_passes_the_options_through(tmp_path):
+    path = export_cookies([CHIPS, PW_COOKIES[0]], tmp_path / "c.txt", skip_partitioned=True)
+    assert "Left out 1 partitioned" in path.read_text(encoding="utf-8")
+    path = export_cookies([CHIPS], tmp_path / "c.json", exact_expiry=True)
+    assert json.loads(path.read_text(encoding="utf-8"))[0]["expires"] == FUTURE + 0.704219
+
+
+def test_parse_report_skips_bad_entries_without_quoting_them():
+    secret = "do-not-echo-me"
+    data = [PW_COOKIES[0], {"name": "x", "value": secret}, "junk", CHIPS]
+    fmt, cookies, problems = parse_cookies_report(json.dumps({"cookies": data}))
+    assert fmt == "json" and [c["name"] for c in cookies] == ["sid", "chips"]
+    assert cookies[1]["expires"] == FUTURE + 0.704219  # an export imports back exactly
+    assert [p.split(":")[0] for p in problems] == ["Cookie #2", "Cookie #3"] and secret not in " ".join(problems)
+    fmt, cookies, problems = parse_cookies_report(to_netscape(PW_COOKIES) + f"broken\t{secret}\n")
+    assert fmt == "netscape" and len(cookies) == 3 and problems == ["cookies.txt line 7: expected 7 tab-separated fields, got 2."]
+    assert parse_cookies_report("[{oops")[1:] == ([], ["Invalid JSON: Expecting property name enclosed in double quotes (line 1)."])
+    assert parse_cookies_report('{"no": "cookies"}')[2][0].startswith("JSON cookie data must be")
+    with pytest.raises(CookieFormatError, match="Unknown cookie format"):
+        parse_cookies_report("x", "xml")  # type: ignore[arg-type]

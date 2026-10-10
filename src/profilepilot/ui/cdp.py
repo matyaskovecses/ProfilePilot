@@ -4,7 +4,9 @@ Everything here speaks plain CDP over the profile browser's own websocket and HT
 never sends ``Runtime.enable``, ``Page.enable`` or any other domain-enabling command, and never
 evaluates script: a page cannot notice that the Manager looked at it. A thumbnail attaches a
 short-lived flat session to one page target, asks ``Page.getLayoutMetrics`` and
-``Page.captureScreenshot`` (JPEG, scaled to ~480 px wide) and detaches again.
+``Page.captureScreenshot`` (JPEG, scaled to ~480 px wide) and detaches again. The websocket client
+(:class:`CdpConnection`, :func:`browser_connection`, :class:`CdpError`) lives in
+:mod:`profilepilot.browser.devtools` and is re-exported here.
 
 Window focus is only ever done on the user's request (the Focus button): it restores a minimized
 window, moves an off-screen window on-screen and brings it to the front (Windows: Win32
@@ -13,17 +15,16 @@ window, moves an off-screen window on-screen and brings it to the front (Windows
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import contextlib
-import itertools
-import json
 import logging
 import subprocess
 import sys
-from typing import Any, AsyncIterator
+from typing import Any
 
 import httpx
+
+from ..browser.devtools import CdpConnection, CdpError, browser_connection
 
 log = logging.getLogger("profilepilot.ui.cdp")
 
@@ -31,10 +32,6 @@ THUMB_WIDTH = 480
 THUMB_QUALITY = 60
 OFFSCREEN_LIMIT = -5000
 """Windows placed further left/up than this are off-screen (``--window-position=-32000,-32000``)."""
-
-
-class CdpError(Exception):
-    """A DevTools call failed (``message`` is Chrome's error text or a timeout)."""
 
 
 class ThumbnailUnavailable(CdpError):
@@ -88,65 +85,6 @@ async def activate_target(port: int, target_id: str) -> bool:
 async def close_target(port: int, target_id: str) -> bool:
     """Close the tab ``target_id`` (``/json/close``)."""
     return await _target_endpoint(port, "close", target_id)
-
-
-# --------------------------------------------------------------------------- websocket client
-
-
-class CdpConnection:
-    """A tiny CDP client on the browser websocket (flat sessions; events are ignored)."""
-
-    def __init__(self, ws: Any) -> None:
-        self._ws = ws
-        self._ids = itertools.count(1)
-        self.sent: list[str] = []
-        """Methods sent so far (tests assert that nothing enables a domain)."""
-
-    async def call(self, method: str, params: dict[str, Any] | None = None, *, session_id: str | None = None,
-                   timeout: float = 5.0) -> dict[str, Any]:
-        msg_id = next(self._ids)
-        message: dict[str, Any] = {"id": msg_id, "method": method, "params": params or {}}
-        if session_id:
-            message["sessionId"] = session_id
-        self.sent.append(method)
-        await self._ws.send(json.dumps(message))
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
-        while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                raise CdpError(f"{method} timed out")
-            try:
-                raw = await asyncio.wait_for(self._ws.recv(), remaining)
-            except asyncio.TimeoutError:
-                raise CdpError(f"{method} timed out") from None
-            try:
-                data = json.loads(raw)
-            except (TypeError, ValueError):
-                continue
-            if data.get("id") != msg_id:
-                continue
-            if "error" in data:
-                error = data["error"]
-                raise CdpError(str(error.get("message") if isinstance(error, dict) else error))
-            result = data.get("result")
-            return result if isinstance(result, dict) else {}
-
-
-@contextlib.asynccontextmanager
-async def browser_connection(ws_url: str, *, timeout: float = 3.0) -> AsyncIterator[CdpConnection]:
-    """Connect to a browser websocket (``RuntimeInfo.cdp_ws_url``); never through a proxy."""
-    from websockets.asyncio.client import connect
-
-    try:
-        ws = await connect(ws_url, proxy=None, open_timeout=timeout, close_timeout=1, max_size=None)
-    except Exception as exc:
-        raise CdpError(f"could not connect to the browser ({type(exc).__name__})") from None
-    try:
-        yield CdpConnection(ws)
-    finally:
-        with contextlib.suppress(Exception):
-            await ws.close()
 
 
 async def _window_of(cdp: CdpConnection, target_id: str) -> dict[str, Any] | None:

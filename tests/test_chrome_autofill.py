@@ -349,12 +349,38 @@ async def test_fill_source_resolution(home, browsers):
     source, values = await resolve_fill_source(state, "p", None, None)
     assert source.ident is not None and source.ident.name == "Ada" and values is None
 
+    IdentityStore(home).delete("Ada")  # a deleted persona must never turn into the user's real address
+    with pytest.raises(ProfilePilotError, match="no longer exists"):
+        await resolve_fill_source(state, "p", None, None)
+    with pytest.raises(ProfilePilotError, match="ShardX profiles have no linked identity"):
+        await resolve_fill_source(state, "shardx:x", None, None)  # their own persona, never the local Chrome
+
     home.update_profile("p", identity_id=None)
     config = home.load_config()
     config.autofill_from_browser = False
     home.save_config(config)
     with pytest.raises(ProfilePilotError, match="has no linked identity"):
         await resolve_fill_source(state, "p", None, None)
+
+
+@pytest.mark.asyncio
+async def test_fallback_tries_every_browsers_active_profile(home, tmp_path, monkeypatch):
+    chrome = make_browser(tmp_path / "c", {"Default": ("Empty", [])}, "Default")  # active Chrome: nothing saved
+    edge = make_browser(tmp_path / "e", {"Default": ("Work", [BOB])}, "Default")
+    monkeypatch.setattr(chrome_autofill, "_user_data_dirs", lambda: {"chrome": chrome, "edge": edge})
+    home.create_profile("p")
+    source, values = await resolve_fill_source(type("State", (), {"store": home})(), "p", None, None)
+    assert source.browser_ref == "chrome:edge/Default" and values["city"] == "Berlin"
+
+
+def test_identity_names_cannot_shadow_browser_sources(home):
+    ids = IdentityStore(home)
+    for name in ("chrome", "Profile", "chrome:edge", " CHROME "):
+        with pytest.raises(ProfilePilotError, match="reserved for the browser's saved addresses"):
+            ids.create(name)
+    ids.create("Chromebook")  # only the exact source names are reserved
+    with pytest.raises(ProfilePilotError, match="reserved"):
+        ids.update("Chromebook", name="profile")
 
 
 @pytest.mark.asyncio
@@ -426,6 +452,9 @@ def test_cli_lists_links_and_imports_browser_addresses(tmp_path, monkeypatch):
     assert "linked browser: Google Chrome profile 'Me' (active): " + ADA_SUMMARY in cli("identity", "show", "Ada").stdout
     refused = cli("identity", "connect-chrome", "Ada", "--source", "profile", ok=False)
     assert "not to 'profile'" in refused.stderr
+    failed = cli("identity", "connect-chrome", "Ghost", "--create", "--address", "7", ok=False)
+    assert "pick 1-2" in failed.stderr
+    assert "Ghost" not in cli("identity", "list").stdout  # no empty identity left behind
     cli("identity", "disconnect-chrome", "Ada")
     assert "linked browser" not in cli("identity", "show", "Ada").stdout
 
@@ -433,6 +462,13 @@ def test_cli_lists_links_and_imports_browser_addresses(tmp_path, monkeypatch):
     assert "Created identity 'Bob' from Google Chrome profile 'Me' (active) (Bob Example - Berlin, DE)" in out
     bob = IdentityStore(Store(cli.home)).get("Bob")  # type: ignore[attr-defined]
     assert bob.values["street"] == "Teststrasse 1" and bob.chrome_source is None  # a snapshot, not a link
+    # importing another address into it replaces the whole name and address: no Bob-Ada mix
+    cli("identity", "set", "Bob", "middle_name=Q", "state=Berlin", "birth_date=1990-01-01")
+    out = cli("identity", "import-chrome", "Bob", "--address", "1").stdout
+    assert "Updated identity 'Bob'" in out
+    bob = IdentityStore(Store(cli.home)).get("Bob")  # type: ignore[attr-defined]
+    assert (bob.values["first_name"], bob.values["street"], bob.values["state"]) == ("Ada", "12 Example Street", "AZ")
+    assert "middle_name" not in bob.values and bob.values["birth_date"] == "1990-01-01"  # other fields stay
     assert not any(FAKE_CARD in text or FORM_HISTORY in text for text in cli.history)  # type: ignore[attr-defined]
 
 

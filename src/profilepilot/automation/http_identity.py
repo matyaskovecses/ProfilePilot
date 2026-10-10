@@ -360,7 +360,7 @@ async def read_http_identity(ws_url: str | None) -> HttpIdentity | None:
     context could be read."""
     if not ws_url:
         return None
-    from ..ui.cdp import browser_connection  # the plain CDP client (flat sessions, no domain enabling)
+    from ..browser.devtools import browser_connection  # the plain CDP client (flat sessions, no domain enabling)
 
     try:
         async with browser_connection(ws_url) as cdp:

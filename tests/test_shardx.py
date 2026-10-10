@@ -491,3 +491,21 @@ async def test_async_client(fake):
         assert cdp["http_url"].startswith("http://127.0.0.1:")
         assert [r["profile_id"] for r in await c.running()] == [pid]
         assert await c.stop(pid) is True
+
+
+def test_redact_secrets_stays_fast_on_long_page_controlled_text():
+    from profilepilot.integrations.shardx import REDACT_MAX
+
+    # each of these made a pattern backtrack quadratically (minutes at 200 KB)
+    for unit in ("!", "ab.", "eyJ-", "a:", "x@"):
+        text = unit * (200_000 // len(unit))
+        started = time.perf_counter()
+        out = redact_secrets(text)
+        assert time.perf_counter() - started < 1.0, unit
+        assert len(out) <= REDACT_MAX + 20
+    # a secret that the cut falls into is dropped whole, never half-kept
+    secret = "proxyuser:" + "S3cretPassw0rd" * 2 + "@gate.example.test"
+    text = "x " * ((REDACT_MAX - 10) // 2) + secret + " tail"
+    out = redact_secrets(text)
+    assert out.endswith("[truncated]") and "S3cret" not in out and "proxyuser" not in out
+    assert redact_secrets("short socks5://u:p@h:1080 text") == "short socks5://***:***@h:1080 text"

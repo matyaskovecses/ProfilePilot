@@ -5,7 +5,8 @@ import { avatar, fmt, h, hue, icon, replace } from "./dom.js";
 import { BROWSER_LABELS, cloneDialog, confirmDelete, newProfileDialog } from "./profile-dialogs.js";
 import { openProfileDrawer } from "./profile-drawer.js";
 import {
-  actions, aiActivity, displayStatus, loadClients, loadProfiles, profileList, profilesByPriority, proxyLabel, state, upsertProfile,
+  actions, aiActivity, displayStatus, loadClients, loadProfiles, profileList, profilesByPriority, proxyLabel, runWindow, state,
+  upsertProfile,
 } from "./store.js";
 import { attachThumb } from "./thumbs.js";
 import {
@@ -88,6 +89,16 @@ export function createProfilesView() {
   grid.addEventListener("focusin", (event) => {
     const card = event.target.closest(".profile-card");
     if (card && card.dataset.id !== activeId) { activeId = card.dataset.id; updateRoving(); }
+  });
+  // While the pointer is over the grid the cards keep their places: a live re-sort (a request answered,
+  // a profile paused) would slide another card's "I'm done" or "Hand back" under it. The new order
+  // applies when the pointer leaves.
+  let pointerIn = false;
+  let resortHeld = false;
+  grid.addEventListener("pointerenter", () => { pointerIn = true; });
+  grid.addEventListener("pointerleave", () => {
+    pointerIn = false;
+    if (resortHeld) { resortHeld = false; render(); }
   });
   const body = h("div.view-body", skeletonCards(6));
   const el = h("section.view", { attrs: { "aria-label": "Profiles" } }, header, toolbar, body, bulkBar);
@@ -332,7 +343,7 @@ export function createProfilesView() {
     newBtn.classList.remove("hidden");
     toolbar.classList.remove("hidden");
     grid.classList.toggle("list", density === "list");
-    const shown = all.filter(matches);
+    let shown = all.filter(matches);
     if (!shown.length) {
       replace(body, emptyState({
         icon: "search", title: "No profiles match", text: "Try another search or clear the filters.",
@@ -341,6 +352,11 @@ export function createProfilesView() {
       return;
     }
     if (body.firstChild !== grid) replace(body, grid);
+    if (pointerIn) {
+      const held = keepPlaces(shown);
+      resortHeld = resortHeld || held.some((p, i) => p !== shown[i]);
+      shown = held;
+    }
     const seen = new Set();
     shown.forEach((p, index) => {
       seen.add(p.id);
@@ -367,6 +383,13 @@ export function createProfilesView() {
     updateRoving();
   }
 
+  /** `list` in the grid's current order (cards not in the grid yet go last, by priority). */
+  function keepPlaces(list) {
+    const at = new Map(shownCards().map((c, i) => [c.dataset.id, i]));
+    const place = (p) => (at.has(p.id) ? at.get(p.id) : at.size);
+    return [...list].sort((a, b) => place(a) - place(b));
+  }
+
   return {
     el,
     title: "Profiles",
@@ -375,7 +398,7 @@ export function createProfilesView() {
         || (topics.has("clients") && !state.profiles.size)) render();
     },
     onShow() { render(); renderSelection(); },
-    onHide() { document.body.classList.remove("bulk-open"); },
+    onHide() { document.body.classList.remove("bulk-open"); pointerIn = false; }, // (no pointerleave once detached)
     onEscape() { if (selection.on) { setSelecting(false); return true; } return false; },
     focusSearch() { searchInput.focus(); searchInput.select(); },
     newItem() { newProfileDialog({ onCreated: (p) => openProfileDrawer(p.id) }); },
@@ -471,7 +494,7 @@ function profileCard(p0, sel) {
     if (running) {
       stateLine = thumbState === "minimized" ? h("div.thumb-state", icon("tab"), "Window is minimized")
         : thumbState === "page-error" ? h("div.thumb-state.warn", icon("alert"), p.proxy ? "Page couldn't load – check the proxy" : "Page couldn't load")
-          : p.window === "headless" ? h("div.thumb-state", icon("eye"), "Headless: no window")
+          : runWindow(p) === "headless" ? h("div.thumb-state", icon("eye"), "Headless: no window")
             : h("div.thumb-state", h("span.spinner.sm"), "Loading preview…");
     } else if (st.runtime === "starting" || st.runtime === "stopping") {
       stateLine = h("div.thumb-state", h("span.spinner.sm"), st.runtime === "starting" ? "Starting Chrome…" : "Closing…");
@@ -485,7 +508,7 @@ function profileCard(p0, sel) {
     const busyAi = aiActivity(p.id);
     if (running) over.push(h("div.thumb-live", { class: busyAi ? "ai" : "" }, busyAi ? icon("sparkles") : statusDot("running"),
       busyAi ? "AI working" : "Live"));
-    const win = (p.runtime && p.runtime.window) || p.window;
+    const win = runWindow(p);
     if (win && win !== "normal") over.push(h("div.thumb-window", h("span.badge", win === "offscreen" ? "Off-screen" : "Headless")));
     const control = p.control || {};
     if (control.help && control.help.length) {
@@ -538,12 +561,12 @@ function profileCard(p0, sel) {
     const items = [];
     if (pending) {
       items.push(h("button.btn.sm", { disabled: true }, h("span.spinner"), pending === "stopping" ? "Stopping…" : "Starting…"));
-    } else if (help && p.window !== "headless") {
+    } else if (help && runWindow(p) !== "headless") {
       items.push(h("button.btn.sm", { attrs: { type: "button", title: running ? "Bring the window to the front" : "Start the profile in a normal window" },
         onclick: (e) => busy(e.currentTarget, () => actions.openWindow(p.id).catch(() => {})) }, icon(running ? "focus" : "play"), running ? "Show window" : "Open window"));
     } else if (!running) {
       items.push(h("button.btn.sm", { class: control.paused ? "" : "primary", attrs: { type: "button" }, onclick: () => actions.start(p.id).catch(() => {}) }, icon("play"), "Start"));
-    } else if (p.window !== "headless") {
+    } else if (runWindow(p) !== "headless") {
       items.push(h("button.btn.sm", { attrs: { type: "button", title: "Bring the window to the front" }, onclick: (e) => busy(e.currentTarget, () => actions.focus(p.id).catch(() => {})) }, icon("focus"), "Show"));
     }
     if (help) {
@@ -584,6 +607,7 @@ export function profileMenu(p, anchor) {
     { label: "Open details", icon: "info", onClick: () => openProfileDrawer(p.id) },
     { label: "Edit settings", icon: "edit", onClick: () => openProfileDrawer(p.id, "settings") },
     running ? { label: "Open tabs", icon: "tab", onClick: () => openProfileDrawer(p.id, "tabs") } : null,
+    { label: "Cookies…", icon: "cookie", onClick: () => openProfileDrawer(p.id, "cookies") },
     !running ? { label: "Start off-screen", icon: "play", onClick: () => actions.start(p.id, "offscreen").catch(() => {}) } : null,
     { label: "Open data folder", icon: "folder", onClick: () => api.post("/api/reveal", { what: "profile", id: p.id }).catch((e) => toast(e.message, { kind: "error" })) },
     { label: "Clone…", icon: "clone", onClick: () => cloneDialog(p) },

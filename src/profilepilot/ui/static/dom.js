@@ -231,6 +231,17 @@ export function copyText(text) {
   return Promise.resolve();
 }
 
+/** Hand `blob` to the browser as a download named `filename`. */
+export function saveFile(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const link = h("a.hidden", { attrs: { href: url, download: filename } });
+  // (inside the open modal dialog, if any: the rest of the page is inert while one is open)
+  ([...document.querySelectorAll("dialog[open]")].pop() || document.body).append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
 export function isTyping(target) {
   if (!target) return false;
   const tag = target.tagName;

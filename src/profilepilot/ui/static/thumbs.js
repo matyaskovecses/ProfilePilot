@@ -22,7 +22,9 @@ function schedule() {
     if (document.hidden) return;
     const now = Date.now();
     for (const entry of entries) {
-      if (!entry.el.isConnected) { detach(entry); continue; }
+      // A detached thumbnail (another view or drawer tab is showing) waits: it is shown again later and
+      // only its owner's stop() ends it.
+      if (!entry.el.isConnected) continue;
       if (entry.visible && entry.active() && !entry.loading && entry.due <= now) refresh(entry);
     }
     if (!entries.size) { clearInterval(timer); timer = null; }

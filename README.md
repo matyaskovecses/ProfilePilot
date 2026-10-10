@@ -118,6 +118,10 @@ Not everything can be automated. `profilepilot ui` opens **ProfilePilot Manager*
   - open a page in a profile;
   - **Take control / Hand back to AI**;
   - bulk start, stop, tag and proxy assignment.
+- **Cookies:** every cookie of a profile, grouped by site. Search, reveal and copy values, and edit every attribute
+  (domain or host-only, path, expiry, Secure, HttpOnly, SameSite, partitioned). Import Cookie-Editor / EditThisCookie
+  JSON or `cookies.txt` (merge, replace those sites, or replace everything, with a preview first) and export all,
+  a filter or a selection. A stopped profile can be started in the background for it.
 - **Help requests:** when the AI needs a human (CAPTCHA, login, 2FA, payment confirmation), a banner and a desktop notification appear. You act in the profile's window and click **Done**.
 - **Proxies:** paste hundreds at once (`host:port:user:pass`, `socks5://…`). Test the exit IP, country and latency, with a history sparkline, and see which profiles use each proxy. Passwords go into the OS keyring and are never shown again.
 - **Identities:** your details for autofill. Card numbers, CVVs, SSNs and passwords are write-only, and you choose which sites may receive them.
@@ -129,6 +133,7 @@ Not everything can be automated. `profilepilot ui` opens **ProfilePilot Manager*
 | ![Proxies](docs/img/manager/proxies-light.png) | ![Profile details with a help request](docs/img/manager/drawer-profile-light.png) |
 | ![Identities](docs/img/manager/identities-light.png) | ![Activity](docs/img/manager/activity-dark.png) |
 | ![Add proxies](docs/img/manager/dialog-import-proxies-light.png) | ![Connections](docs/img/manager/connections-dark.png) |
+| ![Cookies](docs/img/manager/drawer-cookies-light.png) | ![Edit a cookie](docs/img/manager/dialog-cookie-edit-light.png) |
 
 The Manager listens on 127.0.0.1 only, requires a one-time code from its launcher, and never shows stored
 secrets. The same controls are on the command line: `profilepilot profile pause|resume`, `profilepilot help list|resolve`.
@@ -231,6 +236,7 @@ contains the values.
 | `profilepilot profile start shop-us` / `stop` / `pause` / `resume` | run it, or take control of it |
 | `profilepilot proxy import proxies.txt --scheme socks5` | bulk import: `scheme://user:pass@host:port`, `host:port:user:pass`, `user:pass@host:port`, `host:port` (append `  # name`) |
 | `profilepilot proxy test shop-us` | exit IP, country and latency of a proxy or a profile's route |
+| `profilepilot cookies list shop-us` / `export` / `import` / `set` / `delete` | the profile's cookies; a stopped profile is started off-screen for the command and stopped again |
 | `profilepilot status` | running profiles |
 | `profilepilot help list` | open help requests from the AI |
 | `profilepilot connect chatgpt` | share ProfilePilot with ChatGPT |
@@ -348,6 +354,10 @@ It does not solve CAPTCHAs or bypass access controls; those go to you.
 
 The second command runs the fast tests. The third runs everything, including the real-browser tests,
 whose windows open off-screen. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+Releases: push a tag like `v0.1.0` (matching `pyproject.toml` and a `CHANGELOG.md` section). The release
+workflow runs the tests, builds the wheel, the sdist and the Claude Desktop extension (`profilepilot.mcpb`)
+and creates a draft GitHub release with them and their checksums.
 
 ## Credits
 

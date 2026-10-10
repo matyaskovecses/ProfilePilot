@@ -15,8 +15,8 @@ export function onUnauthorized(fn) {
   unauthorizedHandlers.add(fn);
 }
 
-async function request(method, path, body) {
-  const init = { method, headers: { Accept: "application/json" }, credentials: "same-origin", cache: "no-store" };
+async function send(method, path, body, accept = "application/json") {
+  const init = { method, headers: { Accept: accept }, credentials: "same-origin", cache: "no-store" };
   if (body !== undefined) {
     init.headers["Content-Type"] = "application/json";
     init.body = JSON.stringify(body);
@@ -31,17 +31,40 @@ async function request(method, path, body) {
     unauthorizedHandlers.forEach((fn) => fn());
     throw new ApiError("Your session has ended. Open ProfilePilot Manager again.", 401, "unauthorized");
   }
-  if (res.status === 204) return null;
+  return res;
+}
+
+async function failure(res) {
   let data = null;
   try {
     data = await res.json();
   } catch (err) {
     data = null;
   }
-  if (!res.ok) {
-    throw new ApiError((data && data.error) || `Request failed (${res.status})`, res.status, data && data.code, data);
+  return new ApiError((data && data.error) || `Request failed (${res.status})`, res.status, data && data.code, data);
+}
+
+async function request(method, path, body) {
+  const res = await send(method, path, body);
+  if (res.status === 204) return null;
+  if (!res.ok) throw await failure(res);
+  try {
+    return await res.json();
+  } catch (err) {
+    return null;
   }
-  return data;
+}
+
+/**
+ * A file the server sends as an attachment (GET, or POST with `body`) -> {blob, filename, headers}.
+ * Errors come back as JSON like every other request and are thrown as ApiError.
+ */
+async function download(path, body) {
+  const res = await send(body === undefined ? "GET" : "POST", path, body, "*/*");
+  if (!res.ok) throw await failure(res);
+  const blob = await res.blob();
+  const match = /filename="([^"]+)"/.exec(res.headers.get("Content-Disposition") || "");
+  return { blob, filename: match ? match[1] : "download", headers: res.headers };
 }
 
 export const api = {
@@ -50,6 +73,7 @@ export const api = {
   patch: (path, body = {}) => request("PATCH", path, body),
   put: (path, body = {}) => request("PUT", path, body),
   del: (path, body) => request("DELETE", path, body),
+  download,
 };
 
 export const enc = encodeURIComponent;
