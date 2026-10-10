@@ -160,6 +160,25 @@ def open_window(store: Store, url: str) -> subprocess.Popen | None:
         return None
 
 
+def manager_window_icons(store: Store) -> object | None:
+    """The logo and the Manager's own taskbar group for its app window (Windows), so it does not show
+    up as a plain Chrome window. The same icon file as the desktop shortcut."""
+    if sys.platform != "win32":
+        return None
+    try:
+        from ..winicon import MANAGER_APP_ID, WindowIcons
+        from .shortcut import APP_NAME, _gui_python, _launch_args, write_icons
+
+        ico = store.root / "ui" / "ProfilePilot.ico"
+        if not ico.is_file():
+            ico = write_icons(store.root / "ui")["ico"]
+        command = subprocess.list2cmdline([_gui_python(), *_launch_args(store.root)])
+        return WindowIcons(ico, MANAGER_APP_ID, APP_NAME, command)
+    except Exception as exc:  # icons are a nicety
+        log.debug("Manager window icon unavailable: %s", exc)
+        return None
+
+
 def wait_for_window_close(store: Store, proc: subprocess.Popen | None, stop: threading.Event,
                           poll: float = 1.0) -> None:
     """Block until the Manager window is gone (or ``stop`` is set).
@@ -180,6 +199,7 @@ def wait_for_window_close(store: Store, proc: subprocess.Popen | None, stop: thr
         stop.wait(0.5)
     import psutil
 
+    icons = manager_window_icons(store)
     while not stop.is_set():
         alive = [p for p in pids if psutil.pid_exists(p)]
         if not alive:
@@ -187,6 +207,8 @@ def wait_for_window_close(store: Store, proc: subprocess.Popen | None, stop: thr
             if not pids:
                 return
             continue
+        if icons is not None:
+            icons.apply(alive)  # type: ignore[attr-defined]  # also windows opened later; never raises
         stop.wait(poll)
 
 

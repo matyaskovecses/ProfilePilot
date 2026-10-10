@@ -13,6 +13,7 @@ PNG-in-ICO file (Windows Vista and later read PNG entries at every size).
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 import struct
@@ -23,6 +24,8 @@ from pathlib import Path
 from typing import Sequence
 
 APP_NAME = "ProfilePilot Manager"
+APP_ID = "ProfilePilot.Manager"
+"""Windows AppUserModelID shared by the shortcuts and the Manager window (one taskbar group)."""
 ICON_SIZES = (16, 20, 24, 32, 40, 48, 64, 128, 256)
 
 # Geometry in unit coordinates (0..1, y down), shared with static/logo.svg (viewBox 0 0 256 256).
@@ -213,6 +216,24 @@ def _create_lnk(path: Path, target: str, args: list[str], icon: Path, workdir: P
                    capture_output=True, timeout=30)
 
 
+def _set_lnk_app_id(path: Path, app_id: str) -> None:
+    """Give a ``.lnk`` the Manager's AppUserModelID, so the window opened from it (or pinned) groups
+    with it on the taskbar under its icon. Best effort: a shortcut without it still works."""
+    try:
+        import pythoncom  # type: ignore[import-not-found]
+        from win32com.propsys import propsys, pscon  # type: ignore[import-not-found]
+        from win32com.shell import shellcon  # type: ignore[import-not-found]
+
+        with contextlib.suppress(pythoncom.com_error):
+            pythoncom.CoInitialize()
+        store = propsys.SHGetPropertyStoreFromParsingName(str(path), None, shellcon.GPS_READWRITE,
+                                                          propsys.IID_IPropertyStore)
+        store.SetValue(pscon.PKEY_AppUserModel_ID, propsys.PROPVARIANTType(app_id))
+        store.Commit()
+    except Exception:
+        pass
+
+
 def install_shortcuts(root: Path, *, folders: Sequence[Path] | None = None, python: str | None = None,
                       platform: str | None = None) -> list[Path]:
     """Create the Manager shortcuts. ``folders`` defaults to :func:`default_locations` (tests pass
@@ -228,6 +249,7 @@ def install_shortcuts(root: Path, *, folders: Sequence[Path] | None = None, pyth
             folder.mkdir(parents=True, exist_ok=True)
             path = folder / f"{APP_NAME}.lnk"
             _create_lnk(path, exe, args, icons["ico"], Path.home())
+            _set_lnk_app_id(path, APP_ID)
             created.append(path)
     elif plat == "darwin":
         exe = python or sys.executable

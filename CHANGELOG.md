@@ -25,6 +25,11 @@
 - **Browser-saved addresses:** autofill can use the addresses you saved in Chrome, Edge or Brave (`identity="chrome"`, `autofill_sources`, `profilepilot identity connect-chrome`). They're read live and read-only, and only names, email, phone, company and address; cards, passwords and form history are never opened.
 - **ShardX backend (optional):** drive ShardX/ShardBrowser profiles with the same tools.
 
+### Window icons (Windows)
+- The Manager window and every profile's browser windows get their own icon and taskbar group: a profile shows
+  the ProfilePilot tile in its avatar colour with the first letters of its name. The desktop shortcut shares the
+  Manager's taskbar identity.
+
 ### Cookie manager
 - **In ProfilePilot Manager:** a Cookies tab for every profile. Cookies are grouped by site with search, masked values
   you can reveal or copy, and an editor for every attribute, including host-only vs domain cookies, expiry,

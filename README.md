@@ -111,6 +111,8 @@ with a **Focus window** button. You solve it, click **Done**, and the AI carries
 
 Not everything can be automated. `profilepilot ui` opens **ProfilePilot Manager** in its own app window.
 `profilepilot ui --install-shortcut` adds it to the Desktop and the Start menu.
+On Windows the Manager and every profile get their own taskbar entry: a profile's windows show the
+ProfilePilot tile in the profile's colour with the first letters of its name, so they never pass for plain Chrome.
 
 - **Profiles:**
   - live thumbnails of every running browser, with an "AI working" badge while the AI acts;

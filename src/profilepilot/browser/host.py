@@ -422,11 +422,19 @@ class ProfileHost:
     async def _supervise(self) -> None:
         """Wait for Chrome to exit or for a stop request (then close Chrome gracefully)."""
         assert self.proc is not None
-        last_snapshot = time.monotonic()
+        last_snapshot = last_icons = time.monotonic()
+        icons = None
+        if _WINDOWS:  # the profile's own icon and taskbar group on its windows (see profilepilot.winicon)
+            from ..winicon import profile_window_icons
+
+            icons = await asyncio.to_thread(profile_window_icons, self.store, self.profile)
         while self.proc.poll() is None:
             try:
                 await asyncio.wait_for(self._stop.wait(), 0.25)
             except asyncio.TimeoutError:
+                if icons is not None and time.monotonic() - last_icons > 2.0:
+                    await asyncio.to_thread(icons.apply, self.proc.pid)  # new windows; never raises
+                    last_icons = time.monotonic()
                 if time.monotonic() - last_snapshot > 5.0:
                     # Remember Chrome's children: once the browser process exits they can no
                     # longer be found through it, and any straggler must be reaped.
