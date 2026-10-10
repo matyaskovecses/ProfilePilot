@@ -26,8 +26,8 @@ The owner asked for **WebKit compatibility**, set up on their Mac. Decisions mad
 
 | Phase | Content |
 |---|---|
-| **1a Engine core** | The Swift app, the host branch, the automation protocol, the Python facade, the fake-app tests, the facade-drift test, the SPI test and the macOS `webkit` CI job. Tools: `browser_navigate`, `browser_tabs`, `browser_snapshot`, `browser_read`, `browser_extract`, `browser_click`, `browser_hover`, `browser_type` (fill/type/human), `browser_press_key`, `browser_wait_for`, `browser_screenshot`, `browser_evaluate` (isolated). CLI `profilepilot webkit install|status`, plus `doctor` checks. |
-| **1b Engine complete** | `browser_evaluate(world="main")`, `browser_select_option`, `browser_scroll`, cookies (`WebKitTransport` over the shared `CookieTransport` from `main`), downloads, `restore_session`, `lang` (V3), the leak and fingerprint verifications V9–V12, the quota (V4), and the docs (README, DESIGN.md, SKILL.md, SECURITY.md). |
+| **1a Engine core** | The Swift app, the host branch, the automation protocol, the Python facade, the fake-app tests, the facade-drift test, the SPI test and the macOS `webkit` CI job. Tools: `browser_navigate`, `browser_tabs`, `browser_snapshot`, `browser_read`, `browser_extract`, `browser_click`, `browser_hover`, `browser_type` (fill/type/human), `browser_press_key`, `browser_wait_for`, `browser_screenshot`, `browser_evaluate` (both worlds: `main` is the same call with the page world). CLI `profilepilot webkit install|status`, plus `doctor` checks. |
+| **1b Engine complete** | `browser_select_option`, `browser_scroll`, cookies (`WebKitTransport` over the shared `CookieTransport` from `main`), downloads, `restore_session`, `lang` (V3), the leak and fingerprint verifications V9–V12, the quota (V4), and the docs (README, DESIGN.md, SKILL.md, SECURITY.md). |
 | **2 Manager** | WebKit profiles in ProfilePilot Manager: status, thumbnails, open/close, *Take control*, help requests, WebRTC leak warning. Built together with the Windows session, which owns `ui/*`. |
 | **3 Autofill** | `form_autofill`, `form_autofill_sensitive`, humanized typing and type-paste on WebKit profiles. |
 
@@ -134,7 +134,7 @@ compiles them with `swiftc` into `<data root>/apps/ProfilePilot WebKit.app`. The
 | `js.evaluate` | `{tab_id, frame_id?, world: "utility" \| "main", body, args, timeout_ms}` → `{value}` (`callAsyncJavaScript`, so promises are awaited) |
 | `input.mouse` | `{tab_id, action: move \| down \| up \| click \| wheel, x, y, button, click_count, modifiers, delta_x, delta_y}`, with main-frame viewport CSS px (W9) |
 | `input.key` | `{tab_id, action: down \| up \| press, key, modifiers}` (Playwright key names) |
-| `input.text` | `{tab_id, text, delay_ms?}`: key events per character (V2) |
+| `input.insert_text` | `{tab_id, text}`: `insertText:` on the web view (NSTextInputClient), the same as Playwright's `keyboard.insert_text` (V2). Per-character typing is a sequence of `input.key` calls made by the Python side. |
 | `cookies.get` / `cookies.set` / `cookies.delete` / `cookies.clear` | Cookie dicts in the cookiejar shape of `main` (§7.4) |
 
 **Events:** `tab.created` (with `opener_tab_id`), `tab.closed`, `tab.updated` (url/title/loading),
@@ -322,7 +322,8 @@ Defaults for every WebKit profile, all measured against real Safari 26.3 on the 
 | `+[WKPreferences _features]`, `-[WKPreferences _setEnabled:forFeature:]` | The feature switches above, and `PeerConnectionEnabled` |
 | `-[WKWebView _setWindowOcclusionDetectionEnabled:]` | Offscreen windows stay `visible` (W15) |
 | `WKUIDelegate _webView:getWindowFrameWithCompletionHandler:` | Real outer window geometry |
-| `_WKFrameTreeNode` (`-[WKWebView _frames:]`) | The frame tree for snapshots and coordinates (fallback: `src` matching) |
+| `-[WKWebView _frames:]` (`_WKFrameTreeNode`: `info`, `childFrames`); `-[WKFrameInfo _handle]` / `_parentFrameHandle` (`_WKFrameHandle.frameID`) | The frame tree and stable frame ids for snapshots and coordinates (fallback: `src` matching). Present on macOS 26.3. |
+| `-[WKWebView _evaluateJavaScript:asAsyncFunction:withSourceURL:withArguments:forceUserGesture:inFrame:inWorld:completionHandler:]` with `forceUserGesture: NO` | Every evaluation runs **without a user gesture**. Public `evaluateJavaScript`/`callAsyncJavaScript` count as one, which would give pages sticky user activation (`navigator.userActivation.hasBeenActive`) with no input: the same problem `patchright_preload.js` fixes on Chrome. Present on macOS 26.3. |
 
 - Every call is guarded with `respondsToSelector:`. The app reports the result in `browser.version.spi` and in
   `ppwebkit --spi-report`.
@@ -409,7 +410,7 @@ proxied WebKit profile.
 | V8 | Does an `.accessory` app opening on-screen windows ever take focus on launch, and does `.regular` plus no `activate` stay in the background? | Adjust the window-mode details |
 | V9 | **HTTP/3 and QUIC:** load a site that advertises h3 (Alt-Svc), such as `https://cloudflare-quic.com`, twice in a proxied profile. Do 0 UDP/443 packets leave the real interface? Network.framework may race QUIC outside a SOCKS proxy. | Find the switch (a WebKit feature, or disabling HTTP/3 for the store) before release, as with WebRTC |
 | V10 | **DNS outside the proxy:** with the proxy set, does any DNS query leave (port 53, DoH, or the system resolver log) from `<link rel=dns-prefetch>`, `preconnect`, speculative loads or HTTPS/SVCB (type 65) lookups? | Turn the responsible feature off for proxied profiles before release |
-| V11 | **Safari's staged WebKit:** on macOS 14/15 a newer Safari can ship its own WebKit in `/Library/Apple/System/Library/StagedFrameworks/Safari`, while WKWebView apps load the older system WebKit. The user agent would then claim a Safari version the engine doesn't match. Does the in-process `WebKit.framework` `CFBundleVersion` match Safari.app's? | `browser.version` reports a mismatch, `doctor` and `profile_status` warn, and the user agent uses the Safari version that matches the loaded WebKit (or makes no Safari claim). Never Safari.app's version blindly. On 26.x they match (W16). |
+| V11 (measured 2026-10-09: WebKit `CFBundleVersion` 21623.2.7.11.6 = Safari's, no staged framework on 26.3) | **Safari's staged WebKit:** on macOS 14/15 a newer Safari can ship its own WebKit in `/Library/Apple/System/Library/StagedFrameworks/Safari`, while WKWebView apps load the older system WebKit. The user agent would then claim a Safari version the engine doesn't match. Does the in-process `WebKit.framework` `CFBundleVersion` match Safari.app's? | `browser.version` reports a mismatch, `doctor` and `profile_status` warn, and the user agent uses the Safari version that matches the loaded WebKit (or makes no Safari claim). Never Safari.app's version blindly. On 26.x they match (W16). |
 | V12 | **Live proxy switch:** after `/upstream` switches the relay, do WebKit's existing keep-alive connections stop using the old exit? The relay drops tunnels on a switch. Does WebKit reconnect cleanly, with the new exit IP on the next fetch and no restart? | Close idle connections on a switch (reload the store's network session) before release |
 
 ## 13. Testing
