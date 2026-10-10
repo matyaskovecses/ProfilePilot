@@ -52,7 +52,7 @@ import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Literal
+from typing import Any, AsyncIterator, Literal, Protocol, Union
 from urllib.parse import urlsplit
 
 from ..automation.cookies import (
@@ -657,18 +657,79 @@ async def _remove(cdp: CdpConnection, targets: list[dict[str, Any]]) -> None:
         raise CookieRefusedError(_refused_message("delete", labels), refused=labels, done=len(targets) - len(left))
 
 
+# ---------------------------------------------------------------------- transports
+
+
+class CookieTransport(Protocol):
+    """How one browser engine's cookie store is reached. Everything engine-neutral in this module
+    (validation, identity keys, rename ordering, import modes, clearing by domain) runs over it;
+    Chrome's is :class:`CdpTransport`. Cookies go in and come out in :func:`normalize_cookie` shape."""
+
+    async def get(self) -> list[dict[str, Any]]:
+        """Every cookie of the store, normalised."""
+        ...
+
+    async def store(self, cookies: list[dict[str, Any]], *, before: list[dict[str, Any]] | None = None
+                    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Write validated cookies and read them back: ``(stored, as the engine keeps them; refused)``.
+        ``before`` is the jar as just read, when the caller has it."""
+        ...
+
+    async def remove(self, cookies: list[dict[str, Any]]) -> None:
+        """Delete exactly these cookies; :class:`CookieRefusedError` for any that are still there."""
+        ...
+
+    async def clear(self) -> None:
+        """Delete every cookie."""
+        ...
+
+
+class CdpTransport:
+    """:class:`CookieTransport` over a Chromium browser's DevTools connection."""
+
+    def __init__(self, cdp: CdpConnection) -> None:
+        self.cdp = cdp
+
+    async def get(self) -> list[dict[str, Any]]:
+        return await _get(self.cdp)
+
+    async def store(self, cookies: list[dict[str, Any]], *, before: list[dict[str, Any]] | None = None
+                    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        return await _store(self.cdp, cookies, before=before)
+
+    async def remove(self, cookies: list[dict[str, Any]]) -> None:
+        await _remove(self.cdp, cookies)
+
+    async def clear(self) -> None:
+        await self.cdp.call("Storage.clearCookies", timeout=SET_TIMEOUT)
+
+
+Jar = Union[str, CookieTransport]
+"""Where the public functions act: a Chromium browser's DevTools websocket URL
+(``RuntimeInfo.cdp_ws_url``) or another engine's :class:`CookieTransport`."""
+
+
+@contextlib.asynccontextmanager
+async def _transport(jar: Jar, cdp: CdpConnection | None) -> AsyncIterator[CookieTransport]:
+    if not isinstance(jar, str):
+        yield jar
+        return
+    async with _connection(jar, cdp) as conn:
+        yield CdpTransport(conn)
+
+
 # ---------------------------------------------------------------------- public API
 
 
-async def list_cookies(ws_url: str, *, cdp: CdpConnection | None = None) -> list[dict[str, Any]]:
-    """Every cookie of the browser (``Storage.getCookies``), normalised, sorted by site / name / path."""
-    async with _connection(ws_url, cdp) as conn:
-        return sorted(await _get(conn), key=_sort_key)
+async def list_cookies(jar: Jar, *, cdp: CdpConnection | None = None) -> list[dict[str, Any]]:
+    """Every cookie of the browser, normalised, sorted by site / name / path."""
+    async with _transport(jar, cdp) as t:
+        return sorted(await t.get(), key=_sort_key)
 
 
-async def set_cookies(ws_url: str, cookies: Iterable[Mapping[str, Any]], *, cdp: CdpConnection | None = None) -> int:
+async def set_cookies(jar: Jar, cookies: Iterable[Mapping[str, Any]], *, cdp: CdpConnection | None = None) -> int:
     """Add or replace cookies (``Storage.setCookies``). All of them are validated first (nothing is
-    sent if one is invalid); returns how many distinct cookies Chrome stored. Raises
+    sent if one is invalid); returns how many distinct cookies the browser stored. Raises
     :class:`InvalidCookieError` / :class:`CookieRefusedError` (``done`` = how many were stored)."""
     items = list(cookies)
     if len(items) > MAX_BATCH:
@@ -684,42 +745,42 @@ async def set_cookies(ws_url: str, cookies: Iterable[Mapping[str, Any]], *, cdp:
             raise InvalidCookieError(f"Cookie #{i} ({_input_label(cookie)}): {exc}") from None
     if not valid:
         return 0
-    async with _connection(ws_url, cdp) as conn:
-        stored, refused = await _store(conn, valid)
+    async with _transport(jar, cdp) as t:
+        stored, refused = await t.store(valid)
     if refused:
         labels = [cookie_label(c) for c in refused]
         raise CookieRefusedError(_refused_message("store", labels), refused=labels, done=len(stored))
     return len(stored)
 
 
-async def delete_cookies(ws_url: str, keys: Iterable[str], *, cdp: CdpConnection | None = None) -> int:
+async def delete_cookies(jar: Jar, keys: Iterable[str], *, cdp: CdpConnection | None = None) -> int:
     """Delete the cookies with these :func:`cookie_key` ids, and nothing else. Returns how many of
     them existed (unknown ids are ignored)."""
     wanted = {str(k) for k in keys}
     if not wanted:
         return 0
-    async with _connection(ws_url, cdp) as conn:
-        targets = [c for c in await _get(conn) if cookie_key(c) in wanted]
-        await _remove(conn, targets)
+    async with _transport(jar, cdp) as t:
+        targets = [c for c in await t.get() if cookie_key(c) in wanted]
+        await t.remove(targets)
     return len(targets)
 
 
-async def clear_cookies(ws_url: str, *, domain: str | None = None, cdp: CdpConnection | None = None) -> int:
+async def clear_cookies(jar: Jar, *, domain: str | None = None, cdp: CdpConnection | None = None) -> int:
     """Delete all cookies (``Storage.clearCookies``), or those of ``domain`` and its subdomains
     (except cookies partitioned for an opaque site, which only clearing everything reaches).
     Returns how many were deleted."""
     site = filter_domain(domain) if domain is not None else None
-    async with _connection(ws_url, cdp) as conn:
+    async with _transport(jar, cdp) as t:
         if site is None:
-            count = len(await _get(conn))
-            await conn.call("Storage.clearCookies", timeout=SET_TIMEOUT)
+            count = len(await t.get())
+            await t.clear()
             return count
-        targets = [c for c in await _get(conn) if domain_matches(c["domain"], site) and not c.get("partitionKeyOpaque")]
-        await _remove(conn, targets)
+        targets = [c for c in await t.get() if domain_matches(c["domain"], site) and not c.get("partitionKeyOpaque")]
+        await t.remove(targets)
     return len(targets)
 
 
-async def save_cookie(ws_url: str, cookie: Mapping[str, Any], *, replace: str | None = None,
+async def save_cookie(jar: Jar, cookie: Mapping[str, Any], *, replace: str | None = None,
                       overwrite: bool = False, cdp: CdpConnection | None = None) -> dict[str, Any]:
     """Create a cookie, or edit the one whose :func:`cookie_key` is ``replace`` (``cookie`` then only
     needs the changed fields, see :func:`merge_cookie`). A changed identity sets the new cookie first
@@ -728,18 +789,18 @@ async def save_cookie(ws_url: str, cookie: Mapping[str, Any], *, replace: str | 
     :class:`CookieExistsError` when an edit would land on another existing cookie (a host-only and
     a domain ``sid`` merging into one) unless ``overwrite``."""
     new = validate_cookie(merge_cookie(None, cookie)) if replace is None else None  # before connecting
-    async with _connection(ws_url, cdp) as conn:
-        jar = await _get(conn)
+    async with _transport(jar, cdp) as t:
+        current = await t.get()
         base = None
         if replace is not None:
-            base = next((c for c in jar if cookie_key(c) == replace), None)
+            base = next((c for c in current if cookie_key(c) == replace), None)
             if base is None:
                 raise NotFoundError("That cookie no longer exists (it expired or was deleted). Refresh the list.")
             if base.get("partitionKeyOpaque"):
                 raise InvalidCookieError("Cookies partitioned for an opaque site can't be edited; delete it instead.")
         valid = new if new is not None else validate_cookie(merge_cookie(base, cookie))
         if base is not None and not overwrite and cookie_key(valid) != replace:
-            other = next((c for c in jar if cookie_key(c) == cookie_key(valid)), None)
+            other = next((c for c in current if cookie_key(c) == cookie_key(valid)), None)
             if other is not None:
                 host = str(other["domain"]).lstrip(".")
                 scope = f"for {host} and its subdomains" if str(other["domain"]).startswith(".") else f"for {host} only"
@@ -747,13 +808,13 @@ async def save_cookie(ws_url: str, cookie: Mapping[str, Any], *, replace: str | 
                 raise CookieExistsError(f"There already is a cookie '{other['name']}' {scope}{path}. Saving this edit "
                                         "would replace it with the edited one; delete or edit that cookie instead, "
                                         "or confirm to replace it.", existing=cookie_label(other))
-        stored, refused = await _store(conn, [valid], before=jar)
+        stored, refused = await t.store([valid], before=current)
         if refused:
             labels = [cookie_label(valid)]
             raise CookieRefusedError(_refused_message("store", labels), refused=labels)
         saved = stored[0]
         if base is not None and cookie_key(saved) != replace:
-            await _remove(conn, [base])
+            await t.remove([base])
         return saved
 
 
@@ -811,7 +872,7 @@ class ImportResult:
     """Labels of older cookies a replace import could not delete (the new ones are stored anyway)."""
 
 
-async def import_cookies(ws_url: str, cookies: Iterable[Mapping[str, Any]], *, mode: ImportMode = "merge",
+async def import_cookies(jar: Jar, cookies: Iterable[Mapping[str, Any]], *, mode: ImportMode = "merge",
                          cdp: CdpConnection | None = None) -> ImportResult:
     """Write cookies (validated by :func:`parse_import` or raw). ``merge`` keeps everything else;
     ``replace`` then deletes the other cookies of the imported sites (each site and its subdomains);
@@ -824,19 +885,19 @@ async def import_cookies(ws_url: str, cookies: Iterable[Mapping[str, Any]], *, m
         raise InvalidCookieError(f"Too many cookies at once ({len(items)}; at most {MAX_BATCH}).")
     now = time.time()
     valid = [validate_cookie(c, now=now) for c in items]
-    async with _connection(ws_url, cdp) as conn:
-        stored, refused = await _store(conn, valid)
+    async with _transport(jar, cdp) as t:
+        stored, refused = await t.store(valid)
         removed, not_removed = 0, []
         if mode != "merge" and stored:
             keep = {cookie_key(c) for c in stored + refused}  # never drop an old cookie that was not replaced
             # Only sites that really received cookies are replaced: a site whose cookies Chrome refused
             # keeps its old ones (a refused login must not log the profile out of that site).
             sites = {str(c["domain"]).lstrip(".") for c in stored}
-            current = await _get(conn)
+            current = await t.get()
             stale = [c for c in current if cookie_key(c) not in keep and not c.get("partitionKeyOpaque")
                      and (mode == "replace_all" or any(domain_matches(c["domain"], s) for s in sites))]
             try:
-                await _remove(conn, stale)
+                await t.remove(stale)
                 removed = len(stale)
             except CookieRefusedError as exc:  # the new cookies are stored: report, do not fail the import
                 removed, not_removed = exc.done, list(exc.refused)
@@ -845,10 +906,13 @@ async def import_cookies(ws_url: str, cookies: Iterable[Mapping[str, Any]], *, m
 
 
 __all__ = [
+    "CdpTransport",
     "CookieExistsError",
     "CookieRefusedError",
+    "CookieTransport",
     "ImportResult",
     "InvalidCookieError",
+    "Jar",
     "ParsedCookies",
     "clear_cookies",
     "cookie_key",

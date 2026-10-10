@@ -605,3 +605,48 @@ async def test_chrome_import_replace_modes(ws) -> None:
         result = await import_cookies(ws, [cookie("only", "third.test")], mode="replace_all", cdp=cdp)
         assert result.removed == 2 and [c["name"] for c in await list_cookies(ws, cdp=cdp)] == ["only"]
         assert_native(cdp.sent)
+
+
+class MemoryTransport:
+    """The smallest :class:`CookieTransport`, as another engine (WebKit) provides it: proves the
+    engine-neutral functions need nothing but get / store / remove / clear."""
+
+    def __init__(self, cookies: list[dict[str, Any]] = ()) -> None:  # type: ignore[assignment]
+        self.jar = {cookie_key(c): cookiejar.normalize_cookie(c) for c in cookies}
+
+    async def get(self) -> list[dict[str, Any]]:
+        return [dict(c) for c in self.jar.values()]
+
+    async def store(self, cookies, *, before=None):  # type: ignore[no-untyped-def]
+        stored, refused = [], []
+        for c in cookies:
+            if c["domain"] == ".co.uk":  # this engine refuses public suffixes outright
+                refused.append(c)
+                continue
+            self.jar[cookie_key(c)] = cookiejar.normalize_cookie(c)
+            stored.append(self.jar[cookie_key(c)])
+        return stored, refused
+
+    async def remove(self, cookies) -> None:  # type: ignore[no-untyped-def]
+        for c in cookies:
+            self.jar.pop(cookie_key(c), None)
+
+    async def clear(self) -> None:
+        self.jar.clear()
+
+
+@pytest.mark.asyncio
+async def test_the_public_functions_run_over_any_cookie_transport() -> None:
+    t = MemoryTransport([cookie("sid"), cookie("sid", ".example.com", value="wide"), cookie("x", "other.test")])
+    assert [c["name"] for c in await list_cookies(t)] == ["sid", "sid", "x"]
+    host_only = next(c for c in await list_cookies(t) if c["domain"] == "example.com")
+    with pytest.raises(cookiejar.CookieExistsError):
+        await save_cookie(t, {"domain": ".example.com"}, replace=cookie_key(host_only))
+    renamed = await save_cookie(t, {"name": "sid2"}, replace=cookie_key(host_only))
+    assert renamed["name"] == "sid2" and cookie_key(host_only) not in t.jar
+    result = await import_cookies(t, [cookie("new", "other.test"), cookie("p", ".co.uk")], mode="replace")
+    assert (result.imported, result.refused, result.removed) == (1, ["'p' on co.uk"], 1)
+    assert await delete_cookies(t, [cookie_key(renamed)]) == 1
+    assert await clear_cookies(t, domain="example.com") == 1
+    assert [c["name"] for c in await list_cookies(t)] == ["new"]
+    assert await clear_cookies(t) == 1 and t.jar == {}
