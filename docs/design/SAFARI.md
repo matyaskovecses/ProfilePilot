@@ -26,7 +26,8 @@ The owner asked for **WebKit compatibility**, set up on their Mac. Decisions mad
 
 | Phase | Content |
 |---|---|
-| **1 Engine** | The Swift app, the host branch, the automation protocol, the Python facade, every basic browsing tool, the cookie API (cookiejar shape), CLI `profilepilot webkit …`, `doctor` checks, tests and a CI job. |
+| **1a Engine core** | The Swift app, the host branch, the automation protocol, the Python facade, the fake-app tests, the facade-drift test, the SPI test and the macOS `webkit` CI job. Tools: `browser_navigate`, `browser_tabs`, `browser_snapshot`, `browser_read`, `browser_extract`, `browser_click`, `browser_hover`, `browser_type` (fill/type/human), `browser_press_key`, `browser_wait_for`, `browser_screenshot`, `browser_evaluate` (isolated). CLI `profilepilot webkit install|status`, plus `doctor` checks. |
+| **1b Engine complete** | `browser_evaluate(world="main")`, `browser_select_option`, `browser_scroll`, cookies (`WebKitTransport` over the shared `CookieTransport` from `main`), downloads, `restore_session`, `lang` (V3), the leak and fingerprint verifications V9–V12, the quota (V4), and the docs (README, DESIGN.md, SKILL.md, SECURITY.md). |
 | **2 Manager** | WebKit profiles in ProfilePilot Manager: status, thumbnails, open/close, *Take control*, help requests, WebRTC leak warning. Built together with the Windows session, which owns `ui/*`. |
 | **3 Autofill** | `form_autofill`, `form_autofill_sensitive`, humanized typing and type-paste on WebKit profiles. |
 
@@ -73,7 +74,7 @@ compiles them with `swiftc` into `<data root>/apps/ProfilePilot WebKit.app`. The
 | `Frames.swift` | The frame registry: the utility-world document-start script registers every frame (W13). The frame tree comes from `_WKFrameTreeNode` (SPI, §8) when available; otherwise children are matched to `<iframe>` elements by `src`. |
 | `Capture.swift` | `takeSnapshot` for the viewport, clips and full page (W14), encoded as JPEG/PNG in the app. |
 | `Cookies.swift` | `httpCookieStore`: get, set, delete and clear. The store is warmed before the first call (W2 caveat). |
-| `Session.swift` | `restore_session`: on a clean exit, saves the open tabs' URLs and the session cookies to `<profile dir>/webkit-session.json`, and restores them on the next start (V5). |
+| `Session.swift` | `restore_session`: on a clean exit, saves the open tabs' URLs and the session cookies to `<profile dir>/webkit-session.json`, and restores them on the next start (V5). The file holds session cookies in plaintext (often the login), so it is written **0600 and atomically** (temp file + rename) and **deleted after a successful restore**. SECURITY.md says so. Persistent cookies stay in the WebKit store, protected like Safari's own. |
 
 ### 2.1 Config (stdin, one JSON line, never argv or environment)
 
@@ -164,6 +165,9 @@ compiles them with `swiftc` into `<data root>/apps/ProfilePilot WebKit.app`. The
 - **Deletion:**
   - Moving the profile to the trash keeps the store, so a restore just works.
   - Purging the trash runs `ppwebkit --remove-store <uuid>` (`WKWebsiteDataStore.remove(forIdentifier:)`).
+  - If the app isn't built, or that call fails (for example after `webkit uninstall`), the purge deletes
+    `~/Library/WebKit/dev.profilepilot.webkit/WebsiteDataStore/<uuid>` directly, so a purged profile never leaves
+    data behind.
   - `TrashEntry.size_bytes` measures that store directory.
 - **Cloning or exporting a profile** is out of scope for v1, and refused for WebKit profiles with a clear message.
 
@@ -198,7 +202,7 @@ overrides:
 |---|---|
 | `proxy_id` | ✅ Through the LocalRelay (W4/W5), with the same leak rules as Chrome. Live switching via `/upstream` works because it happens at the relay. |
 | `launch.webrtc` | §8.2 |
-| `launch.window` | `normal`: on-screen windows, opened without activating the app. `offscreen`: the window sits at −32000, −32000 with occlusion detection off, so the page stays `visible` and animation frames run (W15). `headless`: **refused** ("use offscreen: it keeps the page visible and native"). |
+| `launch.window` | `normal`: on-screen windows, opened without activating the app. `offscreen`: the window sits at −32000, −32000 with occlusion detection off, so the page stays `visible` and animation frames run (W15). `headless` set **on the profile**: **refused** ("use offscreen: it keeps the page visible and native"). A **global** `AppConfig.default_window = "headless"`, or a `window="headless"` override at start, quietly means `offscreen` for WebKit profiles, so one global setting never breaks them. |
 | `launch.restore_session` | ✅ Tabs and session cookies (V5) |
 | `launch.lang` | ✅ If V3 holds, otherwise refused |
 | `launch.timezone` | **Refused:** WebKit has no per-view timezone override |
@@ -264,21 +268,30 @@ the window is minimized, because a minimized page is `hidden` and its animation 
 - Screenshots: viewport, element clip and **full page** (W14), capped at `MAX_SHOT_PX` as today.
 - Navigation and waits: §3. The HTTP status is real (navigation response).
 
-### 7.4 Cookies (the cookiejar shape from `main`)
+### 7.4 Cookies (a transport for the shared cookiejar, Phase 1b)
 
-`browser/cookiejar.py` on `main` (the Windows session's Cookie Manager) identifies a cookie by
-`(name, domain, path, partitionKey)`. `webkit/cookies.py` exposes the same functions over `cookies.*`:
-- `list_cookies`, `set_cookies`, `delete_cookies(keys)`, `clear_cookies(domain=)`;
-- `save_cookie(cookie, replace=key)`, `import_cookies(mode=merge|replace)`.
+`browser/cookiejar.py` on `main` (the Windows session's Cookie Manager) is being refactored so the engine-neutral
+logic is shared: store-and-verify readback, rename = delete then set, import merge/replace, validation, and the
+`cookie_key`/`normalize_cookie`/`validate_cookie` helpers. Engines supply only a transport:
 
-The arguments take a `RuntimeInfo` instead of a CDP ws URL. `partitionKey` is always `None`: `HTTPCookie` doesn't
-expose partitions. The Windows session adds the engine dispatch in `cookiejar`, the Manager tab and the CLI.
-`WebKitContext.cookies/add_cookies/clear_cookies` use the same functions, so the MCP cookie tools work unchanged.
+```python
+class CookieTransport(Protocol):
+    async def get(self) -> list[dict]                       # normalised cookiejar shape (normalize_cookie)
+    async def write(self, cookies: list[dict]) -> list[int]  # validated cookies; returns the refused indexes
+    async def remove(self, cookies: list[dict]) -> list[dict]  # returns those still present
+```
+
+The public cookiejar functions take `jar: str | CookieTransport` (a `str` is a CDP ws URL). `webkit/cookies.py` is
+only `WebKitTransport(runtime: RuntimeInfo)` over `cookies.get/set/delete`. It never re-implements keys or
+validation. `partitionKey` is always `None`: `HTTPCookie` doesn't expose partitions.
+`WebKitContext.cookies/add_cookies/clear_cookies` go through the same transport, so the MCP cookie tools, the
+Manager tab and the CLI all work unchanged.
 
 ### 7.5 Chrome-only code paths
 
 `server/engine.py` (new, so it never conflicts with `server/app.py`) has `require_chromium(session, feature)`. It is
-called where CDP or Chrome itself is needed:
+called where CDP or Chrome itself is needed, in `server/tools_browser.py` and in `server/tools_data.py` (where
+`http_fetch` and the HTTP identity live):
 - `http_fetch` and the HTTP identity;
 - Scrapling;
 - `cdp_url` hand-outs;
@@ -295,7 +308,8 @@ Defaults for every WebKit profile, all measured against real Safari 26.3 on the 
 - **The real window frame for `outerWidth/outerHeight/screenX/screenY`**, through the private UI-delegate callback.
   Default WKWebView reports 0 × 0, a classic bot tell.
 - **The user agent** from the installed Safari's `CFBundleShortVersionString`, read at every launch (a Safari update
-  is followed automatically).
+  is followed automatically), but only when Safari's WebKit build matches the WebKit loaded in the app (V11).
+  Otherwise the mismatch is reported and the claim adjusted.
 - **Known, documented differences:**
   - no `window.safari` (Safari.app adds it itself; we inject nothing);
   - a different storage quota (V4);
@@ -353,7 +367,10 @@ proxied WebKit profile.
   It is idempotent, and rebuilds when the package version changes. **No binary is committed.**
 - **`profilepilot webkit status`:** whether the app is built, its version against the package, the Safari version,
   the SPI report and the store count.
-- **`profilepilot doctor`:** adds the same as one line, plus warnings.
+- **`profilepilot doctor`:** adds the same as one line, plus warnings. It also warns when the data root lies in
+  `~/Documents`, `~/Desktop` or `~/Downloads`: macOS privacy protection (TCC) would show `ppwebkit` a permission
+  prompt on its first file access there, and that can block the host's 45 s readiness wait. The app's downloads
+  folder and logs live under the data root (default `~/Library/Application Support/ProfilePilot`).
 - **`profilepilot browsers`:** lists `webkit` when it is usable.
 - **CI:** a new `webkit` job on `macos-latest` installs the package, runs `profilepilot webkit install`, then
   `pytest -m webkit` unattended. The spike ran windowless and off-screen, so the runner's GUI session is enough.
@@ -390,6 +407,10 @@ proxied WebKit profile.
 | V6 | Is a real Cmd+V through `NSPasteboard` a trusted paste? | Type-paste stays refused on WebKit |
 | V7 | Does HTTPS through the relay, downloads, popups and several app processes in parallel work as specified? | Fix before release |
 | V8 | Does an `.accessory` app opening on-screen windows ever take focus on launch, and does `.regular` plus no `activate` stay in the background? | Adjust the window-mode details |
+| V9 | **HTTP/3 and QUIC:** load a site that advertises h3 (Alt-Svc), such as `https://cloudflare-quic.com`, twice in a proxied profile. Do 0 UDP/443 packets leave the real interface? Network.framework may race QUIC outside a SOCKS proxy. | Find the switch (a WebKit feature, or disabling HTTP/3 for the store) before release, as with WebRTC |
+| V10 | **DNS outside the proxy:** with the proxy set, does any DNS query leave (port 53, DoH, or the system resolver log) from `<link rel=dns-prefetch>`, `preconnect`, speculative loads or HTTPS/SVCB (type 65) lookups? | Turn the responsible feature off for proxied profiles before release |
+| V11 | **Safari's staged WebKit:** on macOS 14/15 a newer Safari can ship its own WebKit in `/Library/Apple/System/Library/StagedFrameworks/Safari`, while WKWebView apps load the older system WebKit. The user agent would then claim a Safari version the engine doesn't match. Does the in-process `WebKit.framework` `CFBundleVersion` match Safari.app's? | `browser.version` reports a mismatch, `doctor` and `profile_status` warn, and the user agent uses the Safari version that matches the loaded WebKit (or makes no Safari claim). Never Safari.app's version blindly. On 26.x they match (W16). |
+| V12 | **Live proxy switch:** after `/upstream` switches the relay, do WebKit's existing keep-alive connections stop using the old exit? The relay drops tunnels on a switch. Does WebKit reconnect cleanly, with the new exit IP on the next fetch and no restart? | Close idle connections on a switch (reload the store's network session) before release |
 
 ## 13. Testing
 
@@ -400,8 +421,15 @@ proxied WebKit profile.
   - `test_webkit_profiles.py`: the §6 refusals; `auto` never picks `webkit`; `find_browser("webkit")` off macOS;
     store UUID creation, trash and restore.
   - `test_webkit_facade.py`: facade calls → exact protocol messages; strictness; unsupported attributes raise.
-  - `test_webkit_cookies.py`: cookiejar-shape round-trips against the fake.
+  - `test_webkit_cookies.py` (1b): `WebKitTransport` round-trips against the fake.
   - **No secrets in logs or argv** (caplog, plus the fake process's argv).
+  - **Facade drift:** `test_webkit_facade_drift.py` AST-scans `server/tools_browser.py`, `server/tools_data.py`,
+    `automation/content.py`, `automation/cookies.py`, `automation/autofill.py` and `automation/typing.py`. It
+    collects the Playwright attributes used on page, frame, locator, element-handle, context, keyboard and mouse
+    objects, and asserts that each is either implemented by the facade or listed in an explicit `UNSUPPORTED` set.
+    A new Playwright call on `main` then fails CI on every OS, instead of surfacing as `EngineUnsupportedError` on
+    someone's Mac.
+  - **Purge fallback:** a fake store directory is deleted when the app is missing.
 - **`webkit` marker** (macOS, opt-in `-m webkit`, and the CI job):
   - `test_webkit_spi.py` (§8.1);
   - `test_webkit_fingerprint.py`: the W16/W18 expectations, `RTCPeerConnection` absent iff proxied with
